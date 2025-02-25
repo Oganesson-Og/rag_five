@@ -517,7 +517,7 @@ class Pipeline:
             # Read file content if source is a file path
             if isinstance(source, str) and Path(source).exists():
                 try:
-                    with open(source, 'rb') as f:
+                    with open(source, 'rb') as f:                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        
                         content = f.read()
                     self.logger.debug(f"Successfully read file: {source}")
                     self.logger.debug(f"Content type: {type(content)}")
