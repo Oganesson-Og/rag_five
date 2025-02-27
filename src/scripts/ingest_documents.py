@@ -170,8 +170,22 @@ class ContentIngester:
             # Initialize logger
             self.logger = logging.getLogger(self.__class__.__name__)
             
-            # Initialize pipeline with the loaded config dict
+            # Set default acceleration config if not present
+            if 'acceleration' not in self.config:
+                self.config['acceleration'] = {
+                    'device': 'auto',
+                    'num_threads': 8
+                }
+            
+            # Initialize pipeline with the enhanced config
             self.pipeline = Pipeline(self.config)
+            
+            # Log acceleration settings
+            acc_config = self.config['acceleration']
+            self.logger.info(
+                f"Pipeline initialized with acceleration: "
+                f"device={acc_config['device']}, threads={acc_config['num_threads']}"
+            )
             
             # Initialize tracking
             self.processed_files = set()

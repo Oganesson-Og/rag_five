@@ -146,6 +146,15 @@ class ExtractionStage(PipelineStage):
         excel_config = config.get('excel', {})
         csv_config = config.get('csv', {})
         
+        # Configure acceleration settings
+        acceleration_config = config.get('acceleration', {
+            'device': 'auto',
+            'num_threads': 8
+        })
+        
+        # Update PDF config with acceleration settings
+        pdf_config['acceleration'] = acceleration_config
+        
         # Initialize extractors with their configs
         self.extractors = {
             ContentModality.PDF: PDFExtractor(config=pdf_config),

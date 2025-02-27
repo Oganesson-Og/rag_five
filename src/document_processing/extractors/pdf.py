@@ -159,6 +159,10 @@ class PDFExtractor(BaseExtractor):
                 'model_path': None,
                 'min_width': 100,
                 'min_height': 100,
+            },
+            'acceleration': {
+                'num_threads': 8,
+                'device': 'auto'  # 'auto', 'cuda', 'mps', 'cpu'
             }
         }
 
@@ -169,20 +173,34 @@ class PDFExtractor(BaseExtractor):
         self._init_components()
         self.base_font_size = 12.0  # Updated during processing
 
-        # Lazy import and init OCR if requested.
-        self.ocr = None
-        if self.config.get('use_ocr', False):
-            try:
-                from ..core.vision.ocr import OCR
-                self.ocr = OCR(
-                    languages=['en'],
-                    enhance_resolution=self.config.get('enhance_resolution', True),
-                    preserve_layout=self.config.get('preserve_layout', True)
-                )
-                self.logger.info("OCR module initialized from pdf.py")
-            except Exception as e:
-                self.logger.warning(f"Failed to initialize OCR: {e}")
-                self.ocr = None
+        # Determine device for acceleration
+        self.device = self._determine_device()
+        
+        # Initialize OCR if requested
+        self.ocr = self._init_ocr()
+
+        # Initialize Docling extractor with acceleration and picture annotation support
+        try:
+            from ..extractors.docling_extractor import DoclingExtractor
+            picture_config = default_config.get('picture_annotation', {})
+            
+            self.docling = DoclingExtractor(
+                offline_mode=config.get('offline_mode', False),
+                artifacts_path=config.get('artifacts_path'),
+                model_type=picture_config.get('model_type', 'local'),
+                model_name=picture_config.get('model_name', 
+                    'ibm-granite/granite-vision-3.1-2b-preview'),
+                image_scale=picture_config.get('image_scale', 2.0),
+                picture_prompt=picture_config.get('prompt', 
+                    "Describe the image in three sentences. Be concise and accurate."),
+                api_config=picture_config.get('api_config'),
+                num_threads=default_config['acceleration'].get('num_threads', 8)
+            )
+            self.has_docling = True
+            self.logger.info(f"Docling extraction initialized successfully on {self.device}")
+        except ImportError:
+            self.has_docling = False
+            self.logger.warning("Docling not available, falling back to default extraction")
 
     def _init_components(self):
         """Initialize sub-components for layout recognition and device settings."""
@@ -219,14 +237,14 @@ class PDFExtractor(BaseExtractor):
     def _init_device(self):
         """Initialize device settings for torch if available."""
         try:
-            if torch.cuda.is_available():
-                self.device = torch.device('cuda')
-            elif torch.backends.mps.is_available():
-                self.device = torch.device('mps')
+            if self.device == 'cuda':
+                self.torch_device = torch.device('cuda')
+            elif self.device == 'mps':
+                self.torch_device = torch.device('mps')
             else:
-                self.device = torch.device('cpu')
+                self.torch_device = torch.device('cpu')
         except Exception:
-            self.device = torch.device('cpu')
+            self.torch_device = torch.device('cpu')
 
     async def extract(self, document: 'Document') -> 'Document':
         """
@@ -248,23 +266,18 @@ class PDFExtractor(BaseExtractor):
             # Open PDF from binary content
             doc = fitz.open(stream=content, filetype="pdf")
             
-            # Initialize base font size for the document
-            self.base_font_size = self._get_base_font_size(doc[0].get_text("dict"))
-            
-            # Process document structure with layout recognition
-            structure = self._process_document_structure(doc)
-            
-            # Determine document type (native vs scanned)
-            is_scanned = self._check_if_scanned(doc)
-            document.doc_info['is_scanned'] = is_scanned
-            
-            # Extract content based on document type
-            if is_scanned and self.ocr:
-                # Handle scanned PDFs with OCR
-                extracted_text = await self.ocr.process_document(doc)
+            # Extract text using Docling if available
+            if self.has_docling:
+                docling_result = self.docling.process_file(content)
+                if docling_result.success:
+                    document.content = docling_result.text
+                else:
+                    self.logger.warning(f"Docling extraction failed: {docling_result.error}")
+                    # Fall back to default text extraction
+                    document.content = self._extract_structured_text(doc, {})
             else:
-                # Handle native PDFs with layout-aware text extraction
-                extracted_text = self._extract_structured_text(doc, structure)
+                # Use default text extraction
+                document.content = self._extract_structured_text(doc, {})
             
             # Extract tables using voting/adaptive approach
             tables = self._extract_tables_with_structure(doc)
@@ -285,36 +298,8 @@ class PDFExtractor(BaseExtractor):
                 if diagrams:
                     document.doc_info['diagrams'] = diagrams
             
-            # Update document content and metadata
-            document.content = extracted_text
-            document.doc_info.update({
-                'structure': structure['hierarchy'],
-                'layout': [
-                    {'elements': elements} 
-                    for elements in structure['page_layouts']
-                ],
-                'metadata': self._extract_pdf_metadata(doc),
-                'processing_details': {
-                    'extractor': self.__class__.__name__,
-                    'timestamp': datetime.now().isoformat(),
-                    'has_tables': bool(tables),
-                    'has_images': bool(images),
-                    'has_diagrams': bool(diagrams) if 'diagrams' in locals() else False,
-                    'is_scanned': is_scanned,
-                    'base_font_size': self.base_font_size,
-                    'layout_recognition_used': self.has_layout_recognition
-                }
-            })
-            
-            # Add cross-references between elements
-            if self.has_layout_recognition:
-                self._add_cross_references(document)
-            
-            # Record processing metrics
-            self._record_metrics(document)
-            
-            # Cleanup
-            doc.close()
+            # Add metadata
+            document.doc_info.update(self._extract_pdf_metadata(doc))
             
             return document
             
@@ -1397,10 +1382,10 @@ class PDFExtractor(BaseExtractor):
                 for section in doc_info['structure']:
                     if 'text' in section:
                         matches = re.finditer(
-                            rf'(see|refer to|in)\s+section\s+\d+(\.\d+)*',
-                            content,
-                            re.IGNORECASE
-                        )
+                        rf'(see|refer to|in)\s+section\s+\d+(\.\d+)*',
+                        content,
+                        re.IGNORECASE
+                    )
                         section['references'] = [
                             content[max(0, m.start() - 50):min(len(content), m.end() + 50)]
                             for m in matches
@@ -1433,3 +1418,34 @@ class PDFExtractor(BaseExtractor):
         if total_pages == 0:
             return False
         return (scanned_pages / total_pages) > 0.5
+
+    def _determine_device(self) -> str:
+        """Determine the best available device for acceleration."""
+        config_device = self.config['acceleration']['device'].lower()
+        
+        if config_device == 'auto':
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    return 'cuda'
+                elif torch.backends.mps.is_available():
+                    return 'mps'
+            except ImportError:
+                pass
+            return 'cpu'
+        
+        return config_device
+
+    def _init_ocr(self):
+        """Initialize OCR if requested."""
+        if self.config.get('use_ocr', False):
+            try:
+                from ..core.vision.ocr import OCR
+                return OCR(
+                    languages=['en'],
+                    enhance_resolution=self.config.get('enhance_resolution', True),
+                    preserve_layout=self.config.get('preserve_layout', True)
+                )
+            except Exception as e:
+                self.logger.warning(f"Failed to initialize OCR: {e}")
+                return None
