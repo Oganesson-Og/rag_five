@@ -1,9 +1,20 @@
-# Create .gitignore
-cat > .gitignore << 'EOF'
 # Virtual Environment
 rag_env/
 venv/
 env/
+.env
+.venv
+ENV/
+
+# Configuration files with sensitive information
+config/*
+!config/rag_config.example.yaml
+*.config
+*.yaml
+!rag_config.example.yaml
+*.yml
+.env
+.env.*
 
 # Python
 __pycache__/
@@ -27,21 +38,59 @@ wheels/
 .installed.cfg
 *.egg
 
-# System files
-.DS_Store
-.env
-.env.local
-.env.*.local
+# Jupyter Notebook
+.ipynb_checkpoints
 
-# IDE
+# IDE specific files
 .idea/
 .vscode/
 *.swp
 *.swo
+.DS_Store
+
+# Logs
+logs/
+*.log
+
+# Local development settings
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Database
+*.sqlite3
+*.db
+
+# Model files (often large)
+models/
+*.pt
+*.pth
+*.h5
+*.hdf5
+*.pkl
+*.model
+
+# Temporary files
+tmp/
+temp/
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# System files
+.env
+.env.local
+.env.*.local
 
 # Large files and directories
 *.dylib
 *.so
 *.dll
 node_modules/
-EOF

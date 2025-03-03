@@ -1,0 +1,72 @@
+# RAG Pipeline Configuration
+# This is an example configuration file. Copy this to rag_config.yaml and fill in your own values.
+
+# Model configuration
+model:
+  # API keys (replace with your own)
+  openai_api_key: "your_openai_api_key_here"
+  google_api_key: "your_google_api_key_here"
+  gemini_api_key: "your_gemini_api_key_here"
+  hf_api_key: "your_huggingface_api_key_here"
+  
+  # Model settings
+  embedding_model: "sentence-transformers/all-MiniLM-L6-v2"
+  llm_model: "gpt-3.5-turbo"
+  temperature: 0.7
+  max_tokens: 1024
+
+# PDF processing configuration
+pdf:
+  # OCR settings
+  ocr:
+    enabled: true
+    language: "eng"
+    dpi: 300
+    
+  # Table extraction settings
+  table_extraction:
+    enabled: true
+    flavor: "lattice"
+    
+  # Picture annotation
+  picture_annotation:
+    enabled: true
+    model_type: "local"
+    model_name: "ibm-granite/granite-vision-3.1-2b-preview"
+    image_scale: 2.0
+    prompt: "Describe the image in three sentences. Be concise and accurate."
+    api_config: null
+    timeout: 90
+    
+  # Educational content processing
+  educational:
+    enabled: true
+    
+    # Cross-modal processing
+    cross_modal:
+      model_name: "gemini-pro-vision"
+      temperature: 0.7
+      top_p: 0.9
+      max_length: 2048
+
+# Database configuration
+database:
+  type: "sqlite"
+  path: "data/rag.db"
+  
+# Search configuration
+search:
+  engine: "bm25"
+  top_k: 5
+  
+# Logging configuration
+logging:
+  level: "INFO"
+  file: "logs/rag.log"
+  
+# Cache configuration
+cache:
+  enabled: true
+  type: "disk"
+  path: "cache/"
+  ttl: 86400  # 24 hours 

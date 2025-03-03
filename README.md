@@ -1,109 +1,101 @@
-# PDF Document Recognition Pipeline
+# RAG Pipeline
 
-A robust document processing pipeline for extracting structured information from PDF documents, leveraging spaCyLayout and vision-based recognition.
+A Retrieval-Augmented Generation (RAG) pipeline for processing and analyzing documents.
+
+## Setup
+
+### Virtual Environment
+
+Create and activate a virtual environment:
+
+```bash
+python -m venv rag_env
+source rag_env/bin/activate  # On Windows: rag_env\Scripts\activate
+```
+
+### Install Dependencies
+
+Install the required packages:
+
+```bash
+pip install -r requirements.txt
+```
+
+### Configuration
+
+The project uses a YAML configuration file to store settings and API keys. For security reasons, this file is not included in the repository.
+
+1. Copy the example configuration file:
+
+```bash
+cp config/rag_config.example.yaml config/rag_config.yaml
+```
+
+2. Edit `config/rag_config.yaml` and add your API keys and other settings.
+
+**Important**: Never commit your configuration file with real API keys to the repository. The `.gitignore` file is set up to exclude the `config/` directory and YAML files to prevent accidental exposure of sensitive information.
 
 ## Features
 
-- **PDF Document Processing**: Extract text, layout, and structure from PDF documents
-- **Table Extraction**: Identify and extract tables as structured data
-- **Layout Analysis**: Recognize document layout elements (headings, paragraphs, lists, etc.)
-- **Metadata Extraction**: Extract document metadata (title, author, creation date, etc.)
-- **Chunking for RAG**: Create optimized text chunks for Retrieval-Augmented Generation
-- **Fallback Mechanism**: Vision-based recognition as fallback when text extraction fails
-- **Multi-page Support**: Process multi-page documents with page tracking
-- **Visualization**: Visualize document layout and recognition results
-
-## Installation
-
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/yourusername/rag_pipeline.git
-   cd rag_pipeline
-   ```
-
-2. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-3. Download spaCy model:
-   ```bash
-   python -m spacy download en_core_web_sm
-   ```
+- Document processing (PDF, DOCX, Excel, CSV)
+- Table extraction from PDFs using multiple libraries (Camelot, Tabula, PDFPlumber)
+- OCR for scanned documents
+- Image analysis and annotation
+- Educational content processing
+- Cross-modal analysis (text and images)
 
 ## Usage
 
-### Basic Usage
+[Add usage examples here]
 
-```python
-from src.document_processing.core.vision.pdf_recognizer import PDFRecognizer
+## Development
 
-# Initialize the PDF recognizer
-pdf_recognizer = PDFRecognizer(
-    spacy_model="en_core_web_sm",
-    device="cuda"  # or "cpu" if GPU is not available
-)
+### Git Workflow
 
-# Process a PDF document
-result = pdf_recognizer.process_document("path/to/document.pdf")
+The repository is set up with a `.gitignore` file that excludes:
 
-# Extract text blocks
-text_blocks = pdf_recognizer.extract_text_blocks(result)
+- Virtual environments (`rag_env/`, `venv/`, etc.)
+- Configuration files with sensitive information (`config/`, `*.yaml`, etc.)
+- Python cache files and build artifacts
+- IDE-specific files
+- Large model files
+- Temporary files and logs
 
-# Extract tables
-tables = pdf_recognizer.extract_tables(result)
+When adding new features that require configuration, add example settings to `config/rag_config.example.yaml` with placeholder values.
 
-# Get document text
-text = pdf_recognizer.get_document_text(result)
+### Adding New Dependencies
 
-# Get document chunks for RAG
-chunks = pdf_recognizer.get_document_chunks(result)
-```
+When adding new dependencies:
 
-### Command Line Example
+1. Install the package: `pip install package-name`
+2. Add it to `requirements.txt`: `pip freeze > requirements.txt`
 
-The repository includes an example script for processing PDF documents from the command line:
+## Troubleshooting
 
-```bash
-python examples/pdf_recognition_example.py path/to/document.pdf --output results.json --visualize
-```
+### Ghostscript Issues
 
-Options:
-- `--output`, `-o`: Output JSON file path
-- `--model`, `-m`: spaCy model to use (default: en_core_web_sm)
-- `--device`, `-d`: Device to use (cuda, cpu, or auto)
-- `--chunk-size`, `-c`: Size of text chunks for RAG
-- `--visualize`, `-v`: Visualize the results
+If you encounter issues with Ghostscript detection:
 
-## Architecture
+1. Ensure Ghostscript is installed on your system:
+   - macOS: `brew install ghostscript`
+   - Ubuntu: `apt-get install ghostscript`
+   - Windows: Download from [Ghostscript website](https://www.ghostscript.com/download.html)
 
-The PDF recognition pipeline consists of the following components:
+2. Create symbolic links if needed:
+   ```bash
+   # On macOS
+   sudo ln -sf /opt/homebrew/lib/libgs.dylib /usr/local/lib/libgs.so
+   sudo ln -sf /opt/homebrew/lib/libgs.dylib /usr/local/lib/libgs.dylib
+   ```
 
-1. **Base Recognizer**: Core vision-based recognition functionality
-2. **PDF Recognizer**: PDF-specific processing using spaCyLayout
-3. **Document Processing**: Text extraction, layout analysis, and structure recognition
-4. **Table Extraction**: Identification and extraction of tables
-5. **Chunking**: Creation of optimized text chunks for RAG
+### TableStructureRecognizer Issues
 
-## Dependencies
+If you encounter issues with the TableStructureRecognizer:
 
-- **spaCy**: Core NLP functionality
-- **spaCyLayout**: PDF processing and layout analysis
-- **ONNX Runtime**: Efficient model inference
-- **pdf2image**: PDF to image conversion
-- **PyTesseract**: OCR for fallback mode
-- **PyMuPDF**: Alternative PDF parser
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
+1. Check your configuration file to ensure the model settings are correct
+2. Ensure you have the necessary API keys for the models you're using
+3. Check the logs for specific error messages
 
 ## License
 
-This project is licensed under the MIT License - see the LICENSE file for details.
-
-## Acknowledgments
-
-- [spaCyLayout](https://github.com/explosion/spacy-layout) for PDF processing
-- [ONNX Runtime](https://onnxruntime.ai/) for efficient model inference
-- [pdf2image](https://github.com/Belval/pdf2image) for PDF to image conversion 
+[Add license information here] 
