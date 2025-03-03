@@ -102,7 +102,8 @@ class DoclingExtractor:
         image_scale: float = 2.0,
         picture_prompt: str = "Describe the image in three sentences. Be concise and accurate.",
         api_config: Optional[Dict[str, Any]] = None,
-        num_threads: int = 8
+        num_threads: int = 8,
+        enable_remote_services: bool = True
     ):
         """
         Initialize the DoclingExtractor.
@@ -116,6 +117,7 @@ class DoclingExtractor:
             picture_prompt (str): Prompt for image description
             api_config (Optional[Dict[str, Any]]): Configuration for remote API (required if model_type is 'remote')
             num_threads (int): Number of threads for acceleration
+            enable_remote_services (bool): Whether to enable remote services for Docling
         """
         self.offline_mode = offline_mode
         self.model_type = model_type
@@ -124,6 +126,7 @@ class DoclingExtractor:
         self.picture_prompt = picture_prompt
         self.api_config = api_config
         self.num_threads = num_threads
+        self.enable_remote_services = enable_remote_services
         self.device = self._determine_device()
         self.converter = self._initialize_converter(artifacts_path)
         
@@ -156,7 +159,7 @@ class DoclingExtractor:
         )
 
         pipeline_options = PdfPipelineOptions(
-            enable_remote_services=(self.model_type == 'remote'),
+            enable_remote_services=self.enable_remote_services,
             accelerator_options=accelerator_options
         )
 
@@ -247,12 +250,12 @@ class DoclingExtractor:
         response.raise_for_status()
         return response.json()["access_token"]
     
-    def process_file(self, file_path: Union[str, Path]) -> ExtractionResult:
+    def process_file(self, file_path_or_content: Union[str, Path, bytes]) -> ExtractionResult:
         """
-        Process a single document file.
+        Process a single document file or binary content.
         
         Args:
-            file_path (Union[str, Path]): Path to the document file
+            file_path_or_content (Union[str, Path, bytes]): Path to the document file or binary content
             
         Returns:
             ExtractionResult: Extraction results in various formats
@@ -260,14 +263,64 @@ class DoclingExtractor:
         Example:
             ```python
             extractor = DoclingExtractor()
+            
+            # Process from file path
             result = extractor.process_file("document.pdf")
+            
+            # Or process from binary content
+            with open("document.pdf", "rb") as f:
+                content = f.read()
+            result = extractor.process_file(content)
+            
             if result.success:
                 print(result.markdown)
             else:
                 print(f"Error: {result.error}")
             ```
         """
-        file_path = Path(file_path)
+        # Handle binary content
+        if isinstance(file_path_or_content, bytes):
+            # Create a temporary filename for logging purposes
+            filename = "document_from_bytes.pdf"
+            result = ExtractionResult(filename=filename)
+            
+            try:
+                logger.info(f"Processing binary content ({len(file_path_or_content)} bytes)")
+                # Use convert_from_bytes method if available, otherwise use a temporary file
+                try:
+                    # Try to use convert_from_bytes if available
+                    conv_result = self.converter.convert_from_bytes(file_path_or_content, "pdf")
+                except AttributeError:
+                    # If not available, use a temporary file
+                    import tempfile
+                    with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as temp_file:
+                        temp_file.write(file_path_or_content)
+                        temp_path = temp_file.name
+                    
+                    try:
+                        conv_result = self.converter.convert(temp_path)
+                    finally:
+                        # Clean up the temporary file
+                        if os.path.exists(temp_path):
+                            os.unlink(temp_path)
+                
+                doc = conv_result.document
+                
+                # Extract content in different formats
+                result.markdown = doc.export_to_markdown()
+                result.text = doc.export_to_text()
+                result.html = doc.export_to_html()
+                result.json = doc.export_to_json()
+                
+            except Exception as e:
+                result.success = False
+                result.error = str(e)
+                logger.error(f"Error processing binary content: {e}")
+                
+            return result
+        
+        # Handle file path
+        file_path = Path(file_path_or_content)
         result = ExtractionResult(filename=file_path.name)
         
         try:
@@ -346,17 +399,17 @@ class DoclingExtractor:
         """
         return ['.pdf', '.docx', '.doc', '.xlsx', '.xls', '.png', '.jpg', '.jpeg']
     
-    def extract_tables(self, file_path: Union[str, Path]) -> List[Dict[str, Any]]:
+    def extract_tables(self, file_path_or_content: Union[str, Path, bytes]) -> List[Dict[str, Any]]:
         """
         Extract tables from a document.
         
         Args:
-            file_path (Union[str, Path]): Path to the document file
+            file_path_or_content (Union[str, Path, bytes]): Path to the document file or binary content
             
         Returns:
             List[Dict[str, Any]]: List of extracted tables with their structure
         """
-        result = self.process_file(file_path)
+        result = self.process_file(file_path_or_content)
         if not result.success:
             return []
         

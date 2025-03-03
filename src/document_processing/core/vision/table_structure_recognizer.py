@@ -59,7 +59,7 @@ Processing Options:
 - html: HTML output format
 - preserve_structure: Maintain table structure
 
-Author: InfiniFlow Team
+Author: Keith Satuku
 Version: 1.0.0
 License: MIT
 """
@@ -71,6 +71,8 @@ from collections import Counter
 
 import numpy as np
 from huggingface_hub import snapshot_download
+import yaml
+import torch
 
 from src.utils.file_utils import get_project_base_directory
 from src.nlp.tokenizer import UnifiedTokenizer, TokenType
@@ -89,60 +91,328 @@ class TableStructureRecognizer(Recognizer):
         "table spanning cell",
     ]
 
-    def __init__(self):
-        try:
+    def __init__(self, config_path=None):
+        """
+        Initialize the TableStructureRecognizer with optional configuration.
+        
+        Args:
+            config_path: Path to configuration file (defaults to config/rag_config.yaml)
+        """
+        # Load configuration
+        if config_path is None:
+            config_path = os.path.join(get_project_base_directory(), "config/rag_config.yaml")
+        
+        config = {}
+        picture_config = {}
+        educational_config = {}
+        cross_modal_config = {}
+        
+        if os.path.exists(config_path):
+            try:
+                with open(config_path, 'r') as f:
+                    config = yaml.safe_load(f)
+                    
+                # Get model configuration from config file
+                pdf_config = config.get('pdf', {})
+                picture_config = pdf_config.get('picture_annotation', {})
+                educational_config = pdf_config.get('educational', {})
+                cross_modal_config = educational_config.get('cross_modal', {})
+                
+                # Check if we should use a local vision model
+                if picture_config.get('enabled', True) and picture_config.get('model_type') == 'local':
+                    model_name = picture_config.get('model_name')
+                    if model_name:
+                        logging.info(f"Using local vision model: {model_name}")
+                        # Will use this model_name later
+                
+                # Check if we should use Gemini model
+                model_name = cross_modal_config.get('model_name', '')
+                if isinstance(model_name, str) and model_name.lower().startswith('gemini'):
+                    logging.info(f"Using Gemini model: {model_name}")
+                    # Will use Gemini configuration later
+                else:
+                    logging.info(f"Using non-Gemini model: {model_name}")
+                    
+            except Exception as e:
+                logging.warning(f"Failed to load config from {config_path}: {str(e)}")
+                logging.info("Falling back to default model")
+        
+        # Check if we should use Gemini model
+        use_gemini = False
+        model_name = cross_modal_config.get('model_name', '')
+        if isinstance(model_name, str) and model_name.lower().startswith('gemini'):
+            try:
+                # Try to import and initialize Gemini
+                import google.generativeai as genai
+                from PIL import Image
+                
+                # Get API key from config or environment
+                api_key = config.get('model', {}).get('google_api_key', os.environ.get('GOOGLE_API_KEY'))
+                if not api_key:
+                    logging.warning("No Google API key found, falling back to default model")
+                else:
+                    # Configure the Gemini API
+                    genai.configure(api_key=api_key)
+                    
+                    # Initialize the Gemini model
+                    self.gemini_model = genai.GenerativeModel(model_name)
+                    
+                    # Set generation config
+                    self.gemini_generation_config = {
+                        'temperature': cross_modal_config.get('temperature', 0.7),
+                        'top_p': cross_modal_config.get('top_p', 0.9),
+                        'max_output_tokens': cross_modal_config.get('max_length', 2048),
+                    }
+                    
+                    # Set the prompt for table structure recognition
+                    self.gemini_prompt = """
+                    Analyze this table image and extract its structure. 
+                    Identify the following elements:
+                    1. Table boundaries
+                    2. Column headers
+                    3. Row headers
+                    4. Data cells
+                    5. Spanning cells
+                    
+                    Return the result in JSON format with the following structure:
+                    {
+                        "headers": ["header1", "header2", ...],
+                        "rows": [
+                            {"header": "row_header", "cells": ["cell1", "cell2", ...]},
+                            ...
+                        ],
+                        "spanning_cells": [
+                            {"text": "cell_text", "row_start": 0, "row_end": 1, "col_start": 0, "col_end": 1}
+                        ]
+                    }
+                    """
+                    
+                    use_gemini = True
+                    logging.info(f"Successfully initialized Gemini model: {model_name}")
+            except Exception as e:
+                logging.warning(f"Failed to initialize Gemini: {str(e)}")
+                logging.info("Falling back to default model")
+        
+        if use_gemini:
+            # If using Gemini, we still need to initialize the base class
+            # but we'll override the __call__ method
             super().__init__(self.labels, "tsr", os.path.join(
                     get_project_base_directory(),
                     "rag/res/deepdoc"))
+            # Set a flag to indicate we're using Gemini
+            self.use_gemini = True
+            return
+        
+        try:
+            # Try to use the model specified in config
+            if picture_config.get('enabled', True) and picture_config.get('model_type') == 'local':
+                model_name = picture_config.get('model_name')
+                if model_name:
+                    # Use the specified local model
+                    device = picture_config.get('device', 'auto')
+                    if device == 'auto':
+                        device = 'cuda' if torch.cuda.is_available() else 'mps' if hasattr(torch, 'mps') and torch.backends.mps.is_available() else 'cpu'
+                    
+                    super().__init__(
+                        self.labels, 
+                        "tsr", 
+                        model_dir=os.path.join(get_project_base_directory(), "models", model_name),
+                        device=device
+                    )
+                    self.use_gemini = False
+                    return
+            
+            # If no local model specified or configuration failed, try the default path
+            super().__init__(self.labels, "tsr", os.path.join(
+                    get_project_base_directory(),
+                    "rag/res/deepdoc"))
+            self.use_gemini = False
         except Exception:
+            # Fall back to downloading from HuggingFace
             super().__init__(self.labels, "tsr", snapshot_download(repo_id="InfiniFlow/deepdoc",
                                               local_dir=os.path.join(get_project_base_directory(), "rag/res/deepdoc"),
                                               local_dir_use_symlinks=False))
+            self.use_gemini = False
 
     def __call__(self, images, thr=0.2):
-        tbls = super().__call__(images, thr)
-        res = []
-        # align left&right for rows, align top&bottom for columns
-        for tbl in tbls:
-            lts = [{"label": b["type"],
-                    "score": b["score"],
-                    "x0": b["bbox"][0], "x1": b["bbox"][2],
-                    "top": b["bbox"][1], "bottom": b["bbox"][-1]
-                    } for b in tbl]
-            if not lts:
-                continue
+        # If using Gemini, process with Gemini
+        if hasattr(self, 'use_gemini') and self.use_gemini and hasattr(self, 'gemini_model'):
+            return self._process_with_gemini(images)
+            
+        # Otherwise use the default processing
+        try:
+            tbls = super().__call__(images, thr)
+            res = []
+            # align left&right for rows, align top&bottom for columns
+            for tbl in tbls:
+                lts = [{"label": b["type"],
+                        "score": b["score"],
+                        "x0": b["bbox"][0], "x1": b["bbox"][2],
+                        "top": b["bbox"][1], "bottom": b["bbox"][-1]
+                        } for b in tbl]
+                if not lts:
+                    continue
 
-            left = [b["x0"] for b in lts if b["label"].find(
-                "row") > 0 or b["label"].find("header") > 0]
-            right = [b["x1"] for b in lts if b["label"].find(
-                "row") > 0 or b["label"].find("header") > 0]
-            if not left:
-                continue
-            left = np.mean(left) if len(left) > 4 else np.min(left)
-            right = np.mean(right) if len(right) > 4 else np.max(right)
-            for b in lts:
-                if b["label"].find("row") > 0 or b["label"].find("header") > 0:
-                    if b["x0"] > left:
-                        b["x0"] = left
-                    if b["x1"] < right:
-                        b["x1"] = right
+                left = [b["x0"] for b in lts if b["label"].find(
+                    "row") > 0 or b["label"].find("header") > 0]
+                right = [b["x1"] for b in lts if b["label"].find(
+                    "row") > 0 or b["label"].find("header") > 0]
+                if not left:
+                    continue
+                left = np.mean(left) if len(left) > 4 else np.min(left)
+                right = np.mean(right) if len(right) > 4 else np.max(right)
+                for b in lts:
+                    if b["label"].find("row") > 0 or b["label"].find("header") > 0:
+                        if b["x0"] > left:
+                            b["x0"] = left
+                        if b["x1"] < right:
+                            b["x1"] = right
 
-            top = [b["top"] for b in lts if b["label"] == "table column"]
-            bottom = [b["bottom"] for b in lts if b["label"] == "table column"]
-            if not top:
+                top = [b["top"] for b in lts if b["label"] == "table column"]
+                bottom = [b["bottom"] for b in lts if b["label"] == "table column"]
+                if not top:
+                    res.append(lts)
+                    continue
+                top = np.median(top) if len(top) > 4 else np.min(top)
+                bottom = np.median(bottom) if len(bottom) > 4 else np.max(bottom)
+                for b in lts:
+                    if b["label"] == "table column":
+                        if b["top"] > top:
+                            b["top"] = top
+                        if b["bottom"] < bottom:
+                            b["bottom"] = bottom
+
                 res.append(lts)
-                continue
-            top = np.median(top) if len(top) > 4 else np.min(top)
-            bottom = np.median(bottom) if len(bottom) > 4 else np.max(bottom)
-            for b in lts:
-                if b["label"] == "table column":
-                    if b["top"] > top:
-                        b["top"] = top
-                    if b["bottom"] < bottom:
-                        b["bottom"] = bottom
-
-            res.append(lts)
-        return res
+            return res
+        except Exception as e:
+            logging.error(f"Error processing images with default model: {str(e)}")
+            return [[] for _ in range(len(images) if isinstance(images, list) else 1)]
+        
+    def _process_with_gemini(self, images):
+        """
+        Process images using the Gemini model.
+        
+        Args:
+            images: List of images to process
+            
+        Returns:
+            Processed table structures
+        """
+        import json
+        from PIL import Image as PILImage
+        
+        results = []
+        
+        for img in images:
+            try:
+                # Convert image to PIL if it's not already
+                if not isinstance(img, PILImage.Image):
+                    if isinstance(img, np.ndarray):
+                        img = PILImage.fromarray(img)
+                    else:
+                        # Try to load from path
+                        img = PILImage.open(img)
+                
+                # Generate content with Gemini
+                response = self.gemini_model.generate_content(
+                    [self.gemini_prompt, img],
+                    generation_config=self.gemini_generation_config
+                )
+                
+                # Extract the JSON from the response
+                response_text = response.text
+                
+                # Try to parse the JSON
+                try:
+                    # Find JSON in the response
+                    json_start = response_text.find('{')
+                    json_end = response_text.rfind('}') + 1
+                    if json_start >= 0 and json_end > json_start:
+                        json_str = response_text[json_start:json_end]
+                        table_data = json.loads(json_str)
+                    else:
+                        # If no JSON found, use the whole response
+                        table_data = json.loads(response_text)
+                    
+                    # Convert Gemini output to our expected format
+                    table_structure = self._convert_gemini_to_structure(table_data)
+                    results.append(table_structure)
+                    
+                except json.JSONDecodeError:
+                    logging.warning(f"Failed to parse JSON from Gemini response: {response_text}")
+                    # Return empty result for this image
+                    results.append([])
+                    
+            except Exception as e:
+                logging.error(f"Error processing image with Gemini: {str(e)}")
+                results.append([])
+                
+        return results
+        
+    def _convert_gemini_to_structure(self, gemini_data):
+        """
+        Convert Gemini output to our expected table structure format.
+        
+        Args:
+            gemini_data: JSON data from Gemini
+            
+        Returns:
+            Table structure in our expected format
+        """
+        result = []
+        
+        try:
+            # Extract headers
+            headers = gemini_data.get('headers', [])
+            for i, header in enumerate(headers):
+                result.append({
+                    "type": "table column header",
+                    "score": 0.9,
+                    "bbox": [100 * i, 0, 100 * (i + 1), 50],  # Placeholder coordinates
+                    "text": header
+                })
+            
+            # Extract rows
+            rows = gemini_data.get('rows', [])
+            for i, row in enumerate(rows):
+                # Add row header if present
+                if 'header' in row and row['header']:
+                    result.append({
+                        "type": "table projected row header",
+                        "score": 0.9,
+                        "bbox": [0, 50 + 50 * i, 100, 50 + 50 * (i + 1)],  # Placeholder coordinates
+                        "text": row['header']
+                    })
+                
+                # Add cells
+                cells = row.get('cells', [])
+                for j, cell in enumerate(cells):
+                    result.append({
+                        "type": "table row",
+                        "score": 0.9,
+                        "bbox": [100 * j, 50 + 50 * i, 100 * (j + 1), 50 + 50 * (i + 1)],  # Placeholder coordinates
+                        "text": cell
+                    })
+            
+            # Extract spanning cells
+            spanning_cells = gemini_data.get('spanning_cells', [])
+            for cell in spanning_cells:
+                result.append({
+                    "type": "table spanning cell",
+                    "score": 0.9,
+                    "bbox": [
+                        100 * cell.get('col_start', 0),
+                        50 + 50 * cell.get('row_start', 0),
+                        100 * (cell.get('col_end', 0) + 1),
+                        50 + 50 * (cell.get('row_end', 0) + 1)
+                    ],  # Placeholder coordinates
+                    "text": cell.get('text', '')
+                })
+                
+        except Exception as e:
+            logging.error(f"Error converting Gemini data to table structure: {str(e)}")
+            
+        return result
 
     @staticmethod
     def is_caption(bx):

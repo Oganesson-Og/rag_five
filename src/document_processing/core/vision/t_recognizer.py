@@ -51,7 +51,7 @@ CLI Arguments:
 - threshold: Detection confidence threshold
 - mode: Recognition mode (layout/tsr)
 
-Author: InfiniFlow Team
+Author: Keith Satuku
 Version: 1.0.0
 License: MIT
 """

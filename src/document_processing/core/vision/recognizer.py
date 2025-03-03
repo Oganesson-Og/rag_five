@@ -6,165 +6,307 @@ Abstract base class providing core functionality for all vision recognition
 models in the document processing pipeline.
 
 Key Features:
-- Model loading and initialization
-- Input preprocessing
-- Output post-processing
-- Device management (CPU/GPU)
+- Support for multiple vision models (Gemini, Ollama)
+- Spatial reasoning and layout organization
 - Batch processing support
 - Model caching
-
-Technical Details:
-- Supports ONNX and PyTorch models
-- Automatic model downloading
-- Input size normalization
-- Configurable preprocessing steps
-- Batch size optimization
+- PDF layout analysis integration
 
 Dependencies:
-- torch>=2.0.0
-- onnxruntime>=1.15.0
+- google-generativeai>=0.3.0
+- ollama>=0.1.0
 - numpy>=1.24.0
 - PIL>=9.5.0
 
 Example Usage:
-    # Basic initialization
+    # Initialize for PDF processing
     recognizer = Recognizer(
-        model_path="path/to/model",
-        device="cuda"
+        model_type="gemini",
+        model_name="gemini-2.0-pro-exp-02-05",
+        label_list=["title", "text", "list", "table", "figure",
+                   "header", "footer", "sidebar", "caption"]
     )
-    
-    # Process single image
-    result = recognizer.process_image(image)
-    
-    # Batch processing
-    results = recognizer.process_batch(images)
-    
-    # Custom model implementation
-    class CustomRecognizer(Recognizer):
-        def preprocess(self, image):
-            # Custom preprocessing logic
-            return processed_image
-            
-        def postprocess(self, output):
-            # Custom postprocessing logic
-            return processed_output
-
-Author: InfiniFlow Team
-Version: 1.0.0
-License: MIT
 """
 
 import logging
 import os
 import math
 import numpy as np
-import cv2
+import base64
 from copy import deepcopy
-import torch
-import onnxruntime
-from huggingface_hub import snapshot_download
 from PIL import Image
-from typing import Union, List, Optional, Dict, Any
+from typing import Union, List, Optional, Dict, Any, Tuple
+from dataclasses import dataclass
+import google.generativeai as genai
+import requests
+from io import BytesIO
 
 from src.utils.file_utils import get_project_base_directory
-from .operators import *  # noqa: F403
+from .operators import *  
 from .operators import preprocess
 from . import operators
 
+@dataclass
+class LayoutElement:
+    """Structure for layout elements."""
+    type: str
+    text: str = ""
+    bbox: Tuple[float, float, float, float] = (0, 0, 0, 0)
+    font_size: float = 0
+    font_name: str = ""
+    is_bold: bool = False
+    in_row: int = 1
+    row_height: float = 0
+    is_row_header: bool = False
+    confidence: float = 1.0
 
 class Recognizer:
     """Base class for vision recognition models."""
     
+    DEFAULT_LABEL_LIST = [
+        "title", "text", "list", "table", "figure",
+        "header", "footer", "sidebar", "caption"
+    ]
+    
     def __init__(
         self,
-        model_dir: Optional[str] = None,
-        device: str = "cuda",
+        model_type: str = "gemini",  # "gemini" or "ollama"
+        model_name: Optional[str] = None,
+        api_key: Optional[str] = None,
+        device: str = "cpu",
         batch_size: int = 32,
         cache_dir: Optional[str] = None,
         label_list: Optional[List[str]] = None,
-        task_name: str = "document_layout"
+        task_name: str = "document_layout",
+        ollama_host: str = "http://localhost:11434",
+        model_dir: str = "",  # Added for compatibility
+        confidence: float = 0.5,  # Added for compatibility
+        merge_boxes: bool = True  # Added for compatibility
     ):
         """
         Initialize the Recognizer.
 
-        If `model_dir` is not provided, the model file will be looked for in the
-        project's default directory and downloaded via HuggingFace snapshot if not found.
-
         Args:
-            model_dir: Path to the directory containing model files.
-            device: Device to use (e.g., "cuda" or "cpu").
-            batch_size: Batch size for processing.
-            cache_dir: Directory for caching models.
-            label_list: List of labels.
-            task_name: Specific task name for model selection.
+            model_type: Type of vision model to use ("gemini" or "ollama")
+            model_name: Name of the specific model to use
+            api_key: API key for Gemini (if using Gemini)
+            device: Device to use (for Ollama)
+            batch_size: Batch size for processing
+            cache_dir: Directory for caching models
+            label_list: List of labels (defaults to PDF layout labels)
+            task_name: Specific task name
+            ollama_host: Host URL for Ollama API
+            model_dir: Directory for model files (compatibility)
+            confidence: Confidence threshold (compatibility)
+            merge_boxes: Whether to merge overlapping boxes (compatibility)
         """
+        self.model_type = model_type.lower()
+        self.model_name = model_name
         self.device = device
         self.batch_size = batch_size
         self.cache_dir = cache_dir
-        self.label_list = label_list or []
+        self.label_list = label_list or self.DEFAULT_LABEL_LIST
         self.task_name = task_name
+        self.ollama_host = ollama_host
+        self.confidence_threshold = confidence
+        self.merge_boxes = merge_boxes
 
-        # Determine model directory and file path
-        if not model_dir:
-            model_dir = os.path.join(get_project_base_directory(), "rag/res/deepdoc")
-            model_file_path = os.path.join(model_dir, task_name + ".onnx")
-            if not os.path.exists(model_file_path):
-                model_dir = snapshot_download(
-                    repo_id="InfiniFlow/deepdoc",
-                    local_dir=os.path.join(get_project_base_directory(), "rag/res/deepdoc"),
-                    local_dir_use_symlinks=False
-                )
-                model_file_path = os.path.join(model_dir, task_name + ".onnx")
+        if self.model_type == "gemini":
+            if not api_key:
+                raise ValueError("API key required for Gemini model")
+            genai.configure(api_key=api_key)
+            self.model = genai.GenerativeModel(self.model_name or "gemini-2.0-pro-exp-02-05")
+        elif self.model_type == "ollama":
+            self.model_name = self.model_name or "Qwen/Qwen2.5-VL-7B"
+            try:
+                response = requests.get(f"{self.ollama_host}/api/tags")
+                if response.status_code != 200:
+                    raise ConnectionError(f"Failed to connect to Ollama at {self.ollama_host}")
+            except Exception as e:
+                raise ConnectionError(f"Failed to connect to Ollama: {str(e)}")
         else:
-            model_file_path = os.path.join(model_dir, task_name + ".onnx")
+            raise ValueError(f"Unsupported model type: {model_type}")
 
-        if not os.path.exists(model_file_path):
-            raise ValueError("Model file not found: {}".format(model_file_path))
+    def _encode_image(self, image: Union[str, Image.Image, np.ndarray]) -> str:
+        """Convert image to base64 string."""
+        if isinstance(image, str):
+            with open(image, "rb") as img_file:
+                return base64.b64encode(img_file.read()).decode('utf-8')
+        elif isinstance(image, np.ndarray):
+            image = Image.fromarray(image)
         
-        self.model_dir = model_dir
+        if isinstance(image, Image.Image):
+            buffered = BytesIO()
+            image.save(buffered, format="PNG")
+            return base64.b64encode(buffered.getvalue()).decode('utf-8')
+        
+        raise ValueError("Unsupported image type")
 
-        # ONNX Runtime session options and session initialization
-        self.run_options = onnxruntime.RunOptions()
+    def _prepare_prompt(self, image: Union[str, Image.Image, np.ndarray]) -> dict:
+        """Prepare prompt for vision models with PDF-specific instructions."""
+        base64_image = self._encode_image(image)
+        
+        prompt_text = f"""
+        Analyze this document image and identify layout elements. For each element, provide:
+        1. type (one of: {', '.join(self.label_list)})
+        2. bbox coordinates [x0,y0,x1,y1]
+        3. confidence score
 
-        if onnxruntime.get_device() == "GPU":
-            options = onnxruntime.SessionOptions()
-            options.enable_cpu_mem_arena = False
-            cuda_provider_options = {
-                "device_id": 0,  # Use specific GPU
-                "gpu_mem_limit": 512 * 1024 * 1024,  # Limit GPU memory
-                "arena_extend_strategy": "kNextPowerOfTwo",
+        Return results in JSON format with fields:
+        - type: element type
+        - bbox: [x0,y0,x1,y1] coordinates
+        - score: confidence (0-1)
+        """
+        
+        if self.model_type == "gemini":
+            return {
+                "contents": [{
+                    "parts": [
+                        {"text": prompt_text},
+                        {"inline_data": {
+                            "mime_type": "image/jpeg",
+                            "data": base64_image
+                        }}
+                    ]
+                }]
             }
-            self.ort_sess = onnxruntime.InferenceSession(
-                model_file_path, options=options,
-                providers=['CUDAExecutionProvider'],
-                provider_options=[cuda_provider_options]
-            )
-            self.run_options.add_run_config_entry("memory.enable_memory_arena_shrinkage", "gpu:0")
-            logging.info(f"Recognizer {task_name} uses GPU")
-        else:
-            self.ort_sess = onnxruntime.InferenceSession(model_file_path, providers=['CPUExecutionProvider'])
-            self.run_options.add_run_config_entry("memory.enable_memory_arena_shrinkage", "cpu")
-            logging.info(f"Recognizer {task_name} uses CPU")
+        else:  # ollama
+            return {
+                "model": self.model_name,
+                "prompt": prompt_text,
+                "images": [base64_image],
+                "stream": False
+            }
 
-        self.input_names = [node.name for node in self.ort_sess.get_inputs()]
-        self.output_names = [node.name for node in self.ort_sess.get_outputs()]
-        self.input_shape = self.ort_sess.get_inputs()[0].shape[2:4]
+    def _box_to_layout_element(self, box: Dict[str, Any]) -> LayoutElement:
+        """Convert a box detection to a LayoutElement."""
+        return LayoutElement(
+            type=box["type"],
+            bbox=tuple(box["bbox"]),
+            confidence=box.get("score", 1.0)
+        )
 
-    def _load_model(self):
-        """Load model from path or download if needed."""
-        pass
+    async def process_page(self, page_image: Union[str, Image.Image, np.ndarray]) -> List[LayoutElement]:
+        """
+        Process a single page image and return layout elements.
+        This is the main method used by the PDF extractor.
+        """
+        boxes = await self._get_vision_model_response(page_image)
         
-    def preprocess(self, image: Union[str, Image.Image]) -> np.ndarray:
-        """Preprocess input image."""
-        pass
+        # Filter by confidence
+        boxes = [box for box in boxes if box.get('score', 0) >= self.confidence_threshold]
         
-    def postprocess(self, output: np.ndarray) -> Dict[str, Any]:
-        """Postprocess model output."""
-        pass
+        # Apply spatial reasoning if merge_boxes is True
+        if self.merge_boxes and boxes:
+            boxes = self.sort_Y_firstly(boxes, 10)
+            boxes = self.sort_X_firstly(boxes, 10)
+            boxes = self.layouts_cleanup(boxes, boxes)
         
-    def __call__(self, image: Union[str, Image.Image]) -> Dict[str, Any]:
-        """Process single image."""
-        pass
+        # Convert to LayoutElements
+        return [self._box_to_layout_element(box) for box in boxes]
+
+    async def _get_vision_model_response(self, image: Union[str, Image.Image, np.ndarray]) -> List[Dict]:
+        """Get response from vision model."""
+        prompt = self._prepare_prompt(image)
+        
+        try:
+            if self.model_type == "gemini":
+                response = await self.model.generate_content(**prompt)
+                # Parse Gemini response to extract bounding boxes
+                return self._parse_gemini_response(response.text)
+            else:  # ollama
+                response = requests.post(
+                    f"{self.ollama_host}/api/generate",
+                    json=prompt
+                )
+                if response.status_code != 200:
+                    raise Exception(f"Ollama API error: {response.text}")
+                # Parse Ollama response to extract bounding boxes
+                return self._parse_ollama_response(response.json()["response"])
+        except Exception as e:
+            logging.error(f"Vision model error: {str(e)}")
+            return []
+
+    def _parse_gemini_response(self, response_text: str) -> List[Dict]:
+        """Parse Gemini response into standardized format."""
+        try:
+            import json
+            boxes = json.loads(response_text)
+            return boxes
+        except Exception as e:
+            logging.error(f"Failed to parse Gemini response: {str(e)}")
+            return []
+
+    def _parse_ollama_response(self, response_text: str) -> List[Dict]:
+        """Parse Ollama response into standardized format."""
+        try:
+            import json
+            boxes = json.loads(response_text)
+            return boxes
+        except Exception as e:
+            logging.error(f"Failed to parse Ollama response: {str(e)}")
+            return []
+
+    async def __call__(self, image_list: List[Union[str, Image.Image, np.ndarray]], 
+                      thr: float = 0.7, 
+                      batch_size: int = 16) -> List[List[Dict]]:
+        """Process images and return detected elements."""
+        results = []
+        
+        # Process images in batches
+        for i in range(0, len(image_list), batch_size):
+            batch = image_list[i:i + batch_size]
+            batch_results = []
+            
+            # Process each image in the batch
+            for image in batch:
+                # Get predictions from vision model
+                boxes = await self._get_vision_model_response(image)
+                
+                # Filter by confidence threshold
+                boxes = [box for box in boxes if box.get('score', 0) >= thr]
+                
+                # Apply spatial reasoning
+                if boxes:
+                    # First sort vertically to establish reading order
+                    boxes = self.sort_Y_firstly(boxes, 10)
+                    
+                    # Sort horizontally within same vertical regions
+                    boxes = self.sort_X_firstly(boxes, 10)
+                    
+                    # Find and handle overlapping elements
+                    boxes_sorted = sorted(boxes, key=lambda x: x["top"])
+                    for idx, box in enumerate(boxes):
+                        # Find overlapping boxes
+                        overlapped_idx = self.find_overlapped(box, boxes_sorted)
+                        if overlapped_idx is not None:
+                            # If significant overlap found, keep the one with higher score
+                            if boxes[overlapped_idx].get('score', 0) > box.get('score', 0):
+                                boxes[idx] = None
+                    
+                    # Remove None values from boxes list
+                    boxes = [b for b in boxes if b is not None]
+                    
+                    # Clean up remaining overlaps
+                    boxes = self.layouts_cleanup(boxes, boxes)
+                    
+                    # Find horizontally aligned elements
+                    for idx, box in enumerate(boxes):
+                        closest_idx = self.find_horizontally_tightest_fit(box, boxes[:idx] + boxes[idx+1:])
+                        if closest_idx is not None:
+                            # Mark horizontally aligned elements with same layout number
+                            box['layoutno'] = boxes[closest_idx].get('layoutno', str(idx))
+                    
+                    # Final sort based on layout numbers and position
+                    boxes = self.sort_C_firstly(boxes) if any('C' in box for box in boxes) else \
+                           self.sort_R_firstly(boxes) if any('R' in box for box in boxes) else \
+                           boxes
+                
+                batch_results.append(boxes)
+            
+            results.extend(batch_results)
+        
+        return results
 
     @staticmethod
     def sort_Y_firstly(arr, threashold):

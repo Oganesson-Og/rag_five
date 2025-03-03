@@ -169,11 +169,10 @@ class ContentIngester:
             
             # Initialize logger
             self.logger = logging.getLogger(self.__class__.__name__)
-            
             # Set default acceleration config if not present
             if 'acceleration' not in self.config:
                 self.config['acceleration'] = {
-                    'device': 'auto',
+                    'device': 'mps',
                     'num_threads': 8
                 }
             
@@ -203,25 +202,32 @@ class ContentIngester:
             directory: Path to content directory
         """
         try:
-            # Add detailed progress tracking
+            # Count total files to process
+            total_files = sum(1 for _ in directory.rglob('*') if _.is_file() and _.suffix.lower() in self.SUPPORTED_EXTENSIONS)
+            
+            # Initialize progress tracking
             self.progress_tracker = ProgressTracker(
-                total_files=sum(1 for _ in directory.rglob('*') if _.is_file()),
+                total_files=total_files,
                 log_interval=10  # Log progress every 10%
             )
             
+            self.logger.info(f"Starting ingestion of {total_files} files from {directory}")
+            
             # First, find and process syllabus files
             syllabus_files = await self._find_syllabus_files(directory)
+            self.logger.info(f"Found {len(syllabus_files)} syllabus files")
             syllabus_content = await self._process_syllabus_files(syllabus_files)
             
             # Then process all other content files
             content_files = self._get_content_files(directory)
+            self.logger.info(f"Found {len(content_files)} content files to process")
             
             # Group files by subject/topic based on syllabus
             organized_content = self._organize_content(content_files, syllabus_content)
             
             # Process each group
             for subject, files in organized_content.items():
-                logger.info(f"Processing content for subject: {subject}")
+                self.logger.info(f"Processing {len(files)} files for subject: {subject}")
                 await self._process_content_group(subject, files)
                 
             # Display final statistics
@@ -263,19 +269,34 @@ class ContentIngester:
         
         for file_path in files:
             try:
-                # Process through pipeline
+                # Determine modality based on file extension
+                modality = self._detect_modality(file_path)
+                
+                # Process through pipeline with syllabus-specific options
                 document = await self.pipeline.process_document(
                     source=str(file_path),
-                    modality=ContentModality.TEXT,
-                    options={'is_syllabus': True}
+                    modality=modality,  # Use detected modality instead of hardcoding TEXT
+                    options={
+                        'is_syllabus': True,
+                        'syllabus_type': 'course_structure',
+                        'file_path': str(file_path),
+                        'document_type': 'syllabus'
+                    }
                 )
                 
                 # Extract course structure
                 structure = self._extract_course_structure(document)
                 syllabus_content.update(structure)
                 
+                # Mark as processed
+                self.processed_files.add(str(file_path))
+                if self.progress_tracker:
+                    self.progress_tracker.update(success=True)
+                
             except Exception as e:
                 logger.error(f"Error processing syllabus {file_path}: {str(e)}")
+                if self.progress_tracker:
+                    self.progress_tracker.update(success=False)
                 
         return syllabus_content
         
@@ -334,23 +355,16 @@ class ContentIngester:
                 # Determine modality
                 modality = self._detect_modality(file_path)
                 
-                # Read file content
-                with open(file_path, 'rb') as f:
-                    content = f.read()
-                
-                # Create document object
-                document = Document(
-                    content=content,
+                # Process through pipeline using the file path directly
+                # This matches how process_document expects to be called
+                processed_doc = await self.pipeline.process_document(
                     source=str(file_path),
                     modality=modality,
-                    doc_info={
+                    options={
                         'subject': subject,
                         'file_path': str(file_path)
                     }
                 )
-                
-                # Process through pipeline
-                processed_doc = await self.pipeline.process_document(document)
                 
                 # Mark as processed
                 self.processed_files.add(str(file_path))

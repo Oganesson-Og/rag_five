@@ -49,12 +49,23 @@ from datetime import datetime
 import io
 import os
 import tempfile
-from typing import Dict, Any, List, Optional, Tuple, Generator
+from typing import Dict, Any, List, Optional, Tuple, Generator, Union
 from dataclasses import dataclass
 from .models import Document
 from .base import BaseExtractor, ExtractorResult
 from enum import Enum
 import cv2  # For diagram / image analysis
+from ..core.vision.table_structure_recognizer import TableStructureRecognizer
+from src.utils.file_utils import get_project_base_directory
+from PIL import Image
+import subprocess
+
+# Check if OpenCV is available
+try:
+    import cv2  # For diagram / image analysis
+    HAS_OPENCV = True
+except ImportError:
+    HAS_OPENCV = False
 
 # Table extraction libraries with checks
 try:
@@ -162,7 +173,7 @@ class PDFExtractor(BaseExtractor):
             },
             'acceleration': {
                 'num_threads': 8,
-                'device': 'auto'  # 'auto', 'cuda', 'mps', 'cpu'
+                'device': 'mps'  # 'auto', 'cuda', 'mps', 'cpu'
             }
         }
 
@@ -174,15 +185,26 @@ class PDFExtractor(BaseExtractor):
         self.base_font_size = 12.0  # Updated during processing
 
         # Determine device for acceleration
-        self.device = self._determine_device()
+        self.device = self._get_device_from_config()
         
         # Initialize OCR if requested
         self.ocr = self._init_ocr()
+        
+        # Check for Ghostscript if Camelot is available
+        if HAS_CAMELOT:
+            if not self._check_ghostscript_installed():
+                self.logger.warning("Ghostscript is not installed, which is required for Camelot table extraction. "
+                                   "You can install it using the instructions here: "
+                                   "https://camelot-py.readthedocs.io/en/master/user/install-deps.html")
+                self.logger.warning("Table extraction will fall back to alternative methods.")
 
         # Initialize Docling extractor with acceleration and picture annotation support
         try:
             from ..extractors.docling_extractor import DoclingExtractor
             picture_config = default_config.get('picture_annotation', {})
+            
+            # Determine if remote services should be enabled
+            enable_remote = picture_config.get('enable_remote_services', True)
             
             self.docling = DoclingExtractor(
                 offline_mode=config.get('offline_mode', False),
@@ -194,10 +216,11 @@ class PDFExtractor(BaseExtractor):
                 picture_prompt=picture_config.get('prompt', 
                     "Describe the image in three sentences. Be concise and accurate."),
                 api_config=picture_config.get('api_config'),
-                num_threads=default_config['acceleration'].get('num_threads', 8)
+                num_threads=default_config['acceleration'].get('num_threads', 8),
+                enable_remote_services=enable_remote  # Explicitly enable remote services
             )
             self.has_docling = True
-            self.logger.info(f"Docling extraction initialized successfully on {self.device}")
+            self.logger.info(f"Docling extraction initialized successfully on {self.device} with remote services {'enabled' if enable_remote else 'disabled'}")
         except ImportError:
             self.has_docling = False
             self.logger.warning("Docling not available, falling back to default extraction")
@@ -210,25 +233,45 @@ class PDFExtractor(BaseExtractor):
     def _init_layout_recognizer(self):
         """Initialize layout recognition capabilities."""
         try:
-            from ..core.vision.layout_recognizer import LayoutRecognizer
+            from ..core.vision.recognizer import Recognizer
 
-            layout_config = self.config.get('layout', {})
-            self.layout_recognizer = LayoutRecognizer(
-                model_dir=layout_config.get('model_dir', ""),
-                device=layout_config.get('device', "cuda"),
+            # Get layout config from PDF section
+            pdf_config = self.config
+            layout_config = pdf_config.get('layout', {})
+            
+            # If API key not in layout config, try to get from model config
+            if not layout_config.get('api_key'):
+                model_config = self.config.get('model', {})
+                # Try Gemini API key first, then fallback to other options
+                layout_config['api_key'] = (
+                    model_config.get('gemini_api_key') or 
+                    model_config.get('api_key')
+                )
+
+            if not layout_config.get('api_key'):
+                raise ValueError("No API key found in configuration for layout recognition")
+
+            # Get device from config or use system default
+            device = layout_config.get('device') or self.config.get('acceleration', {}).get('device', 'cpu')
+
+            self.layout_recognizer = Recognizer(
+                model_type=layout_config.get('model_type', 'gemini'),  # Default to Gemini
+                model_name=layout_config.get('model_name', 'gemini-pro-vision'),  # Use Gemini Pro Vision by default
+                api_key=layout_config['api_key'],
+                device=device,
                 batch_size=layout_config.get('batch_size', 32),
                 cache_dir=layout_config.get('cache_dir'),
-                model_type=layout_config.get('model_type', 'yolov10'),
                 confidence=layout_config.get('confidence', 0.5),
                 merge_boxes=layout_config.get('merge_boxes', True),
                 label_list=layout_config.get('label_list', [
                     "title", "text", "list", "table", "figure",
                     "header", "footer", "sidebar", "caption"
                 ]),
-                task_name=layout_config.get('task_name', 'document_layout')
+                task_name=layout_config.get('task_name', 'document_layout'),
+                ollama_host=layout_config.get('ollama_host', 'http://localhost:11434')
             )
             self.has_layout_recognition = True
-            self.logger.info("Layout recognition initialized successfully")
+            self.logger.info("Layout recognition initialized successfully with Gemini Vision")
 
         except Exception as e:
             self.logger.warning(f"Layout recognition not available: {str(e)}")
@@ -245,6 +288,62 @@ class PDFExtractor(BaseExtractor):
                 self.torch_device = torch.device('cpu')
         except Exception:
             self.torch_device = torch.device('cpu')
+
+    def _init_ocr(self):
+        """
+        Initialize OCR component if requested in config.
+        
+        Returns:
+            OCR instance or None if OCR is not enabled
+        """
+        try:
+            if self.config.get('use_ocr', False):
+                from ..core.vision.ocr import OCR
+                
+                self.logger.info(f"Initializing OCR with engine: {self.config.get('ocr_engine', 'tesseract')}")
+                
+                # Initialize OCR with the entire config dictionary
+                # The OCR class will extract what it needs
+                self.ocr = OCR(
+                    config=self.config,
+                    languages=self.config.get('ocr_languages', ['en']),
+                    preserve_layout=self.config.get('preserve_layout', True),
+                    enhance_resolution=self.config.get('enhance_resolution', True),
+                    use_paligemma=self.config.get('use_paligemma', False)
+                )
+                
+                return self.ocr
+            else:
+                self.logger.info("OCR is disabled in configuration")
+                return None
+                
+        except Exception as e:
+            self.logger.warning(f"Failed to initialize OCR: {str(e)}")
+            return None
+
+    def _get_device_from_config(self) -> str:
+        """
+        Get the device setting from configuration.
+        
+        Returns:
+            str: Device name ('cpu', 'cuda', 'mps', or 'auto')
+        """
+        device = self.config.get('acceleration', {}).get('device', 'cpu')
+        
+        # If auto, try to determine the best device
+        if device == 'auto':
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    return 'cuda'
+                elif hasattr(torch, 'backends') and hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+                    return 'mps'
+                else:
+                    return 'cpu'
+            except ImportError:
+                return 'cpu'
+                
+        return device
 
     async def extract(self, document: 'Document') -> 'Document':
         """
@@ -268,11 +367,16 @@ class PDFExtractor(BaseExtractor):
             
             # Extract text using Docling if available
             if self.has_docling:
-                docling_result = self.docling.process_file(content)
-                if docling_result.success:
-                    document.content = docling_result.text
-                else:
-                    self.logger.warning(f"Docling extraction failed: {docling_result.error}")
+                try:
+                    docling_result = self.docling.process_file(content)
+                    if docling_result.success:
+                        document.content = docling_result.text
+                    else:
+                        self.logger.warning(f"Docling extraction failed: {docling_result.error}")
+                        # Fall back to default text extraction
+                        document.content = self._extract_structured_text(doc, {})
+                except Exception as e:
+                    self.logger.warning(f"Docling extraction failed with exception: {str(e)}")
                     # Fall back to default text extraction
                     document.content = self._extract_structured_text(doc, {})
             else:
@@ -280,26 +384,43 @@ class PDFExtractor(BaseExtractor):
                 document.content = self._extract_structured_text(doc, {})
             
             # Extract tables using voting/adaptive approach
-            tables = self._extract_tables_with_structure(doc)
-            if tables:
-                document.doc_info['tables'] = tables
-                
-                # Add table context and references
-                for table in tables:
-                    if 'region' in table:
-                        table['context'] = self._get_table_context(doc[table.get('page', 1) - 1], table['region'])
+            try:
+                tables = self._extract_tables_with_structure(doc)
+                if tables:
+                    document.doc_info['tables'] = tables
+                    
+                    # Add table context and references
+                    for table in tables:
+                        if 'region' in table:
+                            table['context'] = self._get_table_context(doc[table.get('page', 1) - 1], table['region'])
+            except Exception as e:
+                self.logger.warning(f"Table extraction failed: {str(e)}")
+                document.doc_info['tables'] = []
             
             # Extract and analyze images/diagrams with enhanced context
-            images = self._extract_images_with_context(doc)
-            if images:
-                document.doc_info['images'] = images
-                # Separate diagrams from regular images
-                diagrams = [img for img in images if img['metadata'].get('is_diagram')]
-                if diagrams:
-                    document.doc_info['diagrams'] = diagrams
+            try:
+                images = self._extract_images_with_context(doc)
+                if images:
+                    document.doc_info['images'] = images
+                    # Separate diagrams from regular images
+                    diagrams = [img for img in images if img['metadata'].get('is_diagram')]
+                    if diagrams:
+                        document.doc_info['diagrams'] = diagrams
+            except Exception as e:
+                self.logger.warning(f"Image extraction failed: {str(e)}")
+                document.doc_info['images'] = []
             
             # Add metadata
-            document.doc_info.update(self._extract_pdf_metadata(doc))
+            document.doc_info['metadata'] = self._extract_pdf_metadata(doc)
+            
+            # Add cross-references
+            self._add_cross_references(document)
+            
+            # Check if document is scanned
+            document.doc_info['is_scanned'] = self._check_if_scanned(doc)
+            
+            # Close the document
+            doc.close()
             
             return document
             
@@ -451,7 +572,21 @@ class PDFExtractor(BaseExtractor):
         """
         Simple aggregator that joins recognized text blocks from the structure.
         A real implementation might produce a more advanced layout/JSON, etc.
+        
+        If structure is empty or doesn't contain page_layouts, falls back to basic text extraction.
         """
+        # Check if structure has page_layouts
+        if not structure or 'page_layouts' not in structure:
+            # Fall back to basic text extraction
+            combined_text = []
+            for page_num in range(len(doc)):
+                page = doc[page_num]
+                page_text = page.get_text().strip()
+                if page_text:
+                    combined_text.append(f"--- Page {page_num+1} ---\n{page_text}")
+            return "\n\n".join(combined_text)
+        
+        # Process structured layout if available
         combined_text = []
         for page_num, page_layout in enumerate(structure['page_layouts']):
             page_text = []
@@ -463,989 +598,951 @@ class PDFExtractor(BaseExtractor):
         return "\n\n".join(combined_text)
 
     def _extract_tables_with_structure(self, doc: fitz.Document) -> List[Dict[str, Any]]:
-        """Extract tables using Camelot, tabula, or pdfplumber. Falls back to heuristics as needed."""
-        # Re-uses existing code from your original snippet, with references removed for OCR.
+        """Extract tables using the unified extraction strategy."""
         tables = []
-        table_config = self.config.get('table_extraction', {})
-        method = table_config.get('method', 'auto')
-        strategy = table_config.get('strategy', 'adaptive')
-
-        with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as temp_file:
-            temp_path = temp_file.name
-            doc.save(temp_path)
-
-            try:
-                for page_num, page in enumerate(doc):
-                    page_tables = self._extract_page_tables(page_num, page, temp_path, table_config, method, strategy)
-                    tables.extend(page_tables)
-            except Exception as e:
-                self.logger.error(f"Table extraction error: {str(e)}")
-            finally:
+        
+        # Create a temporary file for the PDF
+        temp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as temp_file:
+                temp_path = temp_file.name
+                doc.save(temp_path)
+                
+                # Use the unified extraction method
+                tables = self.extract_tables(doc, temp_path)
+                
+        except Exception as e:
+            self.logger.error(f"Table extraction error: {str(e)}")
+            # Return empty list on failure
+            tables = []
+            
+        finally:
+            # Clean up temporary file
+            if temp_path and os.path.exists(temp_path):
                 try:
                     os.unlink(temp_path)
                 except Exception as e:
                     self.logger.warning(f"Failed to delete temporary PDF: {str(e)}")
-
+                    
         return tables
 
-    def _extract_page_tables(self, page_num, page, pdf_path, table_config, method, strategy):
-        """Helper that attempts to extract tables from a single page."""
-        page_tables = []
-        table_candidates = []
-
-        if strategy == 'vote':
-            # Try all methods, gather results, pick best.
-            if HAS_CAMELOT:
-                c_tables = self._extract_tables_camelot(pdf_path, page_num+1, table_config)
-                table_candidates.append(('camelot', c_tables))
-            if HAS_TABULA:
-                t_tables = self._extract_tables_tabula(pdf_path, page_num+1, table_config)
-                table_candidates.append(('tabula', t_tables))
-            if HAS_PDFPLUMBER:
-                p_tables = self._extract_tables_pdfplumber(pdf_path, page_num+1, table_config)
-                table_candidates.append(('pdfplumber', p_tables))
-
-            page_tables = self._select_best_tables_by_voting(table_candidates)
-
-        else:
-            # 'adaptive' or 'sequential' approach.
-            # Decide table type, prefer a particular library, else fallback.
-            table_type = self._detect_table_type(page) if strategy == 'adaptive' else None
-            preferred_extractor = table_config.get('table_types', {}).get(table_type)
-
-            if strategy == 'adaptive' and preferred_extractor:
-                page_tables = self._try_preferred_extractor(
-                    preferred_extractor, pdf_path, page_num+1, table_config
-                )
-
-            if not page_tables:
-                # Fallback to method or auto sequence.
-                if method in ['auto', 'camelot'] and HAS_CAMELOT and not page_tables:
-                    page_tables = self._extract_tables_camelot(pdf_path, page_num+1, table_config)
-                if method in ['auto', 'tabula'] and HAS_TABULA and not page_tables:
-                    page_tables = self._extract_tables_tabula(pdf_path, page_num+1, table_config)
-                if method in ['auto', 'pdfplumber'] and HAS_PDFPLUMBER and not page_tables:
-                    page_tables = self._extract_tables_pdfplumber(pdf_path, page_num+1, table_config)
-
-        # If still no tables found, try simple heuristic.
-        if not page_tables and table_config.get('fallback_to_heuristic', True):
-            self.logger.info(f"Using heuristic table detection on page {page_num+1}")
-            tables_heuristic = self._heuristic_table_detection(page)
-            page_tables.extend(tables_heuristic)
-
-        # Add page info, etc.
-        for tb in page_tables:
-            tb['page'] = page_num + 1
-
-        return page_tables
-
-    def _try_preferred_extractor(self, extractor_name, pdf_path, page_number, config):
-        """Attempt to use the user-preferred extractor for this page/table type."""
-        if extractor_name == 'camelot' and HAS_CAMELOT:
-            return self._extract_tables_camelot(pdf_path, page_number, config)
-        elif extractor_name == 'tabula' and HAS_TABULA:
-            return self._extract_tables_tabula(pdf_path, page_number, config)
-        elif extractor_name == 'pdfplumber' and HAS_PDFPLUMBER:
-            return self._extract_tables_pdfplumber(pdf_path, page_number, config)
-        return []
-
-    def _extract_tables_camelot(
-        self, 
-        pdf_path: str, 
-        page_number: int, 
-        config: Dict[str, Any]
-    ) -> List[Dict[str, Any]]:
-        """Extract tables using Camelot library."""
-        if not HAS_CAMELOT:
-            return []
-        
-        tables = []
-        try:
-            # Extract tables using specified flavor
-            flavor = config.get('flavor', 'lattice')
-            line_scale = config.get('line_scale', 40)
+    def _regions_overlap(self, region1, region2):
+        """Check if two regions (bounding boxes) overlap."""
+        if not region1 or not region2:
+            return False
             
-            camelot_tables = camelot.read_pdf(
+        x01, y01, x11, y11 = region1
+        x02, y02, x12, y12 = region2
+        
+        # Check if one rectangle is to the left of the other
+        if x11 < x02 or x12 < x01:
+            return False
+            
+        # Check if one rectangle is above the other
+        if y11 < y02 or y12 < y01:
+            return False
+            
+        return True
+
+    def _check_ghostscript_installed(self) -> bool:
+        """
+        Check if Ghostscript is installed on the system.
+        
+        Ghostscript is required for Camelot to extract tables from PDFs.
+        This method checks for Ghostscript in the same way that Camelot does.
+        
+        Returns:
+            True if Ghostscript is installed, False otherwise
+        """
+        try:
+            # First try the Camelot way of checking for Ghostscript
+            from ctypes.util import find_library
+            import sys
+            
+            self.logger.debug("Checking for Ghostscript using ctypes.util.find_library")
+            
+            # Check based on platform (same as Camelot does)
+            if sys.platform in ["linux", "darwin"]:
+                # For Linux and macOS
+                library = find_library("gs")
+                result = library is not None
+                self.logger.debug(f"Ghostscript library check result: {result}, library path: {library}")
+                if result:
+                    return True
+            elif sys.platform == "win32":
+                # For Windows
+                import ctypes
+                library = find_library(
+                    "".join(("gsdll", str(ctypes.sizeof(ctypes.c_voidp) * 8), ".dll"))
+                )
+                result = library is not None
+                self.logger.debug(f"Ghostscript library check result: {result}, library path: {library}")
+                if result:
+                    return True
+            
+            # If the library check failed, fall back to checking for the executable
+            self.logger.debug("Library check failed, falling back to executable check")
+            
+            # Try to find the Ghostscript executable
+            gs_command = "gs"
+            
+            # Check if we're on Windows
+            if sys.platform == "win32":
+                gs_command = "gswin64c"  # 64-bit Ghostscript on Windows
+            
+            self.logger.debug(f"Checking for Ghostscript using command: {gs_command}")
+                
+            # Try to run Ghostscript with version flag
+            result = subprocess.run(
+                [gs_command, "--version"], 
+                stdout=subprocess.PIPE, 
+                stderr=subprocess.PIPE,
+                timeout=5
+            )
+            
+            # Log the result for debugging
+            self.logger.debug(f"Ghostscript check result: returncode={result.returncode}, stdout={result.stdout.decode().strip()}, stderr={result.stderr.decode().strip()}")
+            
+            # If the command succeeded, Ghostscript is installed
+            return result.returncode == 0
+            
+        except (subprocess.SubprocessError, FileNotFoundError, ImportError) as e:
+            # Log the specific error
+            self.logger.debug(f"Ghostscript check failed with error: {str(e)}")
+            # If the command failed or the executable wasn't found
+            return False
+
+    def _detect_table_borders(self, page: fitz.Page) -> bool:
+        """
+        Analyze a page to determine if it contains tables with visible borders.
+        
+        This method counts horizontal and vertical lines on the page to determine
+        if there are likely to be bordered tables present.
+        
+        Args:
+            page: PyMuPDF page object
+            
+        Returns:
+            True if the page likely contains bordered tables, False otherwise
+        """
+        try:
+            # Get page dimensions
+            page_width = page.rect.width
+            page_height = page.rect.height
+            
+            # Extract paths (lines, rectangles, etc.)
+            paths = page.get_drawings()
+            
+            # Count horizontal and vertical lines
+            h_lines = 0
+            v_lines = 0
+            
+            for path in paths:
+                # Check each item in the path
+                for item in path["items"]:
+                    if item[0] == "l":  # Line segment
+                        x0, y0 = item[1]  # Start point
+                        x1, y1 = item[2]  # End point
+                        
+                        # Calculate line length
+                        length = ((x1 - x0) ** 2 + (y1 - y0) ** 2) ** 0.5
+                        
+                        # Skip very short lines
+                        if length < 10:
+                            continue
+                            
+                        # Check if horizontal (y coordinates are similar)
+                        if abs(y1 - y0) < 3:
+                            h_lines += 1
+                            
+                        # Check if vertical (x coordinates are similar)
+                        elif abs(x1 - x0) < 3:
+                            v_lines += 1
+            
+            # Also check for rectangles which might be table cells
+            rectangles = 0
+            for path in paths:
+                if path["type"] == "rectangle":
+                    rectangles += 1
+            
+            # Determine if the page has enough lines to indicate tables with borders
+            # Thresholds can be adjusted based on experience
+            if (h_lines >= 5 and v_lines >= 3) or rectangles >= 10:
+                return True
+                
+            # Check for explicit table markup in the page structure
+            # This can catch tables that are semantically marked but don't have visible lines
+            blocks = page.get_text("dict")["blocks"]
+            for block in blocks:
+                if block.get("type") == 1:  # Image block, might be a table
+                    return True
+                    
+            return False
+            
+        except Exception as e:
+            self.logger.warning(f"Table border detection failed: {str(e)}")
+            return False
+
+    def _extract_tables_unified(self, pdf_path: str, page_number: int, page: fitz.Page, 
+                             has_borders: bool) -> List[Dict[str, Any]]:
+        """
+        Extract tables using a unified approach that combines multiple extraction methods.
+        
+        Args:
+            pdf_path: Path to the PDF file
+            page_number: Page number (0-indexed)
+            page: PyMuPDF page object
+            has_borders: Whether the page has visible table borders
+            
+        Returns:
+            List of extracted tables
+        """
+        tables = []
+        extraction_method = self.config.get('table_extraction', {}).get('method', 'auto')
+        
+        # Get the appropriate extraction method based on table type
+        if extraction_method == 'auto':
+            if has_borders:
+                method = self.config.get('table_extraction', {}).get('table_types', {}).get('bordered', 'camelot')
+            else:
+                method = self.config.get('table_extraction', {}).get('table_types', {}).get('borderless', 'tabula')
+        else:
+            method = extraction_method
+            
+        self.logger.info(f"Using {method} for table extraction on page {page_number+1}")
+        
+        # Try the primary extraction method
+        if method == 'camelot':
+            try:
+                if has_borders:
+                    tables = self._extract_with_camelot(pdf_path, page_number+1, flavor='lattice')
+                else:
+                    tables = self._extract_with_camelot(pdf_path, page_number+1, flavor='stream')
+            except Exception as e:
+                self.logger.warning(f"Table extraction with {method} failed: {str(e)}")
+                
+        elif method == 'tabula':
+            try:
+                if has_borders:
+                    tables = self._extract_with_tabula(pdf_path, page_number+1, lattice=True)
+                else:
+                    tables = self._extract_with_tabula(pdf_path, page_number+1, lattice=False, guess=True)
+            except Exception as e:
+                self.logger.warning(f"Table extraction with {method} failed: {str(e)}")
+                
+        elif method == 'pdfplumber':
+            try:
+                tables = self._extract_with_pdfplumber(pdf_path, page_number+1)
+            except Exception as e:
+                self.logger.warning(f"Table extraction with {method} failed: {str(e)}")
+        
+        # If primary method failed, try fallback methods
+        if not tables and self.config.get('table_extraction', {}).get('fallback_to_heuristic', True):
+            self.logger.info(f"Primary extraction method failed, trying fallback methods")
+            
+            # Try camelot if not already tried
+            if method != 'camelot':
+                try:
+                    if has_borders:
+                        tables = self._extract_with_camelot(pdf_path, page_number+1, flavor='lattice')
+                    else:
+                        tables = self._extract_with_camelot(pdf_path, page_number+1, flavor='stream')
+                except Exception as e:
+                    self.logger.warning(f"Fallback to camelot failed: {str(e)}")
+            
+            # Try tabula if not already tried and camelot fallback failed
+            if not tables and method != 'tabula':
+                try:
+                    if has_borders:
+                        tables = self._extract_with_tabula(pdf_path, page_number+1, lattice=True)
+                    else:
+                        tables = self._extract_with_tabula(pdf_path, page_number+1, lattice=False, guess=True)
+                except Exception as e:
+                    self.logger.warning(f"Fallback to tabula failed: {str(e)}")
+            
+            # Try pdfplumber as last resort
+            if not tables and method != 'pdfplumber':
+                try:
+                    tables = self._extract_with_pdfplumber(pdf_path, page_number+1)
+                except Exception as e:
+                    self.logger.warning(f"Fallback to pdfplumber failed: {str(e)}")
+        
+        # Get context for each table
+        for table in tables:
+            try:
+                table['context'] = self._get_table_context(page, table['bbox'])
+            except Exception as e:
+                self.logger.warning(f"Failed to get table context on page {page_number+1}: {str(e)}")
+                table['context'] = ""
+        
+        return tables
+
+    def _extract_with_camelot(self, pdf_path: str, page_number: int, flavor: str = 'lattice') -> List[Dict[str, Any]]:
+        """
+        Extract tables using Camelot.
+        
+        Args:
+            pdf_path: Path to the PDF file
+            page_number: Page number (1-indexed for Camelot)
+            flavor: 'lattice' for bordered tables, 'stream' for borderless tables
+            
+        Returns:
+            List of extracted tables
+        """
+        try:
+            import camelot
+            
+            # Check if Ghostscript is installed
+            if not self._check_ghostscript_installed():
+                self.logger.warning("Ghostscript is not installed. Camelot requires Ghostscript for PDF processing.")
+                return []
+            
+            # Configure Camelot options
+            line_scale = self.config.get('table_extraction', {}).get('line_scale', 40)
+            
+            # Extract tables
+            tables = camelot.read_pdf(
                 pdf_path,
                 pages=str(page_number),
                 flavor=flavor,
                 line_scale=line_scale
             )
             
-            # Process each table
-            for table in camelot_tables:
-                # Skip empty tables
-                if table.df.empty:
-                    continue
-                
-                # Get confidence score
+            if len(tables) == 0:
+                self.logger.info(f"No tables found on page {page_number} using Camelot with {flavor} flavor")
+                return []
+            
+            # Convert to standard format
+            result = []
+            for i, table in enumerate(tables):
+                # Get table accuracy
                 accuracy = table.accuracy
-                if accuracy < config.get('min_confidence', 80):
+                
+                # Skip tables with low accuracy
+                min_confidence = self.config.get('table_extraction', {}).get('min_confidence', 80)
+                if accuracy < min_confidence:
+                    self.logger.info(f"Skipping table with low accuracy: {accuracy:.2f}% (threshold: {min_confidence}%)")
                     continue
                 
-                # Convert to standard format
+                # Convert to DataFrame and then to dict
                 df = table.df
-                header = None
-                rows = df.values.tolist()
                 
-                # Extract header if configured
-                if config.get('header_extraction', True) and len(rows) > 0:
-                    header = rows[0]
-                    rows = rows[1:]
+                # Get table bounding box
+                bbox = table._bbox
                 
-                data = {
-                    'header': header,
-                    'rows': rows,
-                    'shape': (len(rows), len(rows[0]) if rows and rows[0] else 0)
+                # Create standardized table structure
+                table_dict = {
+                    'id': f"table_{page_number}_{i+1}",
+                    'page': page_number,
+                    'extraction_method': f"camelot_{flavor}",
+                    'confidence': accuracy / 100.0,
+                    'bbox': bbox,
+                    'headers': df.iloc[0].tolist() if not df.empty else [],
+                    'rows': df.values.tolist() if not df.empty else [],
+                    'num_rows': len(df) if not df.empty else 0,
+                    'num_cols': len(df.columns) if not df.empty else 0
                 }
                 
-                # Get table region
-                region = None
-                if hasattr(table, 'coords'):
-                    x1, y1, x2, y2 = table.coords
-                    region = (x1, y1, x2, y2)
+                # Extract header if configured
+                if self.config.get('table_extraction', {}).get('header_extraction', True) and not df.empty:
+                    table_dict['headers'] = df.iloc[0].tolist()
+                    table_dict['rows'] = df.iloc[1:].values.tolist()
                 
-                tables.append({
-                    'data': data,
-                    'region': region,
-                    'confidence': accuracy,
-                    'detection_method': f'camelot_{flavor}',
-                    'source': 'camelot'
-                })
-                
-        except Exception as e:
-            self.logger.warning(f"Camelot table extraction failed: {str(e)}")
-        
-        return tables
-
-    def _extract_tables_tabula(
-        self, 
-        pdf_path: str, 
-        page_number: int, 
-        config: Dict[str, Any]
-    ) -> List[Dict[str, Any]]:
-        """Extract tables using Tabula library."""
-        if not HAS_TABULA:
+                result.append(table_dict)
+            
+            return result
+            
+        except ImportError:
+            self.logger.warning("Camelot is not installed. Install with: pip install camelot-py")
             return []
+        except Exception as e:
+            self.logger.warning(f"Camelot extraction failed: {str(e)}")
+            return []
+
+    def _get_table_context(self, page: fitz.Page, bbox: List[float], context_range: int = 3) -> str:
+        """
+        Get the text context around a table.
         
-        tables = []
+        Args:
+            page: PyMuPDF page object
+            bbox: Table bounding box [x0, y0, x1, y1]
+            context_range: Number of lines to include before and after the table
+            
+        Returns:
+            Text context around the table
+        """
         try:
-            # Extract tables
+            # Get all text blocks on the page
+            blocks = page.get_text("dict")["blocks"]
+            
+            # Convert table bbox to fitz.Rect
+            table_rect = fitz.Rect(bbox[0], bbox[1], bbox[2], bbox[3])
+            
+            # Find blocks above and below the table
+            blocks_above = []
+            blocks_below = []
+            
+            for block in blocks:
+                if block["type"] == 0:  # Text block
+                    block_rect = fitz.Rect(block["bbox"])
+                    
+                    # Check if block is above the table
+                    if block_rect.y1 < table_rect.y0:
+                        blocks_above.append((block, block_rect.y1))
+                    
+                    # Check if block is below the table
+                    if block_rect.y0 > table_rect.y1:
+                        blocks_below.append((block, block_rect.y0))
+            
+            # Sort blocks by vertical position
+            blocks_above.sort(key=lambda x: x[1], reverse=True)  # Closest to table first
+            blocks_below.sort(key=lambda x: x[1])  # Closest to table first
+            
+            # Get context text
+            context_above = ""
+            for i, (block, _) in enumerate(blocks_above[:context_range]):
+                lines = []
+                for line in block["lines"]:
+                    line_text = ""
+                    for span in line["spans"]:
+                        line_text += span["text"]
+                    lines.append(line_text)
+                context_above = "\n".join(lines) + "\n" + context_above
+            
+            context_below = ""
+            for i, (block, _) in enumerate(blocks_below[:context_range]):
+                lines = []
+                for line in block["lines"]:
+                    line_text = ""
+                    for span in line["spans"]:
+                        line_text += span["text"]
+                    lines.append(line_text)
+                context_below += "\n" + "\n".join(lines)
+            
+            return context_above.strip() + "\n" + context_below.strip()
+            
+        except Exception as e:
+            self.logger.warning(f"Failed to get table context: {str(e)}")
+            return ""
+
+    def _refine_table_structure(self, table: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Refine the table structure by cleaning up headers and rows.
+        
+        Args:
+            table: Table dictionary
+            
+        Returns:
+            Refined table dictionary
+        """
+        try:
+            # Skip empty tables
+            if not table.get('rows') or len(table['rows']) == 0:
+                return table
+            
+            # Clean up headers
+            headers = table.get('headers', [])
+            if headers:
+                # Remove empty headers
+                headers = [h.strip() if isinstance(h, str) else str(h).strip() for h in headers]
+                
+                # Generate generic headers if all are empty
+                if all(not h for h in headers):
+                    headers = [f"Column {i+1}" for i in range(len(headers))]
+                
+                table['headers'] = headers
+            
+            # Clean up rows
+            rows = table.get('rows', [])
+            if rows:
+                # Remove completely empty rows
+                rows = [row for row in rows if any(cell and str(cell).strip() for cell in row)]
+                
+                # Clean cell values
+                cleaned_rows = []
+                for row in rows:
+                    cleaned_row = []
+                    for cell in row:
+                        if isinstance(cell, str):
+                            cell = cell.strip()
+                        elif cell is None:
+                            cell = ""
+                        else:
+                            cell = str(cell).strip()
+                        cleaned_row.append(cell)
+                    cleaned_rows.append(cleaned_row)
+                
+                table['rows'] = cleaned_rows
+                table['num_rows'] = len(cleaned_rows)
+            
+            return table
+            
+        except Exception as e:
+            self.logger.warning(f"Failed to refine table structure: {str(e)}")
+            return table
+
+    def _handle_cross_page_tables(self, tables: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Detect and merge tables that span across multiple pages.
+        
+        Args:
+            tables: List of tables from all pages
+            
+        Returns:
+            List of tables with cross-page tables merged
+        """
+        if not tables or len(tables) < 2:
+            return tables
+        
+        try:
+            # Sort tables by page number
+            tables.sort(key=lambda t: (t['page'], t['bbox'][1]))
+            
+            merged_tables = []
+            i = 0
+            while i < len(tables):
+                current_table = tables[i]
+                
+                # Check if there's a next table that might be related
+                if i + 1 < len(tables):
+                    next_table = tables[i + 1]
+                    
+                    # Check if tables are on consecutive pages and have similar structure
+                    if next_table['page'] == current_table['page'] + 1 and self._are_tables_related(current_table, next_table):
+                        # Merge the tables
+                        merged_table = self._merge_tables(current_table, next_table)
+                        merged_tables.append(merged_table)
+                        i += 2  # Skip both tables
+                        continue
+                
+                # If no merge happened, add the current table
+                merged_tables.append(current_table)
+                i += 1
+            
+            return merged_tables
+            
+        except Exception as e:
+            self.logger.warning(f"Failed to handle cross-page tables: {str(e)}")
+            return tables
+
+    def _are_tables_related(self, table1: Dict[str, Any], table2: Dict[str, Any]) -> bool:
+        """
+        Check if two tables are related and might be parts of the same table.
+        
+        Args:
+            table1: First table
+            table2: Second table
+            
+        Returns:
+            True if tables are related, False otherwise
+        """
+        # Check if tables have similar structure
+        if table1['num_cols'] != table2['num_cols']:
+            return False
+        
+        # Check if headers are similar
+        headers1 = table1.get('headers', [])
+        headers2 = table2.get('headers', [])
+        
+        # If both have headers and they're different, tables are likely not related
+        if headers1 and headers2 and not self._are_headers_similar(headers1, headers2):
+            return False
+        
+        # Check context for continuity indicators
+        context1 = table1.get('context', '').lower()
+        context2 = table2.get('context', '').lower()
+        
+        continuity_indicators = ['continued', 'continuation', 'cont.', 'cont\'d', 'continued from previous page']
+        if any(indicator in context2 for indicator in continuity_indicators):
+            return True
+        
+        return True  # Default to assuming they're related if structure matches
+
+    def _are_headers_similar(self, headers1: List[str], headers2: List[str]) -> bool:
+        """
+        Check if two sets of headers are similar.
+        
+        Args:
+            headers1: First set of headers
+            headers2: Second set of headers
+            
+        Returns:
+            True if headers are similar, False otherwise
+        """
+        if len(headers1) != len(headers2):
+            return False
+        
+        similarity_count = 0
+        for h1, h2 in zip(headers1, headers2):
+            if h1 == h2 or self._string_similarity(h1, h2) > 0.8:
+                similarity_count += 1
+        
+        # Consider headers similar if at least 70% match
+        return (similarity_count / len(headers1) >= 0.7) if headers1 else False
+
+    def _string_similarity(self, s1: str, s2: str) -> float:
+        """
+        Calculate the similarity between two strings using Levenshtein distance.
+        
+        Args:
+            s1: First string
+            s2: Second string
+            
+        Returns:
+            Similarity score between 0 and 1
+        """
+        # Simple implementation of Levenshtein distance
+        if len(s1) < len(s2):
+            return self._string_similarity(s2, s1)
+            
+        if len(s2) == 0:
+            return 0.0
+            
+        previous_row = range(len(s2) + 1)
+        for i, c1 in enumerate(s1):
+            current_row = [i + 1]
+            for j, c2 in enumerate(s2):
+                insertions = previous_row[j + 1] + 1
+                deletions = current_row[j] + 1
+                substitutions = previous_row[j] + (c1 != c2)
+                current_row.append(min(insertions, deletions, substitutions))
+            previous_row = current_row
+            
+        # Convert distance to similarity score
+        max_len = max(len(s1), len(s2))
+        distance = previous_row[-1]
+        return 1.0 - (distance / max_len) if max_len > 0 else 1.0
+
+    def _merge_tables(self, table1: Dict[str, Any], table2: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Merge two related tables into one.
+        
+        Args:
+            table1: First table
+            table2: Second table
+            
+        Returns:
+            Merged table
+        """
+        # Create a new merged table
+        merged_table = table1.copy()
+        
+        # Use headers from the first table
+        merged_table['headers'] = table1.get('headers', [])
+        
+        # Merge rows
+        rows1 = table1.get('rows', [])
+        rows2 = table2.get('rows', [])
+        
+        # Skip header row in the second table if it matches the first table's headers
+        if table2.get('headers') and self._are_headers_similar(table1.get('headers', []), table2.get('headers', [])):
+            rows2 = rows2[1:] if rows2 else []
+        
+        merged_table['rows'] = rows1 + rows2
+        merged_table['num_rows'] = len(merged_table['rows'])
+        
+        # Update metadata
+        merged_table['id'] = f"{table1['id']}_merged"
+        merged_table['cross_page'] = True
+        merged_table['pages'] = [table1['page'], table2['page']]
+        
+        # Average the confidence scores
+        merged_table['confidence'] = (table1.get('confidence', 0) + table2.get('confidence', 0)) / 2
+        
+        return merged_table
+
+    def _extract_with_tabula(self, pdf_path: str, page_number: int, lattice: bool = False, 
+                           guess: bool = True) -> List[Dict[str, Any]]:
+        """
+        Extract tables using Tabula with specific parameters.
+        
+        Args:
+            pdf_path: Path to the PDF file
+            page_number: Page number (1-indexed for Tabula)
+            lattice: Whether to use lattice mode for bordered tables
+            guess: Whether to use guess mode for borderless tables
+            
+        Returns:
+            List of extracted tables
+        """
+        try:
+            # Import tabula within the function to avoid import errors
+            import tabula
+            
+            # Extract tables with specified parameters
             tabula_tables = tabula.read_pdf(
                 pdf_path,
                 pages=page_number,
+                lattice=lattice,
+                guess=guess,
                 multiple_tables=True,
-                guess=True,  # Enable automatic table detection
-                lattice=False,  # Better for borderless tables
-                stream=True,   # Better for stream-based tables
-                pandas_options={'header': None}  # Don't assume first row is header
+                pandas_options={'header': None}
             )
             
             # Process each table
-            for table_df in tabula_tables:
+            result = []
+            for i, df in enumerate(tabula_tables):
                 # Skip empty tables
-                if table_df.empty:
+                if df.empty:
                     continue
-                
-                # Clean the dataframe
-                # Replace NaN with empty string and convert all cells to string
-                table_df = table_df.fillna('')
-                table_df = table_df.astype(str)
-                
-                # Extract header if configured
-                header = None
-                rows = table_df.values.tolist()
-                
-                if config.get('header_extraction', True) and len(rows) > 0:
-                    header = rows[0]
-                    rows = rows[1:]
                 
                 # Convert to standard format
-                data = {
-                    'header': header,
-                    'rows': rows,
-                    'shape': (len(rows), len(rows[0]) if rows and rows[0] else 0)
+                table_dict = {
+                    'id': f"table_{page_number}_{i+1}",
+                    'page': page_number,
+                    'extraction_method': f"tabula_{'lattice' if lattice else 'guess'}",
+                    'confidence': 0.7,  # Tabula doesn't provide confidence metrics
+                    'bbox': [0, 0, 0, 0],  # Tabula doesn't provide bbox information
+                    'headers': df.iloc[0].tolist() if not df.empty else [],
+                    'rows': df.values.tolist() if not df.empty else [],
+                    'num_rows': len(df) if not df.empty else 0,
+                    'num_cols': len(df.columns) if not df.empty else 0
                 }
                 
-                # Note: Tabula doesn't provide confidence scores or exact regions
-                # We'll use a default confidence and None for region
-                tables.append({
-                    'data': data,
-                    'region': None,
-                    'confidence': 85,  # Default confidence for Tabula
-                    'detection_method': 'tabula_stream',
-                    'source': 'tabula'
-                })
+                # Extract header if configured
+                if self.config.get('table_extraction', {}).get('header_extraction', True) and not df.empty:
+                    table_dict['headers'] = df.iloc[0].tolist()
+                    table_dict['rows'] = df.iloc[1:].values.tolist()
                 
-        except Exception as e:
-            self.logger.warning(f"Tabula table extraction failed: {str(e)}")
-        
-        return tables
-
-    def _extract_tables_pdfplumber(
-        self, 
-        pdf_path: str, 
-        page_num: int,
-        config: Dict[str, Any]
-    ) -> List[Dict[str, Any]]:
-        """Extract tables using pdfplumber library."""
-        if not HAS_PDFPLUMBER:
-            return []
+                result.append(table_dict)
             
-        tables = []
-        try:
-            # Open the PDF with pdfplumber
-            with pdfplumber.open(pdf_path) as pdf:
-                # Get the specific page (adjust for 0-based indexing)
-                page = pdf.pages[page_num - 1]
-                
-                # Extract tables
-                plumber_tables = page.extract_tables()
-                
-                # Process extracted tables
-                for i, table_data in enumerate(plumber_tables):
-                    if not table_data or len(table_data) == 0:
-                        continue
-                    
-                    # Clean the table data (remove None values)
-                    cleaned_table = [[cell or "" for cell in row] for row in table_data]
-                    
-                    # Extract header if configured
-                    header = None
-                    rows = cleaned_table
-                    if config.get('header_extraction', True) and len(cleaned_table) > 0:
-                        header = cleaned_table[0]
-                        rows = cleaned_table[1:]
-                    
-                    # Convert to standard format
-                    data = {
-                        'header': header,
-                        'rows': rows,
-                        'shape': (len(rows), len(rows[0]) if rows and rows[0] else 0)
-                    }
-                    
-                    # Get table bounding box if available
-                    # pdfplumber doesn't directly provide this, 
-                    # but we can get it from the table's cells
-                    region = None
-                    try:
-                        table_cells = page.find_tables()[i].cells
-                        if table_cells:
-                            # Get min/max x and y from all cells
-                            x0 = min(cell[0] for cell in table_cells.values())
-                            y0 = min(cell[1] for cell in table_cells.values())
-                            x1 = max(cell[2] for cell in table_cells.values())
-                            y1 = max(cell[3] for cell in table_cells.values())
-                            region = (x0, y0, x1, y1)
-                    except (IndexError, AttributeError):
-                        # If we can't get the region, that's okay
-                        pass
-                    
-                    tables.append({
-                        'data': data,
-                        'region': region,
-                        'detection_method': 'pdfplumber',
-                        'confidence': 85  # pdfplumber doesn't provide confidence scores
-                    })
-                
-        except Exception as e:
-            self.logger.warning(f"pdfplumber table extraction failed: {str(e)}")
-            
-        return tables
-
-    def _select_best_tables_by_voting(self, table_candidates: List[Tuple[str, List[Dict]]]) -> List[Dict]:
-        """Select best tables using a voting approach where multiple extractors processed the same tables."""
-        if not table_candidates:
-            return []
-            
-        # If only one extractor provided results, use those
-        if len(table_candidates) == 1:
-            return table_candidates[0][1]
-            
-        # Get all tables with their source
-        all_tables = []
-        for source, tables in table_candidates:
-            for table in tables:
-                table['source'] = source
-                all_tables.append(table)
-                
-        # Group tables by similar regions
-        region_groups = []
-        for table in all_tables:
-            region = table.get('region')
-            if not region:
-                # If no region, treat as unique table
-                region_groups.append([table])
-                continue
-                
-            # Check if this table overlaps with existing groups
-            assigned = False
-            for group in region_groups:
-                if any(self._regions_overlap(region, t.get('region')) for t in group if t.get('region')):
-                    group.append(table)
-                    assigned = True
-                    break
-                    
-            if not assigned:
-                # Create new group
-                region_groups.append([table])
-                
-        # Select best table from each group
-        best_tables = []
-        for group in region_groups:
-            if len(group) == 1:
-                best_tables.append(group[0])
-            else:
-                # Select based on confidence and source preference
-                best_table = max(group, key=lambda t: (
-                    t.get('confidence', 0),
-                    2 if t.get('source') == 'camelot' and t.get('detection_method') == 'lattice' else
-                    1.5 if t.get('source') == 'pdfplumber' else 
-                    1 if t.get('source') == 'camelot' else
-                    0.5
-                ))
-                best_tables.append(best_table)
-                
-        return best_tables
-
-    def _detect_table_type(self, page: fitz.Page) -> str:
-        """Detect table type on the page to determine best extractor."""
-        # Get page content
-        page_dict = page.get_text("dict")
-        
-        # Look for horizontal and vertical lines
-        horizontal_lines = 0
-        vertical_lines = 0
-        
-        for drawing in page_dict.get('drawings', []):
-            for item in drawing.get('items', []):
-                if item.get('type') == 'l':  # Line
-                    x0, y0, x1, y1 = item['rect']
-                    if abs(y1 - y0) < 1:  # Horizontal line
-                        horizontal_lines += 1
-                    if abs(x1 - x0) < 1:  # Vertical line
-                        vertical_lines += 1
-        
-        # Check for scanned content
-        is_scanned = len(page_dict.get('blocks', [])) < 5 and len(page.get_text().strip()) > 0
-        
-        # Determine table type
-        if is_scanned:
-            return 'scanned'
-        elif horizontal_lines > 3 and vertical_lines > 3:
-            return 'bordered'
-        elif horizontal_lines > 3 or vertical_lines > 3:
-            # Check for complex structure (merged cells)
-            blocks = page_dict.get('blocks', [])
-            has_merged_cells = False
-            for block in blocks:
-                if block.get('type') == 0:  # Text block
-                    spans = block.get('spans', [])
-                    if any(span.get('size', 0) > 0 for span in spans):
-                        has_merged_cells = True
-                        break
-            
-            return 'complex' if has_merged_cells else 'borderless'
-        else:
-            return 'borderless'
-
-    def _heuristic_table_detection(self, page: fitz.Page) -> List[Dict[str, Any]]:
-        """
-        Detect and extract tables using heuristic approaches when library-based methods fail.
-        Uses layout analysis and pattern recognition to identify table structures.
-        """
-        tables = []
-        try:
-            # Get page content with layout information
-            page_dict = page.get_text("dict")
-            blocks = page_dict.get("blocks", [])
-            
-            # Find potential table regions
-            table_regions = self._find_table_regions(page)
-            
-            for region in table_regions:
-                # Extract text within the region
-                region_text = page.get_text("text", clip=region).strip()
-                if not region_text:
-                    continue
-                    
-                # Split into lines and analyze structure
-                lines = [line.strip() for line in region_text.split('\n') if line.strip()]
-                if len(lines) < 2:  # Need at least header and one data row
-                    continue
-                    
-                # Analyze column structure
-                column_structure = self._analyze_column_structure(lines)
-                if not column_structure['is_table']:
-                    continue
-                    
-                # Extract table data
-                table_data = self._extract_table_data(page, region)
-                if not table_data:
-                    continue
-                    
-                # Get table context (captions, references)
-                context = self._get_table_context(page, region)
-                    
-                tables.append({
-                    'data': table_data,
-                    'region': region,
-                    'confidence': 70,  # Lower confidence for heuristic detection
-                    'detection_method': 'heuristic',
-                    'source': 'built_in',
-                    'context': context
-                })
-                
-        except Exception as e:
-            self.logger.warning(f"Heuristic table detection failed: {str(e)}")
-        
-        return tables
-
-    def _analyze_column_structure(self, lines: List[str]) -> Dict[str, Any]:
-        """Analyze lines to determine if they form a table structure."""
-        result = {
-            'is_table': False,
-            'num_columns': 0,
-            'column_separators': [],
-            'confidence': 0.0
-        }
-        
-        if not lines:
             return result
-        
-        # Look for common separators
-        separators = ['\t', '  ', ' | ', '|']
-        separator_counts = {}
-        column_counts = {}
-        
-        # Analyze each line for potential column structure
-        for line in lines:
-            for sep in separators:
-                if sep in line:
-                    parts = [p.strip() for p in line.split(sep)]
-                    num_cols = len([p for p in parts if p])  # Count non-empty columns
-                    
-                    separator_counts[sep] = separator_counts.get(sep, 0) + 1
-                    column_counts[num_cols] = column_counts.get(num_cols, 0) + 1
-        
-        if not separator_counts:
-            return result
-        
-        # Find most common separator and column count
-        best_separator = max(separator_counts.items(), key=lambda x: x[1])[0]
-        most_common_cols = max(column_counts.items(), key=lambda x: x[1])[0]
-        
-        # Calculate consistency
-        total_lines = len(lines)
-        separator_consistency = separator_counts[best_separator] / total_lines
-        column_consistency = column_counts[most_common_cols] / total_lines
-        
-        # Determine if structure is table-like
-        is_table = (
-            most_common_cols >= 2 and  # At least 2 columns
-            separator_consistency >= 0.8 and  # Consistent separator usage
-            column_consistency >= 0.7  # Consistent column count
-        )
-        
-        result.update({
-            'is_table': is_table,
-            'num_columns': most_common_cols,
-            'column_separators': [best_separator],
-            'confidence': min(separator_consistency, column_consistency) * 100
-        })
-        
-        return result
-
-    def _find_table_regions(self, page: fitz.Page) -> List[Tuple[float, float, float, float]]:
-        """Find potential table regions using layout analysis."""
-        regions = []
-        
-        # Get page text with layout info
-        page_dict = page.get_text("dict")
-        blocks = page_dict.get("blocks", [])
-        
-        # Look for grid patterns and aligned text blocks
-        current_region = None
-        last_y = 0
-        aligned_blocks = []
-        
-        for block in blocks:
-            if block["type"] != 0:  # Skip non-text blocks
-                continue
             
-            x0, y0, x1, y1 = block["bbox"]
-            
-            # Check if block is aligned with previous blocks
-            if aligned_blocks and abs(y0 - last_y) > self.config['row_tolerance']:
-                # Process accumulated blocks as potential table
-                if len(aligned_blocks) >= 3:  # Need at least 3 aligned blocks
-                    region = self._get_region_from_blocks(aligned_blocks)
-                    regions.append(region)
-                aligned_blocks = []
-            
-            aligned_blocks.append(block)
-            last_y = y0
-        
-        # Process final set of aligned blocks
-        if len(aligned_blocks) >= 3:
-            region = self._get_region_from_blocks(aligned_blocks)
-            regions.append(region)
-        
-        # Also look for explicit table indicators (lines, borders)
-        bordered_regions = self._find_bordered_regions(page)
-        regions.extend(bordered_regions)
-        
-        # Merge overlapping regions
-        return self._merge_overlapping_regions(regions)
-
-    def _get_region_from_blocks(self, blocks: List[Dict]) -> Tuple[float, float, float, float]:
-        """Calculate bounding box for a group of blocks."""
-        x0 = min(block["bbox"][0] for block in blocks)
-        y0 = min(block["bbox"][1] for block in blocks)
-        x1 = max(block["bbox"][2] for block in blocks)
-        y1 = max(block["bbox"][3] for block in blocks)
-        return (x0, y0, x1, y1)
-
-    def _find_bordered_regions(self, page: fitz.Page) -> List[Tuple[float, float, float, float]]:
-        """Find regions enclosed by lines or borders."""
-        regions = []
-        
-        # Get drawing elements
-        page_dict = page.get_text("dict")
-        drawings = page_dict.get('drawings', [])
-        
-        # Look for rectangles and line patterns
-        for drawing in drawings:
-            if drawing.get('type') == 'rect':
-                regions.append(drawing['rect'])
-            elif drawing.get('type') == 'line':
-                # Analyze line patterns to detect table borders
-                # This is a simplified version - could be enhanced
-                pass
-        
-        return regions
-
-    def _merge_overlapping_regions(
-        self, 
-        regions: List[Tuple[float, float, float, float]]
-    ) -> List[Tuple[float, float, float, float]]:
-        """Merge overlapping table regions."""
-        if not regions:
+        except ImportError:
+            self.logger.warning("Tabula is not installed. Install with: pip install tabula-py")
             return []
-        
-        # Sort regions by x0 coordinate
-        sorted_regions = sorted(regions, key=lambda r: r[0])
-        merged = [sorted_regions[0]]
-        
-        for current in sorted_regions[1:]:
-            previous = merged[-1]
-            
-            # Check if regions overlap
-            if (current[0] <= previous[2] and  # x overlap
-                current[1] <= previous[3] and  # y overlap
-                current[2] >= previous[0] and
-                current[3] >= previous[1]):
-                # Merge regions
-                merged[-1] = (
-                    min(previous[0], current[0]),
-                    min(previous[1], current[1]),
-                    max(previous[2], current[2]),
-                    max(previous[3], current[3])
-                )
-            else:
-                merged.append(current)
-        
-        return merged
-
-    def _extract_images_with_context(self, doc: fitz.Document) -> List[Dict[str, Any]]:
-        """Extract images from each page, possibly classify as diagrams."""
-        images = []
-        diagram_classifier = None
-
-        # If we want to do advanced diagram detection:
-        if HAS_VISION_MODELS and self.config.get('diagram_detection', {}).get('enabled', True):
-            diagram_classifier = self._initialize_diagram_classifier()
-
-        for page_num, page in enumerate(doc):
-            page_text = page.get_text("dict")
-            page_blocks = page_text.get("blocks", [])
-
-            # Extract each image in the page.
-            for img_index, img in enumerate(page.get_images()):
-                xref = img[0]
-                base_img = doc.extract_image(xref)
-                if not base_img:
-                    continue
-
-                image_bytes = base_img["image"]
-                try:
-                    import PIL.Image
-                    pil_image = PIL.Image.open(io.BytesIO(image_bytes))
-
-                    # Skip tiny images.
-                    minw = self.config['diagram_detection'].get('min_width', 100)
-                    minh = self.config['diagram_detection'].get('min_height', 100)
-                    if pil_image.width < minw or pil_image.height < minh:
-                        continue
-
-                    # Identify the bounding box on the page if available.
-                    img_rect = None
-                    for block in page_blocks:
-                        if block.get("type") == 1 and block.get("xref") == xref:
-                            img_rect = block.get("bbox")
-                            break
-
-                    # Get some surrounding text context for the image.
-                    context = self._get_enhanced_image_context(page, img_rect, page_blocks)
-
-                    # Diagram classification (OpenCV lines detection, or deep learning if classifier is available).
-                    diagram_info = self._analyze_diagram(pil_image, diagram_classifier)
-
-                    # If recognized as diagram and we have OCR instance, ask OCR to read embedded text if desired.
-                    diagram_text = None
-                    if diagram_info['is_diagram'] and self.ocr:
-                        # We delegate to self.ocr for diagram text extraction.
-                        diagram_text = self.ocr.extract_text_from_diagram(pil_image)
-
-                    metadata = {
-                        'page': page_num + 1,
-                        'index': img_index,
-                        'size': base_img.get("size", 0),
-                        'format': base_img.get("ext", "unknown"),
-                        'dimensions': (pil_image.width, pil_image.height),
-                        'location': img_rect,
-                        'context': context,
-                        'diagram_type': diagram_info['diagram_type'],
-                        'is_diagram': diagram_info['is_diagram'],
-                        'confidence': diagram_info['confidence'],
-                        'extracted_text': diagram_text
-                    }
-                    images.append({
-                        'data': image_bytes,
-                        'metadata': metadata
-                    })
-
-                except Exception as e:
-                    self.logger.warning(f"Failed to analyze image on page {page_num+1}: {str(e)}")
-                    images.append({
-                        'data': image_bytes,
-                        'metadata': {
-                            'page': page_num + 1,
-                            'index': img_index,
-                            'size': base_img.get("size", 0),
-                            'format': base_img.get("ext", "unknown"),
-                            'error': str(e)
-                        }
-                    })
-
-        return images
-
-    def _initialize_diagram_classifier(self):
-        """Initialize a diagram classifier if you have a trained model for specific diagram categories."""
-        try:
-            model = models.resnet50(pretrained=True)
-            num_classes = len(DiagramType)
-            model.fc = torch.nn.Linear(model.fc.in_features, num_classes)
-
-            model_path = self.config['diagram_detection'].get('model_path')
-            if model_path and os.path.exists(model_path):
-                model.load_state_dict(torch.load(model_path))
-
-            model.eval()
-            transform = transforms.Compose([
-                transforms.Resize(256),
-                transforms.CenterCrop(224),
-                transforms.ToTensor(),
-                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-            ])
-            return {'model': model, 'transform': transform}
         except Exception as e:
-            self.logger.warning(f"Failed to initialize diagram classifier: {str(e)}")
-            return None
+            self.logger.warning(f"Tabula extraction failed: {str(e)}")
+            return []
 
-    def _analyze_diagram(self, pil_image, classifier=None):
-        """Heuristic + optional model-based approach to check if an image is a diagram."""
-        result = {
-            'is_diagram': False,
-            'diagram_type': DiagramType.UNKNOWN.value,
-            'confidence': 0.0
-        }
-        try:
-            np_image = np.array(pil_image.convert('RGB'))
-            gray = cv2.cvtColor(np_image, cv2.COLOR_RGB2GRAY)
-            edges = cv2.Canny(gray, 50, 150, apertureSize=3)
-            lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=100, minLineLength=100, maxLineGap=10)
-
-            line_count = 0 if lines is None else len(lines)
-            # Heuristic: if many lines + certain features => probable diagram.
-            result['is_diagram'] = (line_count > 5)
-            result['confidence'] = 0.5 if result['is_diagram'] else 0.2
-
-            # If we have a deep learning classifier, refine the type.
-            if classifier and result['is_diagram']:
-                model, transform = classifier['model'], classifier['transform']
-                img_tensor = transform(pil_image).unsqueeze(0)
-                with torch.no_grad():
-                    outputs = model(img_tensor)
-                    probabilities = torch.nn.functional.softmax(outputs, dim=1)[0]
-                    max_prob, class_idx = torch.max(probabilities, 0)
-
-                    result['confidence'] = float(max_prob)
-                    result['diagram_type'] = list(DiagramType)[class_idx].value
-
-            # Simple fallback if we remain unknown but is_diagram is True.
-            if result['diagram_type'] == DiagramType.UNKNOWN.value and result['is_diagram']:
-                # We can do extra checks for charts, flowcharts, etc.
-                pass
-
-        except Exception as e:
-            self.logger.warning(f"Diagram analysis error: {str(e)}")
-
-        return result
-
-    def _get_enhanced_image_context(self, page, img_rect, page_blocks):
-        """Get enhanced context information around an image/diagram."""
-        context = {
-            'caption': None,
-            'references': [],
-            'surrounding_text': None,
-            'subject_context': None,
-            'educational_labels': []
-        }
-        
-        if not img_rect:
-            return context
-        
-        # Extract caption - usually text block right above or below the image
-        x0, y0, x1, y1 = img_rect
-        
-        # Define regions to look for captions
-        above_region = (x0 - 20, max(0, y0 - 100), x1 + 20, y0)
-        below_region = (x0 - 20, y1, x1 + 20, min(page.rect.height, y1 + 100))
-        
-        # Common educational image/diagram labels
-        edu_label_patterns = [
-            r'(figure|fig\.)\s+\d',
-            r'(diagram|diag\.)\s+\d',
-            r'(illustration|illus\.)\s+\d',
-            r'(chart)\s+\d',
-            r'(graph)\s+\d',
-            r'(plate)\s+\d',
-            r'(map)\s+\d',
-        ]
-        
-        # Check for caption above
-        caption_above = page.get_text("text", clip=above_region).strip()
-        if caption_above:
-            for pattern in edu_label_patterns:
-                if re.search(pattern, caption_above.lower()):
-                    context['caption'] = caption_above
-                    # Extract the specific label (e.g., "Figure 1.2")
-                    match = re.search(pattern + r'[.:]?\s*[\d.]+', caption_above.lower())
-                    if match:
-                        context['educational_labels'].append(match.group(0))
-                    break
-                
-        # If not found above, check below
-        if not context['caption']:
-            caption_below = page.get_text("text", clip=below_region).strip()
-            if caption_below:
-                for pattern in edu_label_patterns:
-                    if re.search(pattern, caption_below.lower()):
-                        context['caption'] = caption_below
-                        # Extract the label
-                        match = re.search(pattern + r'[.:]?\s*[\d.]+', caption_below.lower())
-                        if match:
-                            context['educational_labels'].append(match.group(0))
-                        break
-        
-        # Get surrounding text for context
-        surrounding_region = (
-            max(0, x0 - 200),
-            max(0, y0 - 200),
-            min(page.rect.width, x1 + 200),
-            min(page.rect.height, y1 + 200))
-        
-        context['surrounding_text'] = page.get_text("text", clip=surrounding_region).strip()
-        
-        # Look for references to the image in the text
-        page_text = page.get_text("text")
-        for label in context['educational_labels']:
-            # Look for phrases like "as shown in Figure 1.2"
-            ref_patterns = [
-                rf'(as shown in|see|refer to|according to|in)\s+{re.escape(label)}',
-                rf'{re.escape(label)}\s+shows',
-                rf'illustrated in\s+{re.escape(label)}'
-            ]
-            
-            for pattern in ref_patterns:
-                for match in re.finditer(pattern, page_text, re.IGNORECASE):
-                    # Get a snippet of text around the reference
-                    start = max(0, match.start() - 50)
-                    end = min(len(page_text), match.end() + 50)
-                    ref_text = page_text[start:end].strip()
-                    context['references'].append(ref_text)
-        
-        # Try to determine subject context from surrounding text
-        context['subject_context'] = self._extract_subject_context(context['surrounding_text'])
-        
-        return context
-
-    def _extract_pdf_metadata(self, doc: fitz.Document) -> Dict[str, Any]:
-        metadata = doc.metadata
-        return {
-            'title': metadata.get('title', ''),
-            'author': metadata.get('author', ''),
-            'subject': metadata.get('subject', ''),
-            'keywords': metadata.get('keywords', ''),
-            'creator': metadata.get('creator', ''),
-            'producer': metadata.get('producer', ''),
-            'page_count': doc.page_count,
-            'file_size': doc.stream_length
-        }
-
-    def _get_table_context(self, page: fitz.Page, region: Tuple[float, float, float, float]) -> Dict[str, Any]:
-        """Get contextual information around a table region."""
-        context = {
-            'caption': None,
-            'references': [],
-            'surrounding_text': None
-        }
-        
-        if not region:
-            return context
-        
-        x0, y0, x1, y1 = region
-        
-        # Look for caption above/below table
-        above_region = (x0, max(0, y0 - 100), x1, y0)
-        below_region = (x0, y1, x1, min(page.rect.height, y1 + 100))
-        
-        caption_above = page.get_text("text", clip=above_region).strip()
-        caption_below = page.get_text("text", clip=below_region).strip()
-        
-        # Check for table caption indicators
-        for text in [caption_above, caption_below]:
-            if re.search(r'(table|tbl\.)\s+\d', text.lower()):
-                context['caption'] = text
-                break
-        
-        # Get surrounding text for context
-        surrounding = (
-            max(0, x0 - 200),
-            max(0, y0 - 200),
-            min(page.rect.width, x1 + 200),
-            min(page.rect.height, y1 + 200)
-        )
-        context['surrounding_text'] = page.get_text("text", clip=surrounding).strip()
-        
-        return context
-
-    def _add_cross_references(self, document: 'Document'):
-        """Add cross-references between document elements (tables, figures, sections)."""
-        try:
-            content = document.content
-            doc_info = document.doc_info
-            
-            # Track references to tables
-            if 'tables' in doc_info:
-                for table in doc_info['tables']:
-                    if caption := table.get('context', {}).get('caption'):
-                        # Look for references to this table in the text
-                        matches = re.finditer(
-                            rf'(see|refer to|in|as shown in)\s+table\s+\d+',
-                            content,
-                            re.IGNORECASE
-                        )
-                        table['references'] = [
-                            content[max(0, m.start() - 50):min(len(content), m.end() + 50)]
-                            for m in matches
-                        ]
-            
-            # Track references to figures/diagrams
-            if 'diagrams' in doc_info:
-                for diagram in doc_info['diagrams']:
-                    if labels := diagram['metadata'].get('educational_labels', []):
-                        for label in labels:
-                            matches = re.finditer(
-                                rf'(see|refer to|in|as shown in)\s+{re.escape(label)}',
-                                content,
-                                re.IGNORECASE
-                            )
-                            diagram['references'] = [
-                                content[max(0, m.start() - 50):min(len(content), m.end() + 50)]
-                                for m in matches
-                            ]
-            
-            # Track references between sections if hierarchy exists
-            if 'structure' in doc_info:
-                for section in doc_info['structure']:
-                    if 'text' in section:
-                        matches = re.finditer(
-                        rf'(see|refer to|in)\s+section\s+\d+(\.\d+)*',
-                        content,
-                        re.IGNORECASE
-                    )
-                        section['references'] = [
-                            content[max(0, m.start() - 50):min(len(content), m.end() + 50)]
-                            for m in matches
-                        ]
-        except Exception as e:
-            self.logger.warning(f"Error adding cross-references: {str(e)}")
-
-    def _check_if_scanned(self, doc: fitz.Document) -> bool:
+    def _extract_with_pdfplumber(self, pdf_path: str, page_number: int, vertical_strategy: str = 'text', 
+                               horizontal_strategy: str = 'text') -> List[Dict[str, Any]]:
         """
-        Heuristic to determine if the PDF is scanned by checking the presence of extractable text.
+        Extract tables using pdfplumber with specific parameters.
         
         Args:
-            doc: The PyMuPDF document.
-        
+            pdf_path: Path to the PDF file
+            page_number: Page number (1-indexed for pdfplumber)
+            vertical_strategy: Strategy for vertical lines ('text', 'lines', or 'explicit')
+            horizontal_strategy: Strategy for horizontal lines ('text', 'lines', or 'explicit')
+            
         Returns:
-            bool: True if the PDF appears to be scanned (i.e., minimal text detected), False otherwise.
+            List of extracted tables
         """
-        scanned_pages = 0
-        total_pages = len(doc)
-        
-        for page in doc:
-            # Get the text from the page
-            text = page.get_text("text").strip()
-            # If very little text is found, consider this page "scanned"
-            # Adjust the threshold (e.g., 10 characters) as needed.
-            if len(text) < 10:
-                scanned_pages += 1
-        
-        # If more than half of the pages lack sufficient text, consider the document scanned.
-        if total_pages == 0:
-            return False
-        return (scanned_pages / total_pages) > 0.5
+        try:
+            # Import pdfplumber within the function to avoid import errors
+            import pdfplumber
+            
+            # Open the PDF and get the specified page
+            with pdfplumber.open(pdf_path) as pdf:
+                if page_number <= len(pdf.pages):
+                    plumber_page = pdf.pages[page_number - 1]  # Convert to 0-based index
+                    
+                    # Extract tables with specified parameters
+                    plumber_tables = plumber_page.extract_tables(
+                        table_settings={
+                            'vertical_strategy': vertical_strategy,
+                            'horizontal_strategy': horizontal_strategy,
+                            'intersection_tolerance': 5,
+                            'snap_tolerance': 3,
+                            'join_tolerance': 3,
+                            'edge_min_length': 3,
+                            'min_words_vertical': 3,
+                            'min_words_horizontal': 1
+                        }
+                    )
+                    
+                    # Process each table
+                    result = []
+                    for i, table_data in enumerate(plumber_tables):
+                        # Skip empty tables
+                        if not table_data or len(table_data) == 0:
+                            continue
+                        
+                        # Clean up rows (remove None values)
+                        rows = []
+                        for row in table_data:
+                            cleaned_row = ['' if cell is None else str(cell).strip() for cell in row]
+                            rows.append(cleaned_row)
+                        
+                        # Create table entry
+                        table_dict = {
+                            'id': f"table_{page_number}_{i+1}",
+                            'page': page_number,
+                            'extraction_method': f"pdfplumber_{vertical_strategy}_{horizontal_strategy}",
+                            'confidence': 0.6,  # pdfplumber doesn't provide confidence metrics
+                            'bbox': [0, 0, 0, 0],  # We could calculate this from the table cells if needed
+                            'headers': rows[0] if rows else [],
+                            'rows': rows[1:] if len(rows) > 1 else [],
+                            'num_rows': len(rows) - 1 if len(rows) > 1 else 0,
+                            'num_cols': len(rows[0]) if rows else 0
+                        }
+                        
+                        # Extract header if configured
+                        if not self.config.get('table_extraction', {}).get('header_extraction', True) and rows:
+                            table_dict['headers'] = []
+                            table_dict['rows'] = rows
+                            table_dict['num_rows'] = len(rows)
+                        
+                        result.append(table_dict)
+                    
+                    return result
+                else:
+                    self.logger.warning(f"Page {page_number} is out of range for the PDF with {len(pdf.pages)} pages")
+                    return []
+            
+        except ImportError:
+            self.logger.warning("pdfplumber is not installed. Install with: pip install pdfplumber")
+            return []
+        except Exception as e:
+            self.logger.warning(f"pdfplumber extraction failed: {str(e)}")
+            return []
 
-    def _determine_device(self) -> str:
-        """Determine the best available device for acceleration."""
-        config_device = self.config['acceleration']['device'].lower()
+    def extract_tables(self, doc: fitz.Document, pdf_path: str) -> List[Dict[str, Any]]:
+        """
+        Unified table extraction strategy that combines the strengths of multiple libraries.
         
-        if config_device == 'auto':
-            try:
-                import torch
-                if torch.cuda.is_available():
-                    return 'cuda'
-                elif torch.backends.mps.is_available():
-                    return 'mps'
-            except ImportError:
-                pass
-            return 'cpu'
+        This method implements a comprehensive approach to table extraction:
+        1. First attempts extraction with Camelot (both lattice and stream modes)
+        2. Then tries Tabula for tables Camelot might have missed
+        3. Finally uses pdfplumber as a fallback
+        4. Merges and deduplicates results based on spatial overlap
+        5. Ranks and selects the best extraction for each detected table region
+        6. Applies advanced structure analysis to refine the table structure
+        7. Detects and handles cross-page tables
         
-        return config_device
-
-    def _init_ocr(self):
-        """Initialize OCR if requested."""
-        if self.config.get('use_ocr', False):
+        Args:
+            doc: PyMuPDF document object
+            pdf_path: Path to the PDF file
+            
+        Returns:
+            List of extracted tables with metadata and quality metrics
+        """
+        all_tables = []
+        
+        # Check if any table extraction libraries are available
+        if not any([HAS_CAMELOT, HAS_TABULA, HAS_PDFPLUMBER]):
+            self.logger.warning("No table extraction libraries available. "
+                               "Please install at least one of: camelot-py, tabula-py, or pdfplumber.")
+            return []
+        
+        # Initialize TableStructureRecognizer if available
+        table_structure_recognizer = None
+        try:
+            # Pass the config path to TableStructureRecognizer
+            config_path = os.path.join(get_project_base_directory(), "config/rag_config.yaml")
+            
+            # Check if config file exists before initializing
+            if os.path.exists(config_path):
+                try:
+                    from ..core.vision.table_structure_recognizer import TableStructureRecognizer
+                    table_structure_recognizer = TableStructureRecognizer(config_path)
+                    self.logger.info("TableStructureRecognizer initialized successfully")
+                except Exception as e:
+                    self.logger.warning(f"Failed to initialize TableStructureRecognizer: {str(e)}")
+            else:
+                self.logger.warning(f"Config file not found at {config_path}, skipping TableStructureRecognizer initialization")
+        except Exception as e:
+            self.logger.warning(f"Failed to initialize TableStructureRecognizer: {str(e)}")
+            
+        # Process each page
+        for page_num, page in enumerate(doc):
+            page_number = page_num + 1  # Convert to 1-based page numbering
+            
             try:
-                from ..core.vision.ocr import OCR
-                return OCR(
-                    languages=['en'],
-                    enhance_resolution=self.config.get('enhance_resolution', True),
-                    preserve_layout=self.config.get('preserve_layout', True)
-                )
+                # Step 1: Analyze page to determine table characteristics
+                has_borders = self._detect_table_borders(page)
+                
+                # Step 2: Extract tables using the unified strategy
+                page_tables = self._extract_tables_unified(pdf_path, page_number, page, has_borders)
+                
+                # Step 3: Apply advanced structure analysis to refine the tables
+                if table_structure_recognizer and page_tables:
+                    try:
+                        page_tables = self._refine_table_structure(page_tables, page, table_structure_recognizer)
+                    except Exception as e:
+                        self.logger.warning(f"Table structure refinement failed on page {page_number}: {str(e)}")
+                
+                # Step 4: Add page information to each table
+                for table in page_tables:
+                    table['page'] = page_number
+                    
+                    # Add table context if region is available
+                    if 'region' in table:
+                        try:
+                            table['context'] = self._get_table_context(page, table['region'])
+                        except Exception as e:
+                            self.logger.warning(f"Failed to get table context on page {page_number}: {str(e)}")
+                
+                all_tables.extend(page_tables)
+                
             except Exception as e:
-                self.logger.warning(f"Failed to initialize OCR: {e}")
-                return None
+                self.logger.error(f"Table extraction failed for page {page_number}: {str(e)}")
+                # Continue with next page instead of failing completely
+                continue
+        
+        # Step 5: Detect and handle cross-page tables
+        if len(all_tables) > 1:
+            try:
+                all_tables = self._handle_cross_page_tables(all_tables, doc)
+            except Exception as e:
+                self.logger.warning(f"Cross-page table handling failed: {str(e)}")
+            
+        return all_tables
+
+# Test function to verify Ghostscript detection
+def test_ghostscript_detection():
+    import subprocess
+    import os
+    import logging
+    
+    logger = logging.getLogger("GhostscriptTest")
+    logger.setLevel(logging.DEBUG)
+    
+    # Create console handler
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.DEBUG)
+    
+    # Create formatter
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    ch.setFormatter(formatter)
+    
+    # Add handler to logger
+    logger.addHandler(ch)
+    
+    # Print environment PATH
+    logger.debug(f"PATH environment: {os.environ.get('PATH', '')}")
+    
+    try:
+        # Try to find the Ghostscript executable
+        gs_command = "gs"
+        
+        # Check if we're on Windows
+        if os.name == 'nt':
+            gs_command = "gswin64c"  # 64-bit Ghostscript on Windows
+        
+        logger.debug(f"Checking for Ghostscript using command: {gs_command}")
+            
+        # Try to run Ghostscript with version flag
+        result = subprocess.run(
+            [gs_command, "--version"], 
+            stdout=subprocess.PIPE, 
+            stderr=subprocess.PIPE,
+            timeout=5
+        )
+        
+        # Log the result for debugging
+        logger.debug(f"Ghostscript check result: returncode={result.returncode}, stdout={result.stdout.decode().strip()}, stderr={result.stderr.decode().strip()}")
+        
+        # If the command succeeded, Ghostscript is installed
+        return result.returncode == 0
+        
+    except (subprocess.SubprocessError, FileNotFoundError) as e:
+        # Log the specific error
+        logger.debug(f"Ghostscript check failed with error: {str(e)}")
+        # If the command failed or the executable wasn't found
+        return False
+
+# Run the test when the module is imported
+test_result = test_ghostscript_detection()
+print(f"Ghostscript detection test result: {test_result}")

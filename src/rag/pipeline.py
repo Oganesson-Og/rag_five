@@ -75,9 +75,6 @@ from .models import (
     SearchResult,
     GenerationResult
 )
-from ..document_processing.extractors.base import BaseExtractor
-from ..document_processing.extractors.audio import AudioExtractor
-from ..document_processing.extractors.text import TextExtractor
 from .prompt_engineering import PromptGenerator
 from ..cache.advanced_cache import MultiModalCache, CacheConfig
 from ..cache.vector_cache import VectorCache
@@ -100,6 +97,9 @@ from ..database.models import (
     DatabaseConnection
 )
 from ..llm.model_manager import LLMManager, ModelError, ModelErrorType
+from ..document_processing.extractors.base import BaseExtractor
+from ..document_processing.extractors.audio import AudioExtractor
+from ..document_processing.extractors.text import TextExtractor
 from ..document_processing.extractors.image import ImageExtractor
 from ..document_processing.extractors.pdf import PDFExtractor
 from ..document_processing.extractors.docx import DocxExtractor
@@ -137,7 +137,7 @@ class ExtractionStage(PipelineStage):
         """Initialize extraction stage."""
         super().__init__(config)
         
-        # Get extractor-specific configs
+        # Get extractor-specific configs from root level
         pdf_config = config.get('pdf', {})
         audio_config = config.get('audio', {})
         text_config = config.get('text', {})
@@ -146,15 +146,16 @@ class ExtractionStage(PipelineStage):
         excel_config = config.get('excel', {})
         csv_config = config.get('csv', {})
         
-        # Configure acceleration settings
+        # Configure acceleration settings from root level
         acceleration_config = config.get('acceleration', {
-            'device': 'auto',
+            'device': 'mps',
             'num_threads': 8
         })
         
-        # Update PDF config with acceleration settings
-        pdf_config['acceleration'] = acceleration_config
-        
+        # Update PDF config with acceleration settings if not already present
+        if 'acceleration' not in pdf_config:
+            pdf_config['acceleration'] = acceleration_config
+            
         # Initialize extractors with their configs
         self.extractors = {
             ContentModality.PDF: PDFExtractor(config=pdf_config),
@@ -400,7 +401,7 @@ class Pipeline:
     def _init_stages(self):
         """Initialize pipeline stages."""
         self.stages = {
-            ProcessingStage.EXTRACTED: ExtractionStage(self.config.get('extraction', {})),
+            ProcessingStage.EXTRACTED: ExtractionStage(self.config),  # Pass the full config
             ProcessingStage.CHUNKED: ChunkingStage(self.config.get('chunking', {})),
             ProcessingStage.ANALYZED: DiagramAnalysisStage(self.config.get('diagram', {})),
             ProcessingStage.EDUCATIONAL_PROCESSED: EducationalProcessingStage(self.config.get('educational', {})),
@@ -511,60 +512,63 @@ class Pipeline:
 
     async def process_document(
         self,
-        source: Union[str, bytes],
+        source: Union[str, bytes, Document],
         modality: Optional[ContentModality] = None,
         options: Optional[Dict[str, Any]] = None
     ) -> Document:
-        """Process document through pipeline stages."""
+        """Process document through pipeline stages.
+        
+        Args:
+            source: Either a file path (str), raw content (bytes), or Document object
+            modality: Content modality (PDF, TEXT, etc.)
+            options: Additional processing options
+            
+        Returns:
+            Processed Document object
+        """
         try:
-            # Debug: Print input parameters
-            self.logger.debug(f"Processing document with parameters:")
-            self.logger.debug(f"Source type: {type(source)}")
-            self.logger.debug(f"Modality: {modality}")
-            self.logger.debug(f"Options: {options}")
-
-            # Read file content if source is a file path
-            if isinstance(source, str) and Path(source).exists():
-                try:
-                    with open(source, 'rb') as f:                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        
-                        content = f.read()
-                    self.logger.debug(f"Successfully read file: {source}")
-                    self.logger.debug(f"Content type: {type(content)}")
-                    self.logger.debug(f"Content size: {len(content)} bytes")
-                except Exception as e:
-                    self.logger.error(f"Failed to read file {source}: {str(e)}")
-                    raise
+            # If source is already a Document object, use it directly
+            if isinstance(source, Document):
+                document = source
+                self.logger.debug(f"Using provided Document object with ID: {document.id}")
+                
+                # Update with any new options if provided
+                if options:
+                    document.doc_info.update({'options': options})
+                
+                # Update modality if provided
+                if modality and not document.modality:
+                    document.modality = modality
             else:
-                content = source
-                self.logger.debug(f"Using provided content directly")
-
-            # Debug: Print document creation parameters
-            self.logger.debug("Creating document with parameters:")
-            self.logger.debug(f"Content type: {type(content)}")
-            self.logger.debug(f"Source: {source}")
-            self.logger.debug(f"Modality: {modality}")
-            self.logger.debug(f"Doc info: {{'options': {options or {}}}}")
-
-            try:
+                # Handle file path or raw content
+                content = None
+                source_path = None
+                
+                # Case 1: Source is a file path
+                if isinstance(source, str) and Path(source).exists():
+                    try:
+                        with open(source, 'rb') as f:
+                            content = f.read()
+                        source_path = source
+                        self.logger.debug(f"Successfully read file: {source}")
+                        self.logger.debug(f"Content size: {len(content)} bytes")
+                    except Exception as e:
+                        self.logger.error(f"Failed to read file {source}: {str(e)}")
+                        raise
+                # Case 2: Source is raw content
+                else:
+                    content = source
+                    source_path = options.get('file_path') if options else None
+                    self.logger.debug(f"Using provided content directly")
+                
                 # Create document object with required fields
                 document = Document(
                     content=content,
-                    source=str(source),
+                    source=source_path,
                     modality=modality,
                     doc_info={'options': options or {}}
                 )
-                self.logger.debug("Successfully created Document object")
-            except Exception as e:
-                self.logger.error(f"Failed to create Document object: {str(e)}")
-                self.logger.error(f"Document parameters that failed:")
-                self.logger.error(f"content type: {type(content)}")
-                self.logger.error(f"source: {source}")
-                self.logger.error(f"modality: {modality}")
-                self.logger.error(f"doc_info: {{'options': {options or {}}}}")
-                raise
-            
-            # Debug: Print document object details
-            self.logger.debug(f"Created document with ID: {document.id}")
+                self.logger.debug(f"Created new Document object with ID: {document.id}")
             
             # Process through stages
             for stage in ProcessingStage:
@@ -575,9 +579,7 @@ class Pipeline:
                         self.logger.debug(f"Completed stage: {stage}")
                     except Exception as e:
                         self.logger.error(f"Stage {stage} failed: {str(e)}")
-                        self.logger.error(f"Document state at failure:")
-                        self.logger.error(f"Document ID: {document.id}")
-                        self.logger.error(f"Current stage: {stage}")
+                        self.logger.error(f"Document state at failure: ID={document.id}, stage={stage}")
                         raise
                         
             return document

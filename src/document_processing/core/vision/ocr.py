@@ -38,14 +38,81 @@ import time
 import logging
 import numpy as np
 import pytesseract
+import fitz
 from typing import List, Dict, Union, Optional, Any
 from pdf2image import convert_from_path
 from PIL import Image
+import yaml
+from pathlib import Path
+import google.generativeai as genai
+from base64 import b64encode
+from io import BytesIO
 
 # If you have your custom text detection/recognition operators:
 # from .operators import ...
 # from .postprocess import build_post_process
 
+# Check for OpenCV
+try:
+    import cv2
+    HAS_OPENCV = True
+except ImportError:
+    print("Warning: OpenCV not available. Image preprocessing will be limited.")
+    HAS_OPENCV = False
+
+# # Load configuration
+# def load_config():
+#     try:
+#         # Try multiple possible locations for the config file
+#         possible_paths = [
+#             Path(__file__).parents[4] / "config" / "rag_config.yaml",  # From module location
+#             Path("config/rag_config.yaml"),                            # From current directory
+#             Path("../config/rag_config.yaml"),                         # One level up
+#             Path("../../config/rag_config.yaml"),                      # Two levels up
+#             Path("../../../config/rag_config.yaml"),                   # Three levels up
+#             Path("../../../../config/rag_config.yaml"),                # Four levels up
+#         ]
+        
+#         config_path = None
+#         for path in possible_paths:
+#             if path.exists():
+#                 config_path = path
+#                 break
+                
+#         if config_path:
+#             print(f"Loading configuration from {config_path}")
+#             with open(config_path, 'r') as f:
+#                 config = yaml.safe_load(f)
+#             return config
+#         else:
+#             print("Warning: Configuration file not found. Using default settings.")
+#             # Return a minimal default configuration
+#             return {
+#                 "pdf": {
+#                     "use_ocr": True,
+#                     "preserve_layout": True,
+#                     "enhance_resolution": True,
+#                     "use_paligemma": True
+#                 },
+#                 "model": {
+#                     "temperature": 0.7,
+#                     "max_tokens": 200,
+#                     "hf_api_key": "",
+#                     "gemini_api_key": ""
+#                 }
+#             }
+#     except Exception as e:
+#         print(f"Error loading configuration: {str(e)}")
+#         return {}
+
+# # Get configuration
+# config = load_config()
+
+def encode_image_to_base64(image):
+    """Convert PIL Image to base64 string."""
+    buffered = BytesIO()
+    image.save(buffered, format="PNG")
+    return b64encode(buffered.getvalue()).decode('utf-8')
 
 class OCR:
     """
@@ -59,28 +126,97 @@ class OCR:
     """
     def __init__(
         self,
-        languages: List[str] = ['en'],
-        enhance_resolution: bool = False,
-        preserve_layout: bool = True,
-        confidence_threshold: float = 0.6,
-        preprocessing_options: Optional[Dict] = None
+        config: Dict[str, Any],
+        languages: List[str] = None,
+        preserve_layout: bool = None,
+        enhance_resolution: bool = None,
+        confidence_threshold: float = None,
+        use_paligemma: bool = False
     ):
+        # Load configuration
+        self.config = config
+        
+        # Set defaults from configuration or fallback to hardcoded defaults
+        self.languages = languages or self.config.get("pdf", {}).get("languages", ['en'])
+        self.preserve_layout = preserve_layout if preserve_layout is not None else self.config.get("pdf", {}).get("preserve_layout", True)
+        self.enhance_resolution = enhance_resolution if enhance_resolution is not None else self.config.get("pdf", {}).get("enhance_resolution", True)
+        self.confidence_threshold = confidence_threshold if confidence_threshold is not None else self.config.get("pdf", {}).get("confidence_threshold", 0.7)
+        self.use_paligemma = use_paligemma if use_paligemma is not None else self.config.get("pdf", {}).get("use_paligemma", False)
+        
+        # Configure logging
         self.logger = logging.getLogger(__name__)
-        self.languages = languages
-        self.enhance_resolution = enhance_resolution
-        self.preserve_layout = preserve_layout
-        self.confidence_threshold = confidence_threshold
+        
+        # Initialize Gemini if available
+        self.use_gemini = False
+        self.gemini_model = None
+        
+        # Try to initialize Gemini if PaliGemma is not available
+        if not HAS_PALIGEMMA:
+            try:                # Get API key from different possible locations in config
+                api_key = (
+                    self.config.get("layout", {}).get("api_key")
+                )
+                
+                # Get model name from different possible locations in config
+                model_name = (
+                    self.config.get("layout", {}).get("model_name") 
+                )
+                
+                if api_key:
+                    self.logger.info(f"Initializing Gemini model {model_name} for image understanding")
+                    genai.configure(api_key=api_key)
+                    self.gemini_model = genai.GenerativeModel(model_name)
+                    self.use_gemini = True
+                else:
+                    self.logger.warning("No Gemini API key found in configuration. Advanced image understanding will be disabled.")
+            except Exception as e:
+                self.logger.warning(f"Failed to initialize Gemini model: {str(e)}")
         
         # Default preprocessing options
-        self._preprocessing_options = {
-            'denoise': True,
+        self.preprocessing_options = {
             'deskew': True,
+            'denoise': True,
             'contrast_enhancement': True,
-            'remove_borders': True,
-            'adaptive_thresholding': True
+            'remove_borders': True
         }
-        if preprocessing_options:
-            self._preprocessing_options.update(preprocessing_options)
+        
+        # Check if advanced features are available
+        self._check_advanced_features()
+
+    def _check_advanced_features(self):
+        """Check if advanced OCR features are available and log status."""
+        if not HAS_OPENCV:
+            self.logger.warning("OpenCV not available. Image preprocessing will be limited.")
+            # Disable preprocessing options that require OpenCV
+            self.preprocessing_options['deskew'] = False
+            self.preprocessing_options['denoise'] = False
+            self.preprocessing_options['contrast_enhancement'] = False
+            self.preprocessing_options['remove_borders'] = False
+        
+        # Check for advanced image understanding capabilities
+        has_advanced_image_understanding = False
+        
+        # Check if PaliGemma is available
+        if self.use_paligemma and HAS_PALIGEMMA:
+            has_advanced_image_understanding = True
+            self.logger.info("PaliGemma model is available for advanced image understanding.")
+        elif hasattr(self, 'use_gemini') and self.use_gemini and self.gemini_model:
+            has_advanced_image_understanding = True
+            self.logger.info("Gemini model is available for advanced image understanding.")
+        else:
+            self.logger.warning("Advanced image understanding is not available.")
+            if self.use_paligemma and not HAS_PALIGEMMA:
+                self.logger.warning("PaliGemma could not be loaded. See earlier logs for details.")
+            if hasattr(self, 'use_gemini') and not self.use_gemini:
+                self.logger.warning("Gemini model could not be initialized. Check API key configuration.")
+        
+        self.has_advanced_image_understanding = has_advanced_image_understanding
+
+    def has_advanced_features(self) -> bool:
+        """Check if advanced OCR features are available."""
+        # Consider either PaliGemma or Gemini as valid for advanced features
+        has_advanced_models = (self.use_paligemma and HAS_PALIGEMMA) or (hasattr(self, 'use_gemini') and self.use_gemini and self.gemini_model is not None)
+        return HAS_OPENCV and has_advanced_models
 
     async def process_document(self, doc) -> str:
         """
@@ -148,68 +284,114 @@ class OCR:
             else:
                 config.append("--psm 3")  # Fully automatic page segmentation
                 
-            # Add any additional Tesseract configurations
-            config.append("--oem 3")  # Default, LSTM only
-            config.append("-c preserve_interword_spaces=1")
-            
+            # Join languages with '+' for pytesseract
             lang_str = "+".join(languages)
             
-            # Get detailed OCR data including confidence scores
+            # Use pytesseract for OCR
+            import pytesseract
             ocr_data = pytesseract.image_to_data(
-                image,
+                image, 
                 lang=lang_str,
                 config=" ".join(config),
                 output_type=pytesseract.Output.DICT
             )
             
-            # Process OCR results into structured format
-            blocks = self._process_ocr_data(ocr_data)
+            # Extract text blocks with confidence scores
+            blocks = self._extract_text_blocks(ocr_data)
             
-            # Validate results and filter low-confidence sections
-            validated_blocks = self._validate_ocr_results(blocks)
+            # Filter blocks by confidence threshold
+            validated_blocks = self._validate_blocks(blocks)
+            
+            # Calculate overall page confidence
+            page_confidence = self._calculate_page_confidence(validated_blocks)
+            
+            # Extract layout information
+            layout_info = self._extract_layout_info(ocr_data)
+            
+            # Use advanced image understanding if available
+            advanced_insights = None
+            
+            # Try PaliGemma first if enabled and available
+            if self.use_paligemma and HAS_PALIGEMMA:
+                try:
+                    advanced_insights = await self._get_paligemma_original_insights(image)
+                    if advanced_insights:
+                        self.logger.info("Successfully obtained PaliGemma insights")
+                except Exception as e:
+                    self.logger.warning(f"PaliGemma processing failed: {str(e)}")
+            
+            # Try Gemini as fallback if PaliGemma failed or is not available
+            if not advanced_insights and hasattr(self, 'use_gemini') and self.use_gemini and self.gemini_model:
+                try:
+                    advanced_insights = await self._get_gemini_insights(image)
+                    if advanced_insights:
+                        self.logger.info("Successfully obtained Gemini insights")
+                except Exception as e:
+                    self.logger.warning(f"Gemini processing failed: {str(e)}")
             
             return {
                 'blocks': validated_blocks,
-                'page_confidence': self._calculate_page_confidence(validated_blocks),
-                'layout_info': self._extract_layout_info(ocr_data)
+                'page_confidence': page_confidence,
+                'layout_info': layout_info,
+                'advanced_insights': advanced_insights
             }
             
         except Exception as e:
-            self.logger.error(f"Page OCR processing failed: {str(e)}")
-            return {'blocks': [], 'page_confidence': 0.0, 'layout_info': None}
+            self.logger.error(f"Page OCR failed: {str(e)}")
+            return {
+                'blocks': [],
+                'page_confidence': 0.0,
+                'layout_info': {},
+                'advanced_insights': None
+            }
 
     def _preprocess_image(self, image: Image.Image) -> Image.Image:
-        """
-        Apply preprocessing steps to improve OCR quality.
-        """
+        """Apply preprocessing steps to enhance image quality for OCR."""
+        if not HAS_OPENCV:
+            # Basic preprocessing using PIL if OpenCV is not available
+            try:
+                # Convert to grayscale
+                image = image.convert('L')
+                
+                # Enhance contrast
+                from PIL import ImageEnhance
+                enhancer = ImageEnhance.Contrast(image)
+                image = enhancer.enhance(1.5)  # Increase contrast
+                
+                # Enhance sharpness
+                enhancer = ImageEnhance.Sharpness(image)
+                image = enhancer.enhance(1.5)  # Increase sharpness
+                
+                return image
+            except Exception as e:
+                self.logger.warning(f"PIL preprocessing failed: {str(e)}")
+                return image
+        
         try:
-            # Convert to numpy array for OpenCV operations
+            # Advanced preprocessing with OpenCV
             np_image = np.array(image)
             
-            if self._preprocessing_options['denoise']:
+            if self.preprocessing_options['denoise']:
                 np_image = cv2.fastNlMeansDenoisingColored(np_image)
                 
-            if self._preprocessing_options['deskew']:
+            if self.preprocessing_options['deskew']:
                 np_image = self._deskew_image(np_image)
                 
-            if self._preprocessing_options['contrast_enhancement']:
+            if self.preprocessing_options['contrast_enhancement']:
                 # Convert to LAB color space for better contrast enhancement
                 lab = cv2.cvtColor(np_image, cv2.COLOR_RGB2LAB)
                 l, a, b = cv2.split(lab)
-                clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
-                l = clahe.apply(l)
-                lab = cv2.merge((l,a,b))
-                np_image = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
                 
-            if self._preprocessing_options['remove_borders']:
+                # Apply CLAHE to L channel
+                clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+                cl = clahe.apply(l)
+                
+                # Merge channels back
+                limg = cv2.merge((cl, a, b))
+                np_image = cv2.cvtColor(limg, cv2.COLOR_LAB2RGB)
+                
+            if self.preprocessing_options['remove_borders']:
                 np_image = self._remove_borders(np_image)
-                
-            if self._preprocessing_options['adaptive_thresholding']:
-                gray = cv2.cvtColor(np_image, cv2.COLOR_RGB2GRAY)
-                np_image = cv2.adaptiveThreshold(
-                    gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-                    cv2.THRESH_BINARY, 11, 2
-                )
                 
             return Image.fromarray(np_image)
             
@@ -334,6 +516,14 @@ class OCR:
         text_parts = [f"--- Page {page_index + 1} ---"]
         text_parts.append(f"Confidence: {page_result['page_confidence']:.1f}%")
         
+        # Add PaliGemma insights if available
+        if page_result.get('advanced_insights'):
+            text_parts.append("\n=== Document Analysis ===")
+            for insight in page_result['advanced_insights'].get('insights', []):
+                text_parts.append(f"Q: {insight['prompt'].replace('<image> ', '')}")
+                text_parts.append(f"A: {insight['response']}\n")
+        
+        text_parts.append("=== Extracted Text ===")
         for block in page_result['blocks']:
             block_text = " ".join(
                 elem['text'] for elem in block['text_elements']
@@ -417,6 +607,183 @@ class OCR:
             self.logger.warning(f"Border removal failed: {str(e)}")
             return np_image
 
+    async def _get_paligemma_original_insights(self, image: Image.Image) -> Dict[str, Any]:
+        """Original PaliGemma implementation."""
+        # Original PaliGemma code here...
+        if not HAS_PALIGEMMA or not self.use_paligemma:
+            return None
+            
+        try:
+            # Get temperature from config
+            temperature = config.get("model", {}).get("temperature", 0.7)
+            
+            # Try to get custom prompt from config
+            custom_prompt = config.get("pdf", {}).get("picture_annotation", {}).get("prompt", "")
+            
+            # Generic document understanding prompts
+            default_prompts = [
+                "<image> Describe the main content and structure of this document.",
+                "<image> What type of document is this and what information does it contain?",
+                "<image> Extract the key information from this document."
+            ]
+            
+            # Use custom prompt if available
+            prompts = ["<image> " + custom_prompt] if custom_prompt else default_prompts
+            
+            results = []
+            for prompt in prompts:
+                inputs = processor(
+                    text=prompt, 
+                    images=image, 
+                    return_tensors="pt"
+                )
+                inputs.pop("last_cache_position", None)
+                
+                for key, tensor in inputs.items():
+                    if key in ["input_ids", "attention_mask"]:
+                        inputs[key] = tensor.to(device)
+                    else:
+                        inputs[key] = tensor.to(device, dtype=torch.float16)
+                
+                input_len = inputs["input_ids"].shape[-1]
+                
+                with torch.inference_mode():
+                    generation = model.generate(
+                        input_ids=inputs["input_ids"],
+                        attention_mask=inputs.get("attention_mask", None),
+                        max_new_tokens=200,
+                        do_sample=True,
+                        temperature=temperature,
+                        pad_token_id=processor.tokenizer.pad_token_id,
+                        eos_token_id=processor.tokenizer.eos_token_id
+                    )
+                    generation = generation[0][input_len:]
+                    decoded = processor.decode(generation, skip_special_tokens=True)
+                    results.append({
+                        'prompt': prompt,
+                        'response': decoded
+                    })
+            
+            return {
+                'insights': results
+            }
+            
+        except Exception as e:
+            self.logger.warning(f"PaliGemma insights failed: {str(e)}")
+            return None
+
+    async def _get_gemini_insights(self, image: Image.Image) -> Dict[str, Any]:
+        """Get insights using Gemini model."""
+        try:
+            # Get custom prompt from config
+            custom_prompt = self.config.get("pdf", {}).get("picture_annotation", {}).get("prompt", "")
+            
+            # Default prompts if no custom prompt
+            default_prompts = [
+                "Describe the main content and structure of this document.",
+                "What type of document is this and what information does it contain?",
+                "Extract the key information from this document."
+            ]
+            
+            prompts = [custom_prompt] if custom_prompt else default_prompts
+            results = []
+            
+            # Convert PIL Image to base64
+            image_data = encode_image_to_base64(image)
+            
+            for prompt in prompts:
+                try:
+                    response = self.gemini_model.generate_content([
+                        prompt,
+                        {"mime_type": "image/png", "data": image_data}
+                    ])
+                    
+                    results.append({
+                        'prompt': prompt,
+                        'response': response.text
+                    })
+                except Exception as e:
+                    self.logger.warning(f"Gemini prompt failed: {str(e)}")
+                    results.append({
+                        'prompt': prompt,
+                        'response': f"Error processing image: {str(e)}"
+                    })
+            
+            self.logger.info(f"Successfully processed image with Gemini model")
+            return {
+                'insights': results,
+                'model': 'gemini'
+            }
+            
+        except Exception as e:
+            self.logger.warning(f"Gemini image analysis failed: {str(e)}")
+            return None
+
+    def _extract_text_blocks(self, ocr_data: Dict) -> List[Dict[str, Any]]:
+        """Extract text blocks from OCR data."""
+        blocks = []
+        current_block = None
+        current_block_num = -1
+        
+        for i in range(len(ocr_data['text'])):
+            text = ocr_data['text'][i].strip()
+            if not text:
+                continue
+                
+            block_num = ocr_data['block_num'][i]
+            line_num = ocr_data['line_num'][i]
+            confidence = ocr_data['conf'][i]
+            
+            # New block
+            if block_num != current_block_num:
+                if current_block:
+                    blocks.append(current_block)
+                    
+                current_block = {
+                    'block_num': block_num,
+                    'text_elements': [],
+                    'bounding_box': {
+                        'x': ocr_data['left'][i],
+                        'y': ocr_data['top'][i],
+                        'width': ocr_data['width'][i],
+                        'height': ocr_data['height'][i]
+                    }
+                }
+                current_block_num = block_num
+                
+            # Add text element to current block
+            current_block['text_elements'].append({
+                'text': text,
+                'line_num': line_num,
+                'confidence': float(confidence) if confidence != '-1' else 0.0,
+                'position': {
+                    'x': ocr_data['left'][i],
+                    'y': ocr_data['top'][i],
+                    'width': ocr_data['width'][i],
+                    'height': ocr_data['height'][i]
+                }
+            })
+            
+        # Add the last block
+        if current_block:
+            blocks.append(current_block)
+            
+        return blocks
+    
+    def _validate_blocks(self, blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Validate text blocks based on confidence threshold."""
+        validated = []
+        
+        for block in blocks:
+            # Calculate average confidence for the block
+            confidences = [elem['confidence'] for elem in block['text_elements']]
+            avg_confidence = sum(confidences) / len(confidences) if confidences else 0
+            
+            if avg_confidence >= self.confidence_threshold * 100:
+                validated.append(block)
+                
+        return validated
+
 
 
 from transformers import (
@@ -430,38 +797,97 @@ from pathlib import Path
 from pdf2image import convert_from_path
 
 # Model setup
-model_id = "google/paligemma2-10b-mix-448"
-api_token = ""
-device = "cuda" if torch.cuda.is_available() else "cpu"
-print(f"Using device: {device}")
+try:
+    # Get configuration values for HuggingFace
+    hf_api_key = config.get("model", {}).get("hf_api_key")
+    model_id = config.get("model", {}).get("hf_captioning_model", "google/paligemma2-10b-mix-448")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Using device: {device}")
+    print(f"Model ID: {model_id}")
 
-torch.set_float32_matmul_precision('high')
+    torch.set_float32_matmul_precision('high')
 
-model = PaliGemmaForConditionalGeneration.from_pretrained(
-    model_id,
-    torch_dtype=torch.float16,
-    device_map="auto",
-    token=api_token
-).eval()
+    if not hf_api_key:
+        print("Warning: No Hugging Face API token found in configuration.")
+        print("To use PaliGemma, add your Hugging Face API token to the config/rag_config.yaml file under model.hf_api_key")
+        raise ValueError("Missing Hugging Face API token")
 
-processor = PaliGemmaProcessor.from_pretrained(
-    model_id,
-    token=api_token
-)
+    print(f"Attempting to load PaliGemma model with API token: {hf_api_key[:4]}{'*' * (len(hf_api_key) - 8)}{hf_api_key[-4:] if len(hf_api_key) > 8 else ''}")
+
+    model = PaliGemmaForConditionalGeneration.from_pretrained(
+        model_id,
+        torch_dtype=torch.float16,
+        device_map="auto",
+        token=hf_api_key
+    ).eval()
+
+    processor = PaliGemmaProcessor.from_pretrained(
+        model_id,
+        token=hf_api_key
+    )
+    HAS_PALIGEMMA = True
+    print("Successfully loaded PaliGemma model")
+except Exception as e:
+    print(f"Warning: Could not load PaliGemma model: {str(e)}")
+    print("Falling back to basic OCR functionality")
+    print("To use PaliGemma, you need to:")
+    print("1. Create a Hugging Face account")
+    print("2. Accept the model terms at https://huggingface.co/google/paligemma2-10b-mix-448")
+    print("3. Create an access token at https://huggingface.co/settings/tokens")
+    print("4. Add your token to config/rag_config.yaml under model.hf_api_key")
+    HAS_PALIGEMMA = False
+    model = None
+    processor = None
 
 # Process passport directory
 passports_dir = Path("port")
 
 def process_passport_image(image, filename, page_num=None):
     try:
-        # Revised prompt
-        queries = [
-        "<image> What are the towage charges for a vessel with a net registered tonnage (NRT) of 4500 in the harbour areas of HaminaKotka?",
-        "<image> What is the minimum charge for towage assistance, and how is the time for the service calculated?",
-        "<image>  What are the additional charges for towage assistance provided on weekends or public holidays in HaminaKotka?",
-        "<image> What is the cancellation fee for tug services if the tug has not left the station on a working day?",
-        "<image> How much is the surcharge for ordering towage assistance outside normal working hours without prior notification during public holidays?"
+        # Check if PaliGemma is available
+        if not HAS_PALIGEMMA:
+            print(f"Using basic OCR for {filename} (Page {page_num if page_num is not None else 1})")
+            # Save the image to a temporary file
+            temp_img_path = f"temp_{filename.replace('.pdf', '')}_{page_num if page_num is not None else 1}.png"
+            image.save(temp_img_path)
+            print(f"Saved image to {temp_img_path}")
+            
+            # Use basic OCR to extract text
+            try:
+                import pytesseract
+                text = pytesseract.image_to_string(image)
+                
+                # Save the extracted text
+                text_file = f"extracted_{filename.replace('.pdf', '')}_{page_num if page_num is not None else 1}.txt"
+                with open(text_file, "w") as f:
+                    f.write(text)
+                print(f"Extracted text saved to {text_file}")
+                
+            except ImportError:
+                print("pytesseract not available. Install it with: pip install pytesseract")
+                print("You'll also need to install Tesseract OCR on your system.")
+            
+            return
+            
+        # Get prompts from configuration if available
+        default_prompts = [
+            "<image> What are the towage charges for a vessel with a net registered tonnage (NRT) of 4500 in the harbour areas of HaminaKotka?",
+            "<image> What is the minimum charge for towage assistance, and how is the time for the service calculated?",
+            "<image> What are the additional charges for towage assistance provided on weekends or public holidays in HaminaKotka?",
+            "<image> What is the cancellation fee for tug services if the tug has not left the station on a working day?",
+            "<image> How much is the surcharge for ordering towage assistance outside normal working hours without prior notification during public holidays?"
         ]
+        
+        # Try to get custom prompt from config
+        custom_prompt = config.get("pdf", {}).get("picture_annotation", {}).get("prompt", "")
+        if custom_prompt:
+            queries = ["<image> " + custom_prompt]
+            print(f"Using custom prompt from configuration: {custom_prompt}")
+        else:
+            queries = default_prompts
+            
+        # Get temperature from config
+        temperature = config.get("model", {}).get("temperature", 0.7)
 
         for prompt in queries:
             inputs = processor(
@@ -485,7 +911,7 @@ def process_passport_image(image, filename, page_num=None):
                     attention_mask=inputs.get("attention_mask", None),
                     max_new_tokens=200,
                     do_sample=True,
-                    temperature=0.7,
+                    temperature=temperature,
                     pad_token_id=processor.tokenizer.pad_token_id,
                     eos_token_id=processor.tokenizer.eos_token_id
                 )
@@ -511,13 +937,45 @@ def main():
     
     print(f"Looking for PDFs in: {passports_dir.absolute()}")
     
+    # Print configuration information
+    print("\n=== Configuration ===")
+    print(f"Hugging Face API Key: {'Configured' if hf_api_key else 'Not configured'}")
+    print(f"OpenCV: {'Available' if HAS_OPENCV else 'Not available'}")
+    print(f"PaliGemma: {'Available' if HAS_PALIGEMMA else 'Not available'}")
+    print(f"Device: {device}")
+    
+    # Print PDF configuration
+    pdf_config = config.get("pdf", {})
+    print("\n=== PDF Processing Configuration ===")
+    print(f"Use OCR: {pdf_config.get('use_ocr', True)}")
+    print(f"Preserve Layout: {pdf_config.get('preserve_layout', True)}")
+    print(f"Enhance Resolution: {pdf_config.get('enhance_resolution', True)}")
+    print(f"Use PaliGemma: {pdf_config.get('use_paligemma', True)}")
+    print("=" * 20)
+    
+    # Initialize OCR with configuration
+    ocr = OCR()
+    
+    print(f"\nOCR initialized. Advanced features: {'Available' if ocr.has_advanced_features() else 'Limited'}")
+    if not ocr.has_advanced_features():
+        print("Note: Some advanced features are not available. Basic OCR will be used.")
+        if not HAS_OPENCV:
+            print("OpenCV is not available. Image preprocessing will be limited.")
+        if not HAS_PALIGEMMA:
+            print("PaliGemma model is not available. Advanced image understanding will be disabled.")
+            print("To use PaliGemma, you need to:")
+            print("1. Create a Hugging Face account")
+            print("2. Accept the model terms at https://huggingface.co/google/paligemma2-10b-mix-448")
+            print("3. Create an access token at https://huggingface.co/settings/tokens")
+            print("4. Ensure your token is in the config/rag_config.yaml file under model.hf_api_key")
+    
     # Process all PDF files in the directory
     found_pdfs = False
     
     for file_path in passports_dir.iterdir():
         if file_path.suffix.lower() == '.pdf':
             found_pdfs = True
-            print(f"Processing PDF: {file_path.name}")
+            print(f"\nProcessing PDF: {file_path.name}")
             
             try:
                 # Convert PDF to images
@@ -525,10 +983,41 @@ def main():
                 
                 # Process each page
                 for i, image in enumerate(images, 1):
-                    process_passport_image(image, file_path.name, i)
+                    print(f"Processing page {i} of {file_path.name}")
+                    
+                    # Save the image to a temporary file
+                    temp_img_path = f"temp_{file_path.stem}_page{i}.png"
+                    image.save(temp_img_path)
+                    print(f"Saved image to {temp_img_path}")
+                    
+                    # Create a PyMuPDF document from the image
+                    import fitz
+                    doc = fitz.open()
+                    doc.new_page(width=image.width, height=image.height)
+                    page = doc[0]
+                    page.insert_image(fitz.Rect(0, 0, image.width, image.height), filename=temp_img_path)
+                    
+                    # Process the document with OCR
+                    import asyncio
+                    result = asyncio.run(ocr.process_document(doc))
+                    
+                    # Save the result
+                    output_file = f"extracted_{file_path.stem}_page{i}.txt"
+                    with open(output_file, "w") as f:
+                        f.write(result)
+                    print(f"Extracted text saved to {output_file}")
+                    
+                    # Clean up
+                    doc.close()
+                    
+                    # If PaliGemma is available, also process with the original function
+                    if HAS_PALIGEMMA and ocr.use_paligemma:
+                        process_passport_image(image, file_path.name, i)
                     
             except Exception as e:
-                print(f"Error converting PDF {file_path}: {str(e)}")
+                print(f"Error processing PDF {file_path}: {str(e)}")
+                import traceback
+                traceback.print_exc()
     
     if not found_pdfs:
         print("No PDF files found in the passports directory!")

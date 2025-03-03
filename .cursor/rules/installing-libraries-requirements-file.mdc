@@ -1,0 +1,10 @@
+---
+description: Whenever you install a library, remember to add it to the requirements.txt of that working space
+globs: 
+alwaysApply: false
+---
+
+# Your rule content
+
+- You can @ files here
+- You can use markdown but dont have to
