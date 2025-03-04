@@ -89,8 +89,13 @@ class DoclingExtractor:
         image_scale (float): Scale factor for image processing
         picture_prompt (str): Prompt for image description
         api_config (Optional[Dict[str, Any]]): Configuration for remote API (required if model_type is 'remote')
+        secondary_api_config (Optional[Dict[str, Any]]): Secondary API configuration for fallback
         num_threads (int): Number of threads for acceleration
         device (AcceleratorDevice): Selected accelerator device
+        rate_limited (bool): Whether the API is rate limited
+        last_rate_limit_time (float): Timestamp of the last rate limit
+        rate_limit_cooldown (float): Cooldown period for rate limiting
+        using_secondary_api (bool): Whether the secondary API is being used
     """
     
     def __init__(
@@ -102,6 +107,7 @@ class DoclingExtractor:
         image_scale: float = 2.0,
         picture_prompt: str = "Describe the image in three sentences. Be concise and accurate.",
         api_config: Optional[Dict[str, Any]] = None,
+        secondary_api_config: Optional[Dict[str, Any]] = None,
         num_threads: int = 8,
         enable_remote_services: bool = True
     ):
@@ -109,15 +115,16 @@ class DoclingExtractor:
         Initialize the DoclingExtractor.
         
         Args:
-            offline_mode (bool): If True, uses offline processing mode
-            artifacts_path (Optional[str]): Path to model artifacts for offline usage
-            model_type (str): Type of model to use ('local' or 'remote')
-            model_name (str): Name of the model to use
-            image_scale (float): Scale factor for image processing
-            picture_prompt (str): Prompt for image description
-            api_config (Optional[Dict[str, Any]]): Configuration for remote API (required if model_type is 'remote')
-            num_threads (int): Number of threads for acceleration
-            enable_remote_services (bool): Whether to enable remote services for Docling
+            offline_mode: Whether to run in offline mode
+            artifacts_path: Path to artifacts directory
+            model_type: Type of model to use ('local', 'remote', 'watsonx')
+            model_name: Name of the model to use
+            image_scale: Scale factor for images
+            picture_prompt: Prompt for image description
+            api_config: API configuration for remote models
+            secondary_api_config: Secondary API configuration for fallback
+            num_threads: Number of threads to use
+            enable_remote_services: Whether to enable remote services
         """
         self.offline_mode = offline_mode
         self.model_type = model_type
@@ -125,10 +132,24 @@ class DoclingExtractor:
         self.image_scale = image_scale
         self.picture_prompt = picture_prompt
         self.api_config = api_config
+        self.secondary_api_config = secondary_api_config
         self.num_threads = num_threads
         self.enable_remote_services = enable_remote_services
+        
+        # Rate limiting tracking
+        self.rate_limited = False
+        self.last_rate_limit_time = 0
+        self.rate_limit_cooldown = api_config.get('rate_limit_cooldown', 60) if api_config else 60
+        self.using_secondary_api = False
+        
+        # Determine device
         self.device = self._determine_device()
+        
+        # Initialize converter
         self.converter = self._initialize_converter(artifacts_path)
+        
+        # Set up logging
+        self.logger = logging.getLogger(__name__)
         
     def _determine_device(self) -> AcceleratorDevice:
         """Determine the best available accelerator device."""
@@ -200,19 +221,103 @@ class DoclingExtractor:
 
     def _configure_remote_model(self) -> PictureDescriptionApiOptions:
         """Configure remote model options."""
-        if not self.api_config:
+        # Check if we should try switching back to primary API after cooldown
+        import time
+        current_time = time.time()
+        if (self.rate_limited and 
+            hasattr(self, 'last_rate_limit_time') and 
+            current_time - self.last_rate_limit_time > self.rate_limit_cooldown):
+            self.logger.info("Cooldown period elapsed, attempting to switch back to primary API")
+            self._switch_to_primary_api()
+        
+        # Use the appropriate API config based on current state
+        api_config = self.secondary_api_config if self.using_secondary_api else self.api_config
+        
+        if not api_config:
             raise ValueError("API configuration required for remote model")
 
-        if 'watsonx' in self.api_config:
+        if 'watsonx' in api_config:
             return self._configure_watsonx_model()
         else:
             return PictureDescriptionApiOptions(
-                url=self.api_config['url'],
-                params=self.api_config['params'],
-                headers=self.api_config.get('headers', {}),
+                url=api_config['url'],
+                params=api_config['params'],
+                headers=api_config.get('headers', {}),
                 prompt=self.picture_prompt,
-                timeout=self.api_config.get('timeout', 60),
+                timeout=api_config.get('timeout', 60),
             )
+            
+    def _switch_to_fallback_api(self) -> bool:
+        """
+        Switch to the fallback API configuration when rate limited.
+        
+        Returns:
+            bool: True if successfully switched to fallback, False otherwise
+        """
+        import time
+        
+        # If we're already using the secondary API, no fallback available
+        if self.using_secondary_api:
+            self.logger.warning("Already using secondary API, no further fallback available")
+            return False
+            
+        # Check if we have a secondary API config
+        if not self.secondary_api_config:
+            self.logger.warning("No secondary API configuration available for fallback")
+            return False
+            
+        try:
+            self.logger.info("Switching to secondary API configuration due to rate limiting")
+            self.using_secondary_api = True
+            
+            # Update rate limit tracking
+            self.rate_limited = True
+            self.last_rate_limit_time = time.time()
+            
+            # Reinitialize converter with new configuration
+            self.converter = self._initialize_converter(
+                artifacts_path=None if not hasattr(self, 'artifacts_path') else self.artifacts_path
+            )
+            
+            self.logger.info("Successfully switched to secondary API configuration")
+            return True
+        except Exception as e:
+            self.logger.error(f"Failed to switch to secondary API configuration: {str(e)}")
+            return False
+    
+    def _switch_to_primary_api(self) -> bool:
+        """
+        Switch back to the primary API configuration after cooldown.
+        
+        Returns:
+            bool: True if successfully switched back to primary, False otherwise
+        """
+        # If we're already using the primary API, nothing to do
+        if not self.using_secondary_api:
+            return True
+            
+        # Check if we have a primary API config
+        if not self.api_config:
+            self.logger.warning("No primary API configuration available to switch back to")
+            return False
+            
+        try:
+            self.logger.info("Switching back to primary API configuration after cooldown")
+            self.using_secondary_api = False
+            
+            # Reset rate limit tracking
+            self.rate_limited = False
+            
+            # Reinitialize converter with new configuration
+            self.converter = self._initialize_converter(
+                artifacts_path=None if not hasattr(self, 'artifacts_path') else self.artifacts_path
+            )
+            
+            self.logger.info("Successfully switched back to primary API configuration")
+            return True
+        except Exception as e:
+            self.logger.error(f"Failed to switch back to primary API configuration: {str(e)}")
+            return False
 
     def _configure_watsonx_model(self) -> PictureDescriptionApiOptions:
         """Configure WatsonX.ai model options."""
@@ -252,94 +357,81 @@ class DoclingExtractor:
     
     def process_file(self, file_path_or_content: Union[str, Path, bytes]) -> ExtractionResult:
         """
-        Process a single document file or binary content.
+        Process a file and extract its content.
         
         Args:
-            file_path_or_content (Union[str, Path, bytes]): Path to the document file or binary content
+            file_path_or_content: Path to file or raw content bytes
             
         Returns:
             ExtractionResult: Extraction results in various formats
-            
-        Example:
-            ```python
-            extractor = DoclingExtractor()
-            
-            # Process from file path
-            result = extractor.process_file("document.pdf")
-            
-            # Or process from binary content
-            with open("document.pdf", "rb") as f:
-                content = f.read()
-            result = extractor.process_file(content)
-            
-            if result.success:
-                print(result.markdown)
-            else:
-                print(f"Error: {result.error}")
-            ```
         """
-        # Handle binary content
-        if isinstance(file_path_or_content, bytes):
-            # Create a temporary filename for logging purposes
-            filename = "document_from_bytes.pdf"
-            result = ExtractionResult(filename=filename)
-            
-            try:
-                logger.info(f"Processing binary content ({len(file_path_or_content)} bytes)")
-                # Use convert_from_bytes method if available, otherwise use a temporary file
-                try:
-                    # Try to use convert_from_bytes if available
-                    conv_result = self.converter.convert_from_bytes(file_path_or_content, "pdf")
-                except AttributeError:
-                    # If not available, use a temporary file
-                    import tempfile
-                    with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as temp_file:
-                        temp_file.write(file_path_or_content)
-                        temp_path = temp_file.name
-                    
-                    try:
-                        conv_result = self.converter.convert(temp_path)
-                    finally:
-                        # Clean up the temporary file
-                        if os.path.exists(temp_path):
-                            os.unlink(temp_path)
-                
-                doc = conv_result.document
-                
-                # Extract content in different formats
-                result.markdown = doc.export_to_markdown()
-                result.text = doc.export_to_text()
-                result.html = doc.export_to_html()
-                result.json = doc.export_to_json()
-                
-            except Exception as e:
-                result.success = False
-                result.error = str(e)
-                logger.error(f"Error processing binary content: {e}")
-                
-            return result
-        
-        # Handle file path
-        file_path = Path(file_path_or_content)
-        result = ExtractionResult(filename=file_path.name)
-        
         try:
-            logger.info(f"Processing file: {file_path}")
-            conv_result = self.converter.convert(str(file_path))
-            doc = conv_result.document
+            # Determine if input is a file path or content
+            if isinstance(file_path_or_content, (str, Path)) and not isinstance(file_path_or_content, bytes):
+                file_path = Path(file_path_or_content)
+                if not file_path.exists():
+                    raise FileNotFoundError(f"File not found: {file_path}")
+                    
+                filename = file_path.name
+                
+                # Read file content
+                with open(file_path, 'rb') as f:
+                    content = f.read()
+            else:
+                content = file_path_or_content if isinstance(file_path_or_content, bytes) else file_path_or_content.encode()
+                filename = "document"
             
-            # Extract content in different formats
-            result.markdown = doc.export_to_markdown()
-            result.text = doc.export_to_text()
-            result.html = doc.export_to_html()
-            result.json = doc.export_to_json()
+            # Process the content
+            try:
+                result = self.converter.convert(content)
+            except Exception as e:
+                error_message = str(e)
+                # Check for rate limiting errors
+                if "429" in error_message or "rate limit" in error_message.lower() or "quota exceeded" in error_message.lower():
+                    self.logger.warning(f"Rate limit detected: {error_message}")
+                    
+                    # Try fallback API
+                    if self._switch_to_fallback_api():
+                        self.logger.info("Retrying with fallback API")
+                        try:
+                            # Retry with fallback API
+                            result = self.converter.convert(content)
+                        except Exception as retry_e:
+                            self.logger.error(f"Fallback API also failed: {str(retry_e)}")
+                            return ExtractionResult(
+                                filename=filename,
+                                success=False,
+                                error=f"Both primary and fallback APIs failed: {str(retry_e)}"
+                            )
+                    else:
+                        return ExtractionResult(
+                            filename=filename,
+                            success=False,
+                            error=f"Rate limit hit and no fallback available: {error_message}"
+                        )
+                else:
+                    # Not a rate limit error, just raise it
+                    raise
+            
+            # Create extraction result
+            extraction_result = ExtractionResult(
+                filename=filename,
+                markdown=result.markdown,
+                text=result.text,
+                html=result.html,
+                json=result.json,
+                success=True
+            )
+            
+            return extraction_result
             
         except Exception as e:
-            result.success = False
-            result.error = str(e)
-            logger.error(f"Error processing {file_path}: {e}")
-            
-        return result
+            self.logger.error(f"Error processing file: {str(e)}")
+            return ExtractionResult(
+                filename=str(file_path_or_content) if isinstance(file_path_or_content, (str, Path)) else "document",
+                success=False,
+                error=str(e)
+            )
     
     def process_directory(self, 
                          input_dir: Union[str, Path],

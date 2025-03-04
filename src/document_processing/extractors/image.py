@@ -29,9 +29,27 @@ class ImageExtractor(BaseExtractor):
             # Convert bytes to image
             image = Image.open(io.BytesIO(content))
             
-            # Use OCR to extract text
+            # Use OCR to extract text - dynamically import to avoid circular imports
             from ..core.vision.ocr import OCR
-            ocr = OCR()
+            
+            # Try to load config, but handle case where it might not exist
+            try:
+                import yaml
+                import os
+                from src.utils.file_utils import get_project_base_directory
+                
+                config_path = os.path.join(get_project_base_directory(), "config", "rag_config.yaml")
+                if os.path.exists(config_path):
+                    with open(config_path, 'r') as f:
+                        config = yaml.safe_load(f)
+                    ocr = OCR(config=config)
+                else:
+                    logger.warning(f"Config file not found at {config_path}, using default OCR settings")
+                    ocr = OCR(config={})
+            except Exception as e:
+                logger.warning(f"Failed to initialize OCR with config: {str(e)}, using default settings")
+                ocr = OCR(config={})
+                
             extracted_text = ocr.process_image(image)
             
             # Update document metadata

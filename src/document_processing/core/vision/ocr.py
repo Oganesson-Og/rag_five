@@ -48,6 +48,46 @@ import google.generativeai as genai
 from base64 import b64encode
 from io import BytesIO
 
+# Default tesseract configuration
+DEFAULT_TESSERACT_CONFIG = "--oem 1 --psm 6"
+
+# Default languages
+DEFAULT_LANGUAGES = ['eng']
+
+# Default confidence threshold
+DEFAULT_CONFIDENCE_THRESHOLD = 0.7
+
+# Default PaliGemma model
+DEFAULT_PALIGEMMA_MODEL = "google/paligemma-3b-mix-224"
+
+# Default Gemini model
+DEFAULT_GEMINI_MODEL = "gemini-pro-vision"
+
+# Check if PaliGemma is available
+try:
+    import torch
+    from transformers import AutoProcessor, AutoModelForVision2Seq
+    HAS_PALIGEMMA = True
+except ImportError:
+    HAS_PALIGEMMA = False
+
+# Check if OpenCV is available
+try:
+    import cv2
+    HAS_OPENCV = True
+except ImportError:
+    HAS_OPENCV = False
+
+# Check if Tesseract is available
+try:
+    pytesseract.get_tesseract_version()
+    HAS_TESSERACT = True
+except Exception:
+    HAS_TESSERACT = False
+
+# Configure logging
+logger = logging.getLogger(__name__)
+
 # If you have your custom text detection/recognition operators:
 # from .operators import ...
 # from .postprocess import build_post_process
@@ -59,6 +99,21 @@ try:
 except ImportError:
     print("Warning: OpenCV not available. Image preprocessing will be limited.")
     HAS_OPENCV = False
+
+# Check if PaliGemma is available
+try:
+    import torch
+    from transformers import AutoProcessor, AutoModelForVision2Seq
+    HAS_PALIGEMMA = True
+except ImportError:
+    HAS_PALIGEMMA = False
+
+# Check if Tesseract is available
+try:
+    pytesseract.get_tesseract_version()
+    HAS_TESSERACT = True
+except Exception:
+    HAS_TESSERACT = False
 
 # # Load configuration
 # def load_config():
@@ -111,8 +166,8 @@ except ImportError:
 def encode_image_to_base64(image):
     """Convert PIL Image to base64 string."""
     buffered = BytesIO()
-    image.save(buffered, format="PNG")
-    return b64encode(buffered.getvalue()).decode('utf-8')
+    image.save(buffered, format=image.format if image.format else "PNG")
+    return b64encode(buffered.getvalue()).decode("utf-8")
 
 class OCR:
     """
@@ -346,58 +401,138 @@ class OCR:
             }
 
     def _preprocess_image(self, image: Image.Image) -> Image.Image:
-        """Apply preprocessing steps to enhance image quality for OCR."""
-        if not HAS_OPENCV:
-            # Basic preprocessing using PIL if OpenCV is not available
-            try:
-                # Convert to grayscale
-                image = image.convert('L')
-                
-                # Enhance contrast
-                from PIL import ImageEnhance
-                enhancer = ImageEnhance.Contrast(image)
-                image = enhancer.enhance(1.5)  # Increase contrast
-                
-                # Enhance sharpness
-                enhancer = ImageEnhance.Sharpness(image)
-                image = enhancer.enhance(1.5)  # Increase sharpness
-                
-                return image
-            except Exception as e:
-                self.logger.warning(f"PIL preprocessing failed: {str(e)}")
-                return image
+        """
+        Preprocess an image to improve OCR results.
         
+        Args:
+            image: PIL Image to preprocess
+            
+        Returns:
+            Preprocessed PIL Image
+        """
+        # If OpenCV is not available, return the original image
+        if not HAS_OPENCV:
+            return image
+            
         try:
-            # Advanced preprocessing with OpenCV
-            np_image = np.array(image)
+            # Convert PIL image to OpenCV format
+            img_array = np.array(image.convert('RGB'))
+            img_cv = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
             
-            if self.preprocessing_options['denoise']:
-                np_image = cv2.fastNlMeansDenoisingColored(np_image)
+            # Apply preprocessing steps based on options
+            if self.preprocessing_options.get('deskew', True):
+                img_cv = self._deskew_image(img_cv)
                 
-            if self.preprocessing_options['deskew']:
-                np_image = self._deskew_image(np_image)
+            if self.preprocessing_options.get('denoise', True):
+                img_cv = self._denoise_image(img_cv)
                 
-            if self.preprocessing_options['contrast_enhancement']:
-                # Convert to LAB color space for better contrast enhancement
-                lab = cv2.cvtColor(np_image, cv2.COLOR_RGB2LAB)
-                l, a, b = cv2.split(lab)
+            if self.preprocessing_options.get('contrast_enhancement', True):
+                img_cv = self._enhance_contrast(img_cv)
                 
-                # Apply CLAHE to L channel
-                clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-                cl = clahe.apply(l)
+            if self.preprocessing_options.get('remove_borders', True):
+                img_cv = self._remove_borders(img_cv)
                 
-                # Merge channels back
-                limg = cv2.merge((cl, a, b))
-                np_image = cv2.cvtColor(limg, cv2.COLOR_LAB2RGB)
-                
-            if self.preprocessing_options['remove_borders']:
-                np_image = self._remove_borders(np_image)
-                
-            return Image.fromarray(np_image)
-            
+            # Convert back to PIL image
+            img_rgb = cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB)
+            return Image.fromarray(img_rgb)
         except Exception as e:
             self.logger.warning(f"Image preprocessing failed: {str(e)}")
             return image
+            
+    def _deskew_image(self, img: np.ndarray) -> np.ndarray:
+        """Deskew an image to straighten text."""
+        try:
+            # Convert to grayscale
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            
+            # Threshold the image
+            thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1]
+            
+            # Find all contours
+            contours, _ = cv2.findContours(thresh, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+            
+            # Find largest contour
+            if contours:
+                largest_contour = max(contours, key=cv2.contourArea)
+                
+                # Find minimum area rectangle
+                rect = cv2.minAreaRect(largest_contour)
+                angle = rect[2]
+                
+                # Adjust angle
+                if angle < -45:
+                    angle = 90 + angle
+                
+                # Rotate image
+                (h, w) = img.shape[:2]
+                center = (w // 2, h // 2)
+                M = cv2.getRotationMatrix2D(center, angle, 1.0)
+                rotated = cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+                return rotated
+            
+            return img
+        except Exception as e:
+            self.logger.warning(f"Deskew failed: {str(e)}")
+            return img
+            
+    def _denoise_image(self, img: np.ndarray) -> np.ndarray:
+        """Remove noise from an image."""
+        try:
+            # Apply non-local means denoising
+            return cv2.fastNlMeansDenoisingColored(img, None, 10, 10, 7, 21)
+        except Exception as e:
+            self.logger.warning(f"Denoising failed: {str(e)}")
+            return img
+            
+    def _enhance_contrast(self, img: np.ndarray) -> np.ndarray:
+        """Enhance contrast in an image."""
+        try:
+            # Convert to LAB color space
+            lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+            
+            # Split channels
+            l, a, b = cv2.split(lab)
+            
+            # Apply CLAHE to L channel
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            cl = clahe.apply(l)
+            
+            # Merge channels
+            merged = cv2.merge((cl, a, b))
+            
+            # Convert back to BGR
+            return cv2.cvtColor(merged, cv2.COLOR_LAB2BGR)
+        except Exception as e:
+            self.logger.warning(f"Contrast enhancement failed: {str(e)}")
+            return img
+            
+    def _remove_borders(self, img: np.ndarray) -> np.ndarray:
+        """Remove borders from an image."""
+        try:
+            # Convert to grayscale
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            
+            # Threshold
+            _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+            
+            # Find contours
+            contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            # Find bounding rectangle
+            if contours:
+                # Find the largest contour
+                largest_contour = max(contours, key=cv2.contourArea)
+                
+                # Get bounding rectangle
+                x, y, w, h = cv2.boundingRect(largest_contour)
+                
+                # Crop image
+                return img[y:y+h, x:x+w]
+            
+            return img
+        except Exception as e:
+            self.logger.warning(f"Border removal failed: {str(e)}")
+            return img
 
     def extract_text_from_diagram(self, pil_image: Image.Image) -> Optional[Dict[str, Any]]:
         """
@@ -551,61 +686,6 @@ class OCR:
         except Exception as e:
             self.logger.warning(f"Language detection failed: {str(e)}")
             return None
-
-    def _deskew_image(self, np_image: np.ndarray) -> np.ndarray:
-        """Deskew image using contour detection."""
-        try:
-            gray = cv2.cvtColor(np_image, cv2.COLOR_RGB2GRAY)
-            edges = cv2.Canny(gray, 50, 150, apertureSize=3)
-            lines = cv2.HoughLinesP(edges, 1, np.pi/180, 100, minLineLength=100, maxLineGap=10)
-            
-            if lines is None:
-                return np_image
-                
-            angles = []
-            for line in lines:
-                x1, y1, x2, y2 = line[0]
-                angle = np.arctan2(y2 - y1, x2 - x1) * 180.0 / np.pi
-                angles.append(angle)
-                
-            median_angle = np.median(angles)
-            if abs(median_angle) > 0.5:  # Only correct if skew is significant
-                (h, w) = np_image.shape[:2]
-                center = (w // 2, h // 2)
-                M = cv2.getRotationMatrix2D(center, median_angle, 1.0)
-                return cv2.warpAffine(np_image, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
-                
-        except Exception as e:
-            self.logger.warning(f"Deskewing failed: {str(e)}")
-            
-        return np_image
-
-    def _remove_borders(self, np_image: np.ndarray) -> np.ndarray:
-        """Remove potential borders from the image."""
-        try:
-            gray = cv2.cvtColor(np_image, cv2.COLOR_RGB2GRAY)
-            edges = cv2.Canny(gray, 50, 150, apertureSize=3)
-            contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            
-            if not contours:
-                return np_image
-                
-            # Find the main content contour
-            main_contour = max(contours, key=cv2.contourArea)
-            x, y, w, h = cv2.boundingRect(main_contour)
-            
-            # Add small margin
-            margin = 10
-            x = max(0, x - margin)
-            y = max(0, y - margin)
-            w = min(np_image.shape[1] - x, w + 2 * margin)
-            h = min(np_image.shape[0] - y, h + 2 * margin)
-            
-            return np_image[y:y+h, x:x+w]
-            
-        except Exception as e:
-            self.logger.warning(f"Border removal failed: {str(e)}")
-            return np_image
 
     async def _get_paligemma_original_insights(self, image: Image.Image) -> Dict[str, Any]:
         """Original PaliGemma implementation."""
@@ -784,7 +864,106 @@ class OCR:
                 
         return validated
 
-
+    def process_image(self, image: Image.Image) -> str:
+        """
+        Process a single image and extract text using OCR.
+        
+        Args:
+            image: PIL Image object to process
+            
+        Returns:
+            Extracted text from the image
+        """
+        try:
+            # Preprocess the image
+            processed_image = self._preprocess_image(image)
+            
+            # Use Tesseract for OCR
+            if HAS_TESSERACT:
+                # Convert languages to Tesseract format
+                lang_str = '+'.join(self.languages)
+                
+                # Extract text using Tesseract
+                text = pytesseract.image_to_string(
+                    processed_image, 
+                    lang=lang_str,
+                    config=DEFAULT_TESSERACT_CONFIG
+                )
+                
+                # If text is empty or very short, try advanced methods if available
+                if len(text.strip()) < 10:
+                    if self.use_paligemma and HAS_PALIGEMMA:
+                        # Try PaliGemma for image understanding
+                        text = self._extract_text_with_paligemma(processed_image)
+                    elif self.use_gemini and self.gemini_model:
+                        # Try Gemini for image understanding
+                        text = self._extract_text_with_gemini(processed_image)
+                
+                return text.strip()
+            else:
+                self.logger.warning("Tesseract not available. Using alternative methods.")
+                
+                # Try alternative methods
+                if self.use_paligemma and HAS_PALIGEMMA:
+                    return self._extract_text_with_paligemma(processed_image)
+                elif self.use_gemini and self.gemini_model:
+                    return self._extract_text_with_gemini(processed_image)
+                else:
+                    self.logger.error("No OCR methods available.")
+                    return ""
+        except Exception as e:
+            self.logger.error(f"Error processing image: {str(e)}")
+            return ""
+            
+    def _extract_text_with_paligemma(self, image: Image.Image) -> str:
+        """Extract text using PaliGemma model."""
+        try:
+            if not HAS_PALIGEMMA:
+                return ""
+                
+            # Load model and processor
+            processor = AutoProcessor.from_pretrained(DEFAULT_PALIGEMMA_MODEL)
+            model = AutoModelForVision2Seq.from_pretrained(DEFAULT_PALIGEMMA_MODEL)
+            
+            # Process image
+            inputs = processor(images=image, return_tensors="pt")
+            
+            # Generate text
+            generated_ids = model.generate(
+                pixel_values=inputs["pixel_values"],
+                max_length=512,
+                num_beams=3
+            )
+            
+            # Decode text
+            generated_text = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+            return generated_text
+        except Exception as e:
+            self.logger.error(f"PaliGemma extraction failed: {str(e)}")
+            return ""
+            
+    def _extract_text_with_gemini(self, image: Image.Image) -> str:
+        """Extract text using Gemini model."""
+        try:
+            if not self.use_gemini or not self.gemini_model:
+                return ""
+                
+            # Encode image to base64
+            image_data = encode_image_to_base64(image)
+            
+            # Generate prompt
+            prompt = "Extract all text visible in this image. Include any text in tables, diagrams, or other elements."
+            
+            # Generate response
+            response = self.gemini_model.generate_content([
+                prompt,
+                {"mime_type": "image/jpeg", "data": image_data}
+            ])
+            
+            return response.text
+        except Exception as e:
+            self.logger.error(f"Gemini extraction failed: {str(e)}")
+            return ""
 
 from transformers import (
     PaliGemmaProcessor,

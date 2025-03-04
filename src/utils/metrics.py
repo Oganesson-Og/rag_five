@@ -65,6 +65,7 @@ class MetricsCollector:
         self.metrics: Dict[str, Any] = {}
         self.counters: Dict[str, int] = {}
         self.logger = logging.getLogger(__name__)
+        self.elapsed: float = 0.0  # Add elapsed property to store the most recent timing
 
     def increment(self, metric_name: str, value: int = 1) -> None:
         """Increment a counter metric.
@@ -104,12 +105,13 @@ class MetricsCollector:
         try:
             yield self
         finally:
-            elapsed_time = time.time() - start_time
-            self.add_timing(elapsed_time)
+            self.elapsed = time.time() - start_time  # Store the elapsed time
+            self.add_timing(self.elapsed)
     
     def add_timing(self, elapsed: float):
         """Add a timing measurement."""
         self.timings.append(elapsed)
+        self.elapsed = elapsed  # Update the elapsed property
         
     def get_average_time(self) -> float:
         """Get average processing time."""
@@ -120,7 +122,8 @@ class MetricsCollector:
         return {
             'timings': {
                 'values': self.timings,
-                'average': self.get_average_time()
+                'average': self.get_average_time(),
+                'last': self.elapsed  # Include the most recent timing
             },
             'metrics': self.metrics
         }
@@ -130,6 +133,7 @@ class MetricsCollector:
         self.timings = []
         self.metrics = {}
         self.counters.clear()
+        self.elapsed = 0.0  # Reset the elapsed property
 
     def get_counter(self, metric_name: str) -> int:
         """Get current value of a counter.
@@ -183,7 +187,8 @@ class MetricsCollector:
             'counters': self.counters.copy(),
             'timings': {
                 'values': self.timings,
-                'average': self.get_average_time()
+                'average': self.get_average_time(),
+                'last': self.elapsed  # Include the most recent timing
             },
             'metrics': self.metrics
         }

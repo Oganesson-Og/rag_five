@@ -29,7 +29,8 @@ from .pdf import PDFExtractor
 from .docx import DocxExtractor
 from .spreadsheet import ExcelExtractor, CSVExtractor
 from .text import TextExtractor
-from .image import ImageExtractor
+# Import ImageExtractor dynamically when needed to avoid circular imports
+# from .image import ImageExtractor
 
 __all__ = [
     'BaseExtractor',
@@ -38,7 +39,7 @@ __all__ = [
     'ExcelExtractor',
     'CSVExtractor',
     'TextExtractor',
-    'ImageExtractor',
+    # 'ImageExtractor',  # Removed to avoid circular imports
     'ExtractorResult',
     'DocumentContent'
 ] 

@@ -49,16 +49,19 @@ from datetime import datetime
 import io
 import os
 import tempfile
-from typing import Dict, Any, List, Optional, Tuple, Generator, Union
+import logging
+import base64
+import subprocess
+from typing import Dict, List, Tuple, Any, Optional, Union
 from dataclasses import dataclass
+from enum import Enum
+from PIL import Image
 from .models import Document
 from .base import BaseExtractor, ExtractorResult
-from enum import Enum
 import cv2  # For diagram / image analysis
-from ..core.vision.table_structure_recognizer import TableStructureRecognizer
 from src.utils.file_utils import get_project_base_directory
-from PIL import Image
-import subprocess
+import statistics
+import time
 
 # Check if OpenCV is available
 try:
@@ -190,13 +193,13 @@ class PDFExtractor(BaseExtractor):
         # Initialize OCR if requested
         self.ocr = self._init_ocr()
         
-        # Check for Ghostscript if Camelot is available
-        if HAS_CAMELOT:
-            if not self._check_ghostscript_installed():
-                self.logger.warning("Ghostscript is not installed, which is required for Camelot table extraction. "
-                                   "You can install it using the instructions here: "
-                                   "https://camelot-py.readthedocs.io/en/master/user/install-deps.html")
-                self.logger.warning("Table extraction will fall back to alternative methods.")
+        # # Check for Ghostscript if Camelot is available
+        # if HAS_CAMELOT:
+        #     if not self._check_ghostscript_installed():
+        #         self.logger.warning("Ghostscript is not installed, which is required for Camelot table extraction. "
+        #                            "You can install it using the instructions here: "
+        #                            "https://camelot-py.readthedocs.io/en/master/user/install-deps.html")
+        #         self.logger.warning("Table extraction will fall back to alternative methods.")
 
         # Initialize Docling extractor with acceleration and picture annotation support
         try:
@@ -229,6 +232,72 @@ class PDFExtractor(BaseExtractor):
         """Initialize sub-components for layout recognition and device settings."""
         self._init_layout_recognizer()
         self._init_device()
+        self._init_ocr()
+        self._init_gemini_image_processor()
+        self._init_docling_extractor()
+        
+    def _init_docling_extractor(self):
+        """Initialize DoclingExtractor with fallback support."""
+        try:
+            from ..extractors.docling_extractor import DoclingExtractor
+            
+            # Get configuration
+            pdf_config = self.config
+            picture_config = pdf_config.get('picture_annotation', {})
+            
+            # Get primary API configuration
+            primary_api_config = picture_config.get('api_config', {})
+            if not primary_api_config and 'api_key' in picture_config:
+                # Create API config from individual settings
+                primary_api_config = {
+                    'url': picture_config.get('url', 'https://generativelanguage.googleapis.com/v1/models/gemini-2.0-pro-exp-02-05:generateContent'),
+                    'api_key': picture_config.get('api_key'),
+                    'params': {
+                        'model': picture_config.get('model_name', 'gemini-2.0-pro-exp-02-05'),
+                        'temperature': picture_config.get('temperature', 0.7),
+                        'max_output_tokens': picture_config.get('max_tokens', 1024),
+                        'top_p': picture_config.get('top_p', 0.9)
+                    },
+                    'headers': {'Content-Type': 'application/json'},
+                    'timeout': picture_config.get('timeout', 90)
+                }
+            
+            # Get secondary API configuration
+            secondary_api_config = None
+            if 'second_api_key' in picture_config:
+                secondary_api_config = {
+                    'url': picture_config.get('url', 'https://generativelanguage.googleapis.com/v1/models/gemini-2.0-flash:generateContent'),
+                    'api_key': picture_config.get('second_api_key'),
+                    'params': {
+                        'model': picture_config.get('second_model_name', 'gemini-2.0-flash'),
+                        'temperature': picture_config.get('temperature', 0.7),
+                        'max_output_tokens': picture_config.get('max_tokens', 1024),
+                        'top_p': picture_config.get('top_p', 0.9)
+                    },
+                    'headers': {'Content-Type': 'application/json'},
+                    'timeout': picture_config.get('timeout', 90)
+                }
+            
+            # Initialize DoclingExtractor with both primary and secondary configurations
+            self.docling_extractor = DoclingExtractor(
+                model_type='remote',
+                model_name=picture_config.get('model_name', 'gemini-2.0-pro-exp-02-05'),
+                image_scale=picture_config.get('image_scale', 2.0),
+                picture_prompt=picture_config.get('prompt', 'Describe the image in three sentences. Be concise and accurate.'),
+                api_config=primary_api_config,
+                secondary_api_config=secondary_api_config,
+                num_threads=pdf_config.get('acceleration', {}).get('num_threads', 8),
+                enable_remote_services=True
+            )
+            
+            self.logger.info("DoclingExtractor initialized with fallback support")
+            
+        except ImportError:
+            self.logger.warning("DoclingExtractor not available")
+            self.docling_extractor = None
+        except Exception as e:
+            self.logger.warning(f"Failed to initialize DoclingExtractor: {str(e)}")
+            self.docling_extractor = None
 
     def _init_layout_recognizer(self):
         """Initialize layout recognition capabilities."""
@@ -320,6 +389,85 @@ class PDFExtractor(BaseExtractor):
         except Exception as e:
             self.logger.warning(f"Failed to initialize OCR: {str(e)}")
             return None
+
+    def _init_gemini_image_processor(self):
+        """Initialize Gemini image processor for image description and classification."""
+        try:
+            import google.generativeai as genai
+            
+            # Get configuration
+            pdf_config = self.config
+            picture_config = pdf_config.get('picture_annotation', {})
+            
+            self.logger.info(f"Picture annotation config: {picture_config}")
+            
+            # Check if Gemini is enabled for image processing
+            if picture_config.get('enabled', True) and picture_config.get('model_type') == 'gemini':
+                self.logger.info("Gemini image processing is enabled in configuration")
+                
+                # Get primary API key
+                model_config = self.config.get('model', {})
+                primary_api_key = (
+                    picture_config.get('api_key') or
+                    model_config.get('gemini_api_key') or 
+                    model_config.get('api_key')
+                )
+                
+                # Get secondary API key
+                secondary_api_key = (
+                    picture_config.get('second_api_key') or
+                    pdf_config.get('layout', {}).get('second_api_key') or
+                    model_config.get('second_api_key')
+                )
+                
+                self.logger.info(f"Primary API key found: {bool(primary_api_key)}")
+                self.logger.info(f"Secondary API key found: {bool(secondary_api_key)}")
+                
+                # Store both API keys for potential fallback
+                self.primary_api_key = primary_api_key
+                self.secondary_api_key = secondary_api_key
+                
+                if not primary_api_key and not secondary_api_key:
+                    self.logger.warning("No API keys found for Gemini image processing")
+                    self.gemini_image_processor = None
+                    return
+                
+                # Get model names
+                self.primary_model_name = picture_config.get('model_name', 'gemini-2.0-pro-exp-02-05')
+                self.secondary_model_name = picture_config.get('second_model_name', 'gemini-2.0-flash')
+                
+                # Initialize with primary API key and model
+                self.current_api_key = primary_api_key or secondary_api_key
+                self.current_model_name = self.primary_model_name
+                
+                # Configure Gemini with current API key
+                genai.configure(api_key=self.current_api_key)
+                
+                # Initialize Gemini model
+                self.gemini_image_processor = genai.GenerativeModel(self.current_model_name)
+                
+                # Set generation config
+                self.gemini_generation_config = {
+                    'temperature': picture_config.get('temperature', 0.7),
+                    'top_p': picture_config.get('top_p', 0.9),
+                    'max_output_tokens': picture_config.get('max_tokens', 1024),
+                }
+                
+                # Track rate limit status
+                self.rate_limited = False
+                self.last_rate_limit_time = 0
+                self.rate_limit_cooldown = picture_config.get('rate_limit_cooldown', 60)  # seconds
+                
+                self.logger.info(f"Gemini image processor initialized with model: {self.current_model_name}")
+            else:
+                self.logger.info(f"Gemini image processing not enabled in configuration. Enabled: {picture_config.get('enabled', True)}, Model type: {picture_config.get('model_type')}")
+                self.gemini_image_processor = None
+        except ImportError:
+            self.logger.warning("Google Generative AI package not available, Gemini image processing disabled")
+            self.gemini_image_processor = None
+        except Exception as e:
+            self.logger.warning(f"Failed to initialize Gemini image processor: {str(e)}")
+            self.gemini_image_processor = None
 
     def _get_device_from_config(self) -> str:
         """
@@ -484,16 +632,62 @@ class PDFExtractor(BaseExtractor):
         block: Dict[str, Any],
         base_font_size: float
     ) -> Optional[LayoutElement]:
-        """Extract textual info from a text block and classify its type."""
+        """
+        Process a text block from PyMuPDF.
+        
+        Args:
+            block: Text block dictionary from PyMuPDF
+            base_font_size: Base font size for determining element type
+            
+        Returns:
+            LayoutElement or None if processing fails
+        """
         try:
-            text = ' '.join(span['text'] for span in block['spans'])
-            font_info = block['spans'][0]  # Use first span's style as reference.
+            # Check if 'spans' key exists directly in the block
+            if 'spans' in block:
+                spans = block['spans']
+            # Check if 'lines' exists and contains 'spans'
+            elif 'lines' in block and block['lines'] and 'spans' in block['lines'][0]:
+                # Use the spans from the first line
+                spans = block['lines'][0]['spans']
+            else:
+                self.logger.warning(f"Text block missing 'spans' key: {block}")
+                return None
+                
+            # Get the first span for font information
+            if not spans:
+                return None
+                
+            # Extract text from all spans
+            text = ""
+            for s in spans:
+                text += s.get('text', '')
+            
+            # Get font information
+            font_info = spans[0]
             font_size = font_info.get('size', 0)
-            is_bold = 'bold' in font_info.get('font', '').lower()
-
+            
+            # Check if font is bold
+            font_name = font_info.get('font', '')
+            is_bold = False
+            
+            # Check if font_name is a string before using lower()
+            if isinstance(font_name, str):
+                is_bold = 'bold' in font_name.lower() or '-b' in font_name.lower()
+            
+            # Check if flags is iterable before checking if 'bold' is in it
+            flags = font_info.get('flags', 0)
+            if isinstance(flags, int):
+                # For integer flags, we can't use 'in' operator
+                # This might be a bitmask or other numeric representation
+                pass  # Handle according to your specific flag encoding
+            elif hasattr(flags, '__iter__'):  # Check if it's iterable
+                is_bold = is_bold or 'bold' in flags
+            
             # Determine element type (heading, title, normal text...)
             element_type = self._determine_element_type(font_size, base_font_size, is_bold)
-
+            
+            # Create layout element
             return LayoutElement(
                 type=element_type,
                 text=text,
@@ -519,14 +713,30 @@ class PDFExtractor(BaseExtractor):
             return 'text'
 
     def _get_base_font_size(self, page_dict: Dict[str, Any]) -> float:
-        """Heuristic: median of the encountered font sizes on the page."""
+        """
+        Calculate the median font size on a page to establish a baseline for
+        determining element types.
+        """
         font_sizes = []
         for block in page_dict.get('blocks', []):
             if block.get('type') == 0:  # text block
-                for span in block.get('spans', []):
-                    if size := span.get('size'):
-                        font_sizes.append(size)
-        return float(np.median(font_sizes)) if font_sizes else 12.0
+                # Check if 'spans' key exists directly in the block
+                if 'spans' in block and block['spans']:
+                    for span in block['spans']:
+                        if 'size' in span:
+                            font_sizes.append(span['size'])
+                # Check if 'lines' exists and contains 'spans'
+                elif 'lines' in block and block['lines']:
+                    for line in block['lines']:
+                        if 'spans' in line and line['spans']:
+                            for span in line['spans']:
+                                if 'size' in span:
+                                    font_sizes.append(span['size'])
+        
+        if not font_sizes:
+            return 11.0  # Default font size if none found
+        
+        return statistics.median(font_sizes)
 
     def _merge_related_elements(self, elements: List[LayoutElement]) -> List[LayoutElement]:
         """Heuristic to combine adjacent text blocks of the same type, etc."""
@@ -598,119 +808,640 @@ class PDFExtractor(BaseExtractor):
         return "\n\n".join(combined_text)
 
     def _extract_tables_with_structure(self, doc: fitz.Document) -> List[Dict[str, Any]]:
-        """Extract tables using the unified extraction strategy."""
-        tables = []
-        
-        # Create a temporary file for the PDF
-        temp_path = None
-        try:
-            with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as temp_file:
-                temp_path = temp_file.name
-                doc.save(temp_path)
-                
-                # Use the unified extraction method
-                tables = self.extract_tables(doc, temp_path)
-                
-        except Exception as e:
-            self.logger.error(f"Table extraction error: {str(e)}")
-            # Return empty list on failure
-            tables = []
-            
-        finally:
-            # Clean up temporary file
-            if temp_path and os.path.exists(temp_path):
-                try:
-                    os.unlink(temp_path)
-                except Exception as e:
-                    self.logger.warning(f"Failed to delete temporary PDF: {str(e)}")
-                    
-        return tables
-
-    def _regions_overlap(self, region1, region2):
-        """Check if two regions (bounding boxes) overlap."""
-        if not region1 or not region2:
-            return False
-            
-        x01, y01, x11, y11 = region1
-        x02, y02, x12, y12 = region2
-        
-        # Check if one rectangle is to the left of the other
-        if x11 < x02 or x12 < x01:
-            return False
-            
-        # Check if one rectangle is above the other
-        if y11 < y02 or y12 < y01:
-            return False
-            
-        return True
-
-    def _check_ghostscript_installed(self) -> bool:
         """
-        Check if Ghostscript is installed on the system.
+        Extract tables from the document using the PDF path.
         
-        Ghostscript is required for Camelot to extract tables from PDFs.
-        This method checks for Ghostscript in the same way that Camelot does.
+        Args:
+            doc: PyMuPDF document object
+            
+        Returns:
+            List of extracted tables with metadata
+        """
+        # Get the temporary file path
+        with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as temp_file:
+            pdf_path = temp_file.name
+            doc.save(pdf_path)
+        
+        try:
+            # Extract tables using the unified approach
+            return self.extract_tables(doc, pdf_path)
+        finally:
+            # Clean up the temporary file
+            if os.path.exists(pdf_path):
+                os.unlink(pdf_path)
+                
+    def _extract_images_with_context(self, doc: fitz.Document) -> List[Dict[str, Any]]:
+        """
+        Extract images from the document with contextual information.
+        
+        Args:
+            doc: PyMuPDF document object
+            
+        Returns:
+            List of extracted images with metadata and context
+        """
+        images = []
+        
+        try:
+            for page_num, page in enumerate(doc):
+                # Extract images from the page
+                image_list = page.get_images(full=True)
+                
+                for img_index, img_info in enumerate(image_list):
+                    try:
+                        xref = img_info[0]
+                        base_image = doc.extract_image(xref)
+                        
+                        if base_image:
+                            # Get image data
+                            image_bytes = base_image["image"]
+                            image_ext = base_image["ext"]
+                            
+                            # Get image position on page
+                            for img_rect in page.get_image_rects(xref):
+                                # Create image metadata
+                                image_data = {
+                                    'page': page_num + 1,
+                                    'index': img_index,
+                                    'bbox': [img_rect.x0, img_rect.y0, img_rect.x1, img_rect.y1],
+                                    'width': img_rect.width,
+                                    'height': img_rect.height,
+                                    'format': image_ext,
+                                    'size_bytes': len(image_bytes),
+                                    'context': self._get_image_context(page, img_rect),
+                                }
+                                
+                                # Process with Gemini if available
+                                if hasattr(self, 'gemini_image_processor') and self.gemini_image_processor:
+                                    try:
+                                        description, diagram_type = self._process_image_with_gemini(image_bytes)
+                                        image_data['description'] = description
+                                        image_data['metadata'] = {
+                                            'is_diagram': diagram_type != DiagramType.UNKNOWN.value,
+                                            'diagram_type': diagram_type
+                                        }
+                                    except Exception as e:
+                                        self.logger.warning(f"Gemini image processing failed: {str(e)}")
+                                        # Fall back to basic classification
+                                        image_data['metadata'] = {
+                                            'is_diagram': self._is_likely_diagram(image_bytes, image_ext),
+                                            'diagram_type': self._classify_diagram_type(image_bytes, image_ext) if self._is_likely_diagram(image_bytes, image_ext) else DiagramType.UNKNOWN.value
+                                        }
+                                else:
+                                    # Use basic classification
+                                    image_data['metadata'] = {
+                                        'is_diagram': self._is_likely_diagram(image_bytes, image_ext),
+                                        'diagram_type': self._classify_diagram_type(image_bytes, image_ext) if self._is_likely_diagram(image_bytes, image_ext) else DiagramType.UNKNOWN.value
+                                    }
+                                
+                                # Add base64 encoded image
+                                image_data['data'] = base64.b64encode(image_bytes).decode('utf-8')
+                                
+                                images.append(image_data)
+                    except Exception as e:
+                        self.logger.warning(f"Failed to extract image {img_index} on page {page_num+1}: {str(e)}")
+                        continue
+        except Exception as e:
+            self.logger.warning(f"Image extraction process failed: {str(e)}")
+            
+        return images
+    
+    def _get_image_context(self, page: fitz.Page, rect: fitz.Rect, context_range: int = 200) -> str:
+        """
+        Get the text context around an image.
+        
+        Args:
+            page: PyMuPDF page object
+            rect: Rectangle defining the image position
+            context_range: Range in points to consider for context
+            
+        Returns:
+            Text context around the image
+        """
+        # Expand the rectangle to include surrounding text
+        context_rect = fitz.Rect(
+            max(0, rect.x0 - context_range),
+            max(0, rect.y0 - context_range),
+            min(page.rect.width, rect.x1 + context_range),
+            min(page.rect.height, rect.y1 + context_range)
+        )
+        
+        # Get text in the expanded rectangle
+        return page.get_text("text", clip=context_rect).strip()
+    
+    def _is_likely_diagram(self, image_bytes: bytes, image_ext: str) -> bool:
+        """
+        Determine if an image is likely to be a diagram based on simple heuristics.
+        
+        Args:
+            image_bytes: Raw image data
+            image_ext: Image format extension
+            
+        Returns:
+            True if the image is likely a diagram, False otherwise
+        """
+        try:
+            # Convert image bytes to numpy array
+            image = Image.open(io.BytesIO(image_bytes))
+            img_array = np.array(image.convert('RGB'))
+            
+            # Simple heuristics for diagrams:
+            # 1. High percentage of white/light background
+            # 2. Limited color palette
+            # 3. Presence of straight lines/geometric shapes
+            
+            # Check for white/light background
+            is_light_background = np.mean(img_array) > 200
+            
+            # Check for limited color palette
+            colors = np.unique(img_array.reshape(-1, 3), axis=0)
+            limited_palette = len(colors) < 50
+            
+            return is_light_background and limited_palette
+        except Exception as e:
+            self.logger.warning(f"Diagram detection failed: {str(e)}")
+            return False
+    
+    def _classify_diagram_type(self, image_bytes: bytes, image_ext: str) -> str:
+        """
+        Classify the type of diagram if possible.
+        
+        Args:
+            image_bytes: Raw image data
+            image_ext: Image format extension
+            
+        Returns:
+            Diagram type as string
+        """
+        # If Gemini is available, use it for classification
+        if hasattr(self, 'gemini_image_processor') and self.gemini_image_processor:
+            try:
+                description, diagram_type = self._process_image_with_gemini(image_bytes)
+                if diagram_type:
+                    return diagram_type
+            except Exception as e:
+                self.logger.warning(f"Gemini diagram classification failed: {str(e)}")
+        
+        # This would ideally use a ML model for classification
+        # For now, return a default type
+        return DiagramType.UNKNOWN.value
+    
+    def _process_image_with_gemini(self, image_bytes: bytes) -> Tuple[str, str]:
+        """
+        Process an image using Gemini to get a description and classify the image type.
+        
+        Args:
+            image_bytes: Raw image data
+            
+        Returns:
+            Tuple of (description, diagram_type)
+        """
+        if not hasattr(self, 'gemini_image_processor') or self.gemini_image_processor is None:
+            self.logger.warning("Gemini image processor not initialized")
+            return "", DiagramType.UNKNOWN.value
+            
+        try:
+            import google.generativeai as genai
+            from PIL import Image
+            import time
+            
+            # Check if we should try switching back to primary API key after cooldown
+            current_time = time.time()
+            if (self.rate_limited and 
+                hasattr(self, 'last_rate_limit_time') and 
+                current_time - self.last_rate_limit_time > self.rate_limit_cooldown):
+                self.logger.info("Cooldown period elapsed, attempting to switch back to primary API key")
+                self._switch_to_primary_api()
+            
+            # Convert bytes to PIL Image
+            image = Image.open(io.BytesIO(image_bytes))
+            
+            # Prepare the prompt for image description
+            description_prompt = """
+            Describe this image in detail. If it's a diagram, chart, or technical illustration, 
+            explain what it represents and its key components. Be concise but thorough.
+            """
+            
+            # Prepare the prompt for image classification
+            classification_prompt = """
+            Classify this image into one of the following categories:
+            - chart
+            - graph
+            - scientific_diagram
+            - flowchart
+            - concept_map
+            - geometric_figure
+            - circuit_diagram
+            - chemical_structure
+            - mathematical_plot
+            - anatomical_diagram
+            - architectural_drawing
+            - historical_map
+            - unknown
+            
+            Return only the category name, nothing else.
+            """
+            
+            # Get description
+            try:
+                description_response = self.gemini_image_processor.generate_content(
+                    [description_prompt, image],
+                    generation_config=self.gemini_generation_config if hasattr(self, 'gemini_generation_config') else None
+                )
+                description = description_response.text.strip()
+            except Exception as e:
+                if "429" in str(e) or "Resource has been exhausted" in str(e):
+                    self.logger.warning(f"Rate limit hit for description generation: {str(e)}")
+                    # Try fallback
+                    if self._switch_to_fallback_api():
+                        # Retry with new API key
+                        try:
+                            description_response = self.gemini_image_processor.generate_content(
+                                [description_prompt, image],
+                                generation_config=self.gemini_generation_config
+                            )
+                            description = description_response.text.strip()
+                        except Exception as retry_e:
+                            self.logger.error(f"Fallback also failed for description: {str(retry_e)}")
+                            description = ""
+                    else:
+                        description = ""
+                else:
+                    self.logger.warning(f"Error generating description: {str(e)}")
+                    description = ""
+            
+            # Get classification
+            try:
+                classification_response = self.gemini_image_processor.generate_content(
+                    [classification_prompt, image],
+                    generation_config=self.gemini_generation_config if hasattr(self, 'gemini_generation_config') else None
+                )
+                classification = classification_response.text.strip().lower()
+            except Exception as e:
+                if "429" in str(e) or "Resource has been exhausted" in str(e):
+                    self.logger.warning(f"Rate limit hit for classification: {str(e)}")
+                    # Try fallback
+                    if self._switch_to_fallback_api():
+                        # Retry with new API key
+                        try:
+                            classification_response = self.gemini_image_processor.generate_content(
+                                [classification_prompt, image],
+                                generation_config=self.gemini_generation_config
+                            )
+                            classification = classification_response.text.strip().lower()
+                        except Exception as retry_e:
+                            self.logger.error(f"Fallback also failed for classification: {str(retry_e)}")
+                            classification = DiagramType.UNKNOWN.value
+                    else:
+                        classification = DiagramType.UNKNOWN.value
+                else:
+                    self.logger.warning(f"Error generating classification: {str(e)}")
+                    classification = DiagramType.UNKNOWN.value
+            
+            # Validate classification against DiagramType enum
+            valid_types = [t.value for t in DiagramType]
+            if classification not in valid_types:
+                classification = DiagramType.UNKNOWN.value
+                
+            return description, classification
+            
+        except Exception as e:
+            self.logger.warning(f"Image processing with Gemini failed: {str(e)}")
+            return "", DiagramType.UNKNOWN.value
+    
+    def _switch_to_fallback_api(self) -> bool:
+        """
+        Switch to the fallback API key and model when rate limited.
         
         Returns:
-            True if Ghostscript is installed, False otherwise
+            bool: True if successfully switched to fallback, False otherwise
+        """
+        import google.generativeai as genai
+        import time
+        
+        # If we're already using the secondary API key, no fallback available
+        if self.current_api_key == self.secondary_api_key:
+            self.logger.warning("Already using secondary API key, no further fallback available")
+            return False
+            
+        # Check if we have a secondary API key
+        if not hasattr(self, 'secondary_api_key') or not self.secondary_api_key:
+            self.logger.warning("No secondary API key available for fallback")
+            return False
+            
+        try:
+            self.logger.info("Switching to secondary API key and model due to rate limiting")
+            self.current_api_key = self.secondary_api_key
+            self.current_model_name = self.secondary_model_name
+            
+            # Configure Gemini with secondary API key
+            genai.configure(api_key=self.current_api_key)
+            
+            # Initialize new Gemini model with secondary model
+            self.gemini_image_processor = genai.GenerativeModel(self.current_model_name)
+            
+            # Update rate limit tracking
+            self.rate_limited = True
+            self.last_rate_limit_time = time.time()
+            
+            self.logger.info(f"Successfully switched to secondary model: {self.current_model_name}")
+            return True
+        except Exception as e:
+            self.logger.error(f"Failed to switch to secondary API key: {str(e)}")
+            return False
+    
+    def _switch_to_primary_api(self) -> bool:
+        """
+        Switch back to the primary API key and model after cooldown.
+        
+        Returns:
+            bool: True if successfully switched back to primary, False otherwise
+        """
+        import google.generativeai as genai
+        
+        # If we're already using the primary API key, nothing to do
+        if self.current_api_key == self.primary_api_key:
+            return True
+            
+        # Check if we have a primary API key
+        if not hasattr(self, 'primary_api_key') or not self.primary_api_key:
+            self.logger.warning("No primary API key available to switch back to")
+            return False
+            
+        try:
+            self.logger.info("Switching back to primary API key and model after cooldown")
+            self.current_api_key = self.primary_api_key
+            self.current_model_name = self.primary_model_name
+            
+            # Configure Gemini with primary API key
+            genai.configure(api_key=self.current_api_key)
+            
+            # Initialize new Gemini model with primary model
+            self.gemini_image_processor = genai.GenerativeModel(self.current_model_name)
+            
+            # Reset rate limit tracking
+            self.rate_limited = False
+            
+            self.logger.info(f"Successfully switched back to primary model: {self.current_model_name}")
+            return True
+        except Exception as e:
+            self.logger.error(f"Failed to switch back to primary API key: {str(e)}")
+            return False
+
+    def _extract_pdf_metadata(self, doc: fitz.Document) -> Dict[str, Any]:
+        """
+        Extract metadata from the PDF document.
+        
+        Args:
+            doc: PyMuPDF document object
+            
+        Returns:
+            Dictionary of metadata
+        """
+        metadata = {}
+        
+        try:
+            # Extract basic metadata
+            meta = doc.metadata
+            if meta:
+                for key, value in meta.items():
+                    if value:
+                        metadata[key.lower()] = value
+            
+            # Add document structure information
+            metadata['page_count'] = len(doc)
+            metadata['has_toc'] = len(doc.get_toc()) > 0
+            
+            # Extract document structure
+            structure = self._process_document_structure(doc)
+            if structure:
+                metadata['structure'] = structure
+                
+            # Add language detection
+            text_sample = ""
+            for i in range(min(3, len(doc))):
+                text_sample += doc[i].get_text("text")
+                if len(text_sample) > 1000:
+                    break
+                    
+            if text_sample:
+                try:
+                    from langdetect import detect
+                    metadata['language'] = detect(text_sample)
+                except Exception:
+                    metadata['language'] = "unknown"
+                    
+        except Exception as e:
+            self.logger.warning(f"Metadata extraction failed: {str(e)}")
+            
+        return metadata
+    
+    def _add_cross_references(self, document: 'Document') -> None:
+        """
+        Add cross-references between different elements in the document.
+        
+        Args:
+            document: Document object to update
         """
         try:
-            # First try the Camelot way of checking for Ghostscript
-            from ctypes.util import find_library
-            import sys
+            # Initialize cross-references
+            document.doc_info['cross_references'] = []
             
-            self.logger.debug("Checking for Ghostscript using ctypes.util.find_library")
+            # Get tables and images
+            tables = document.doc_info.get('tables', [])
+            images = document.doc_info.get('images', [])
             
-            # Check based on platform (same as Camelot does)
-            if sys.platform in ["linux", "darwin"]:
-                # For Linux and macOS
-                library = find_library("gs")
-                result = library is not None
-                self.logger.debug(f"Ghostscript library check result: {result}, library path: {library}")
-                if result:
-                    return True
-            elif sys.platform == "win32":
-                # For Windows
-                import ctypes
-                library = find_library(
-                    "".join(("gsdll", str(ctypes.sizeof(ctypes.c_voidp) * 8), ".dll"))
-                )
-                result = library is not None
-                self.logger.debug(f"Ghostscript library check result: {result}, library path: {library}")
-                if result:
-                    return True
+            # Find references to tables in text
+            text = document.content
             
-            # If the library check failed, fall back to checking for the executable
-            self.logger.debug("Library check failed, falling back to executable check")
+            # Simple pattern matching for table references
+            table_patterns = [
+                r'table\s+(\d+)',
+                r'tab\.\s*(\d+)',
+                r'tab\s+(\d+)'
+            ]
             
-            # Try to find the Ghostscript executable
-            gs_command = "gs"
+            for pattern in table_patterns:
+                for match in re.finditer(pattern, text, re.IGNORECASE):
+                    table_num = int(match.group(1))
+                    # Find corresponding table
+                    for table in tables:
+                        if table.get('table_number') == table_num:
+                            document.doc_info['cross_references'].append({
+                                'type': 'table_reference',
+                                'reference_id': table.get('id', ''),
+                                'text_position': match.start(),
+                                'text_context': text[max(0, match.start()-50):min(len(text), match.end()+50)]
+                            })
+                            
+            # Similar for figures/images
+            figure_patterns = [
+                r'figure\s+(\d+)',
+                r'fig\.\s*(\d+)',
+                r'fig\s+(\d+)'
+            ]
             
-            # Check if we're on Windows
-            if sys.platform == "win32":
-                gs_command = "gswin64c"  # 64-bit Ghostscript on Windows
+            for pattern in figure_patterns:
+                for match in re.finditer(pattern, text, re.IGNORECASE):
+                    figure_num = int(match.group(1))
+                    # Find corresponding image
+                    for image in images:
+                        if image.get('figure_number') == figure_num:
+                            document.doc_info['cross_references'].append({
+                                'type': 'figure_reference',
+                                'reference_id': image.get('id', ''),
+                                'text_position': match.start(),
+                                'text_context': text[max(0, match.start()-50):min(len(text), match.end()+50)]
+                            })
+                            
+        except Exception as e:
+            self.logger.warning(f"Cross-reference extraction failed: {str(e)}")
+    
+    def _check_if_scanned(self, doc: fitz.Document) -> bool:
+        """
+        Check if the PDF appears to be a scanned document.
+        
+        Args:
+            doc: PyMuPDF document object
             
-            self.logger.debug(f"Checking for Ghostscript using command: {gs_command}")
+        Returns:
+            True if the document appears to be scanned, False otherwise
+        """
+        # Sample a few pages
+        pages_to_check = min(3, len(doc))
+        text_density = []
+        image_coverage = []
+        
+        for i in range(pages_to_check):
+            page = doc[i]
+            
+            # Check text density
+            text = page.get_text("text")
+            text_length = len(text)
+            page_area = page.rect.width * page.rect.height
+            text_density.append(text_length / page_area)
+            
+            # Check image coverage
+            images = page.get_images(full=True)
+            total_image_area = 0
+            
+            for img in images:
+                for rect in page.get_image_rects(img[0]):
+                    total_image_area += rect.width * rect.height
+                    
+            image_coverage.append(total_image_area / page_area)
+        
+        # Heuristics for scanned document:
+        # 1. Low text density
+        # 2. High image coverage
+        avg_text_density = sum(text_density) / len(text_density) if text_density else 0
+        avg_image_coverage = sum(image_coverage) / len(image_coverage) if image_coverage else 0
+        
+        return avg_text_density < 0.01 and avg_image_coverage > 0.5
+
+    def extract_tables(self, doc: fitz.Document, pdf_path: str) -> List[Dict[str, Any]]:
+        """
+        Unified table extraction strategy that combines the strengths of multiple libraries.
+        
+        This method implements a comprehensive approach to table extraction:
+        1. First attempts extraction with Camelot (both lattice and stream modes)
+        2. Then tries Tabula for tables Camelot might have missed
+        3. Finally uses pdfplumber as a fallback
+        4. Merges and deduplicates results based on spatial overlap
+        5. Ranks and selects the best extraction for each detected table region
+        6. Applies advanced structure analysis to refine the table structure
+        7. Detects and handles cross-page tables
+        
+        Args:
+            doc: PyMuPDF document object
+            pdf_path: Path to the PDF file
+            
+        Returns:
+            List of extracted tables with metadata and quality metrics
+        """
+        all_tables = []
+        
+        # Check if any table extraction libraries are available
+        if not any([HAS_CAMELOT, HAS_TABULA, HAS_PDFPLUMBER]):
+            self.logger.warning("No table extraction libraries available. "
+                               "Please install at least one of: camelot-py, tabula-py, or pdfplumber.")
+            return []
+        
+        # Initialize TableStructureRecognizer if available
+        table_structure_recognizer = None
+        try:
+            # Pass the config path to TableStructureRecognizer
+            config_path = os.path.join(get_project_base_directory(), "config/rag_config.yaml")
+            
+            # Check if config file exists before initializing
+            if os.path.exists(config_path):
+                try:
+                    # Import inside the method to avoid circular imports
+                    import importlib
+                    table_structure_recognizer_module = importlib.import_module("..core.vision.table_structure_recognizer", package=__package__)
+                    TableStructureRecognizer = getattr(table_structure_recognizer_module, "TableStructureRecognizer")
+                    table_structure_recognizer = TableStructureRecognizer(config_path)
+                    self.logger.info("TableStructureRecognizer initialized successfully")
+                except Exception as e:
+                    self.logger.warning(f"Failed to initialize TableStructureRecognizer: {str(e)}")
+            else:
+                self.logger.warning(f"Config file not found at {config_path}, skipping TableStructureRecognizer initialization")
+        except Exception as e:
+            self.logger.warning(f"Failed to initialize TableStructureRecognizer: {str(e)}")
+            
+        # Get total number of pages
+        total_pages = len(doc)
+            
+        # Process each page
+        for page_num, page in enumerate(doc):
+            page_number = page_num + 1  # Convert to 0-based to 1-based page numbering
+            
+            # Safety check to ensure we don't process pages beyond the document
+            if page_number > total_pages:
+                self.logger.warning(f"Skipping page {page_number} as it exceeds the document's total pages ({total_pages})")
+                continue
                 
-            # Try to run Ghostscript with version flag
-            result = subprocess.run(
-                [gs_command, "--version"], 
-                stdout=subprocess.PIPE, 
-                stderr=subprocess.PIPE,
-                timeout=5
-            )
+            try:
+                # Step 1: Analyze page to determine table characteristics
+                has_borders = self._detect_table_borders(page)
+                
+                # Step 2: Extract tables using the unified strategy
+                page_tables = self._extract_tables_unified(pdf_path, page_number, page, has_borders)
+                
+                # Step 3: Apply advanced structure analysis to refine the tables
+                if table_structure_recognizer and page_tables:
+                    try:
+                        for i, table in enumerate(page_tables):
+                            page_tables[i] = self._refine_table_structure(table)
+                    except Exception as e:
+                        self.logger.warning(f"Table structure refinement failed on page {page_number}: {str(e)}")
+                
+                # Step 4: Add page information to each table
+                for table in page_tables:
+                    table['page'] = page_number
+                    
+                    # Add table context if region is available
+                    if 'region' in table:
+                        try:
+                            table['context'] = self._get_table_context(page, table['region'])
+                        except Exception as e:
+                            self.logger.warning(f"Failed to get table context on page {page_number}: {str(e)}")
+                
+                all_tables.extend(page_tables)
+                
+            except Exception as e:
+                self.logger.error(f"Table extraction failed for page {page_number}: {str(e)}")
+                # Continue with next page instead of failing completely
+                continue
+        
+        # Step 5: Detect and handle cross-page tables
+        if len(all_tables) > 1:
+            try:
+                all_tables = self._handle_cross_page_tables(all_tables)
+            except Exception as e:
+                self.logger.warning(f"Cross-page table handling failed: {str(e)}")
             
-            # Log the result for debugging
-            self.logger.debug(f"Ghostscript check result: returncode={result.returncode}, stdout={result.stdout.decode().strip()}, stderr={result.stderr.decode().strip()}")
-            
-            # If the command succeeded, Ghostscript is installed
-            return result.returncode == 0
-            
-        except (subprocess.SubprocessError, FileNotFoundError, ImportError) as e:
-            # Log the specific error
-            self.logger.debug(f"Ghostscript check failed with error: {str(e)}")
-            # If the command failed or the executable wasn't found
-            return False
+        return all_tables
 
     def _detect_table_borders(self, page: fitz.Page) -> bool:
         """
@@ -790,7 +1521,7 @@ class PDFExtractor(BaseExtractor):
         
         Args:
             pdf_path: Path to the PDF file
-            page_number: Page number (0-indexed)
+            page_number: Page number (1-indexed)
             page: PyMuPDF page object
             has_borders: Whether the page has visible table borders
             
@@ -809,30 +1540,30 @@ class PDFExtractor(BaseExtractor):
         else:
             method = extraction_method
             
-        self.logger.info(f"Using {method} for table extraction on page {page_number+1}")
+        self.logger.info(f"Using {method} for table extraction on page {page_number}")
         
         # Try the primary extraction method
         if method == 'camelot':
             try:
                 if has_borders:
-                    tables = self._extract_with_camelot(pdf_path, page_number+1, flavor='lattice')
+                    tables = self._extract_with_camelot(pdf_path, page_number, flavor='lattice')
                 else:
-                    tables = self._extract_with_camelot(pdf_path, page_number+1, flavor='stream')
+                    tables = self._extract_with_camelot(pdf_path, page_number, flavor='stream')
             except Exception as e:
                 self.logger.warning(f"Table extraction with {method} failed: {str(e)}")
                 
         elif method == 'tabula':
             try:
                 if has_borders:
-                    tables = self._extract_with_tabula(pdf_path, page_number+1, lattice=True)
+                    tables = self._extract_with_tabula(pdf_path, page_number, lattice=True)
                 else:
-                    tables = self._extract_with_tabula(pdf_path, page_number+1, lattice=False, guess=True)
+                    tables = self._extract_with_tabula(pdf_path, page_number, lattice=False, guess=True)
             except Exception as e:
                 self.logger.warning(f"Table extraction with {method} failed: {str(e)}")
                 
         elif method == 'pdfplumber':
             try:
-                tables = self._extract_with_pdfplumber(pdf_path, page_number+1)
+                tables = self._extract_with_pdfplumber(pdf_path, page_number)
             except Exception as e:
                 self.logger.warning(f"Table extraction with {method} failed: {str(e)}")
         
@@ -844,9 +1575,9 @@ class PDFExtractor(BaseExtractor):
             if method != 'camelot':
                 try:
                     if has_borders:
-                        tables = self._extract_with_camelot(pdf_path, page_number+1, flavor='lattice')
+                        tables = self._extract_with_camelot(pdf_path, page_number, flavor='lattice')
                     else:
-                        tables = self._extract_with_camelot(pdf_path, page_number+1, flavor='stream')
+                        tables = self._extract_with_camelot(pdf_path, page_number, flavor='stream')
                 except Exception as e:
                     self.logger.warning(f"Fallback to camelot failed: {str(e)}")
             
@@ -854,110 +1585,31 @@ class PDFExtractor(BaseExtractor):
             if not tables and method != 'tabula':
                 try:
                     if has_borders:
-                        tables = self._extract_with_tabula(pdf_path, page_number+1, lattice=True)
+                        tables = self._extract_with_tabula(pdf_path, page_number, lattice=True)
                     else:
-                        tables = self._extract_with_tabula(pdf_path, page_number+1, lattice=False, guess=True)
+                        tables = self._extract_with_tabula(pdf_path, page_number, lattice=False, guess=True)
                 except Exception as e:
                     self.logger.warning(f"Fallback to tabula failed: {str(e)}")
             
             # Try pdfplumber as last resort
             if not tables and method != 'pdfplumber':
                 try:
-                    tables = self._extract_with_pdfplumber(pdf_path, page_number+1)
+                    tables = self._extract_with_pdfplumber(pdf_path, page_number)
                 except Exception as e:
                     self.logger.warning(f"Fallback to pdfplumber failed: {str(e)}")
         
         # Get context for each table
         for table in tables:
             try:
-                table['context'] = self._get_table_context(page, table['bbox'])
+                if 'bbox' in table:
+                    table['context'] = self._get_table_context(page, table['bbox'])
+                    # Store the bbox as region for consistency
+                    table['region'] = table['bbox']
             except Exception as e:
-                self.logger.warning(f"Failed to get table context on page {page_number+1}: {str(e)}")
+                self.logger.warning(f"Failed to get table context on page {page_number}: {str(e)}")
                 table['context'] = ""
         
         return tables
-
-    def _extract_with_camelot(self, pdf_path: str, page_number: int, flavor: str = 'lattice') -> List[Dict[str, Any]]:
-        """
-        Extract tables using Camelot.
-        
-        Args:
-            pdf_path: Path to the PDF file
-            page_number: Page number (1-indexed for Camelot)
-            flavor: 'lattice' for bordered tables, 'stream' for borderless tables
-            
-        Returns:
-            List of extracted tables
-        """
-        try:
-            import camelot
-            
-            # Check if Ghostscript is installed
-            if not self._check_ghostscript_installed():
-                self.logger.warning("Ghostscript is not installed. Camelot requires Ghostscript for PDF processing.")
-                return []
-            
-            # Configure Camelot options
-            line_scale = self.config.get('table_extraction', {}).get('line_scale', 40)
-            
-            # Extract tables
-            tables = camelot.read_pdf(
-                pdf_path,
-                pages=str(page_number),
-                flavor=flavor,
-                line_scale=line_scale
-            )
-            
-            if len(tables) == 0:
-                self.logger.info(f"No tables found on page {page_number} using Camelot with {flavor} flavor")
-                return []
-            
-            # Convert to standard format
-            result = []
-            for i, table in enumerate(tables):
-                # Get table accuracy
-                accuracy = table.accuracy
-                
-                # Skip tables with low accuracy
-                min_confidence = self.config.get('table_extraction', {}).get('min_confidence', 80)
-                if accuracy < min_confidence:
-                    self.logger.info(f"Skipping table with low accuracy: {accuracy:.2f}% (threshold: {min_confidence}%)")
-                    continue
-                
-                # Convert to DataFrame and then to dict
-                df = table.df
-                
-                # Get table bounding box
-                bbox = table._bbox
-                
-                # Create standardized table structure
-                table_dict = {
-                    'id': f"table_{page_number}_{i+1}",
-                    'page': page_number,
-                    'extraction_method': f"camelot_{flavor}",
-                    'confidence': accuracy / 100.0,
-                    'bbox': bbox,
-                    'headers': df.iloc[0].tolist() if not df.empty else [],
-                    'rows': df.values.tolist() if not df.empty else [],
-                    'num_rows': len(df) if not df.empty else 0,
-                    'num_cols': len(df.columns) if not df.empty else 0
-                }
-                
-                # Extract header if configured
-                if self.config.get('table_extraction', {}).get('header_extraction', True) and not df.empty:
-                    table_dict['headers'] = df.iloc[0].tolist()
-                    table_dict['rows'] = df.iloc[1:].values.tolist()
-                
-                result.append(table_dict)
-            
-            return result
-            
-        except ImportError:
-            self.logger.warning("Camelot is not installed. Install with: pip install camelot-py")
-            return []
-        except Exception as e:
-            self.logger.warning(f"Camelot extraction failed: {str(e)}")
-            return []
 
     def _get_table_context(self, page: fitz.Page, bbox: List[float], context_range: int = 3) -> str:
         """
@@ -1025,231 +1677,82 @@ class PDFExtractor(BaseExtractor):
             self.logger.warning(f"Failed to get table context: {str(e)}")
             return ""
 
-    def _refine_table_structure(self, table: Dict[str, Any]) -> Dict[str, Any]:
+    def _extract_with_camelot(self, pdf_path: str, page_number: int, flavor: str = 'lattice') -> List[Dict[str, Any]]:
         """
-        Refine the table structure by cleaning up headers and rows.
+        Extract tables using Camelot.
         
         Args:
-            table: Table dictionary
+            pdf_path: Path to the PDF file
+            page_number: Page number (1-indexed for Camelot)
+            flavor: 'lattice' for bordered tables, 'stream' for borderless tables
             
         Returns:
-            Refined table dictionary
+            List of extracted tables
         """
         try:
-            # Skip empty tables
-            if not table.get('rows') or len(table['rows']) == 0:
-                return table
+            import camelot
             
-            # Clean up headers
-            headers = table.get('headers', [])
-            if headers:
-                # Remove empty headers
-                headers = [h.strip() if isinstance(h, str) else str(h).strip() for h in headers]
-                
-                # Generate generic headers if all are empty
-                if all(not h for h in headers):
-                    headers = [f"Column {i+1}" for i in range(len(headers))]
-                
-                table['headers'] = headers
+            # Configure Camelot options
+            line_scale = self.config.get('table_extraction', {}).get('line_scale', 40)
             
-            # Clean up rows
-            rows = table.get('rows', [])
-            if rows:
-                # Remove completely empty rows
-                rows = [row for row in rows if any(cell and str(cell).strip() for cell in row)]
-                
-                # Clean cell values
-                cleaned_rows = []
-                for row in rows:
-                    cleaned_row = []
-                    for cell in row:
-                        if isinstance(cell, str):
-                            cell = cell.strip()
-                        elif cell is None:
-                            cell = ""
-                        else:
-                            cell = str(cell).strip()
-                        cleaned_row.append(cell)
-                    cleaned_rows.append(cleaned_row)
-                
-                table['rows'] = cleaned_rows
-                table['num_rows'] = len(cleaned_rows)
+            # Extract tables
+            tables = camelot.read_pdf(
+                pdf_path,
+                pages=str(page_number),
+                flavor=flavor,
+                line_scale=line_scale
+            )
             
-            return table
+            if len(tables) == 0:
+                self.logger.info(f"No tables found on page {page_number} using Camelot with {flavor} flavor")
+                return []
             
+            # Convert to standard format
+            result = []
+            for i, table in enumerate(tables):
+                # Get table accuracy
+                accuracy = table.accuracy
+                
+                # Skip tables with low accuracy
+                min_confidence = self.config.get('table_extraction', {}).get('min_confidence', 80)
+                if accuracy < min_confidence:
+                    self.logger.info(f"Skipping table with low accuracy: {accuracy:.2f}% (threshold: {min_confidence}%)")
+                    continue
+                
+                # Convert to DataFrame and then to dict
+                df = table.df
+                
+                # Get table bounding box
+                bbox = table._bbox
+                
+                # Create standardized table structure
+                table_dict = {
+                    'id': f"table_{page_number}_{i+1}",
+                    'page': page_number,
+                    'extraction_method': f"camelot_{flavor}",
+                    'confidence': accuracy / 100.0,
+                    'bbox': bbox,
+                    'headers': df.iloc[0].tolist() if not df.empty else [],
+                    'rows': df.values.tolist() if not df.empty else [],
+                    'num_rows': len(df) if not df.empty else 0,
+                    'num_cols': len(df.columns) if not df.empty else 0
+                }
+                
+                # Extract header if configured
+                if self.config.get('table_extraction', {}).get('header_extraction', True) and not df.empty:
+                    table_dict['headers'] = df.iloc[0].tolist()
+                    table_dict['rows'] = df.iloc[1:].values.tolist()
+                
+                result.append(table_dict)
+            
+            return result
+            
+        except ImportError:
+            self.logger.warning("Camelot is not installed. Install with: pip install camelot-py")
+            return []
         except Exception as e:
-            self.logger.warning(f"Failed to refine table structure: {str(e)}")
-            return table
-
-    def _handle_cross_page_tables(self, tables: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """
-        Detect and merge tables that span across multiple pages.
-        
-        Args:
-            tables: List of tables from all pages
-            
-        Returns:
-            List of tables with cross-page tables merged
-        """
-        if not tables or len(tables) < 2:
-            return tables
-        
-        try:
-            # Sort tables by page number
-            tables.sort(key=lambda t: (t['page'], t['bbox'][1]))
-            
-            merged_tables = []
-            i = 0
-            while i < len(tables):
-                current_table = tables[i]
-                
-                # Check if there's a next table that might be related
-                if i + 1 < len(tables):
-                    next_table = tables[i + 1]
-                    
-                    # Check if tables are on consecutive pages and have similar structure
-                    if next_table['page'] == current_table['page'] + 1 and self._are_tables_related(current_table, next_table):
-                        # Merge the tables
-                        merged_table = self._merge_tables(current_table, next_table)
-                        merged_tables.append(merged_table)
-                        i += 2  # Skip both tables
-                        continue
-                
-                # If no merge happened, add the current table
-                merged_tables.append(current_table)
-                i += 1
-            
-            return merged_tables
-            
-        except Exception as e:
-            self.logger.warning(f"Failed to handle cross-page tables: {str(e)}")
-            return tables
-
-    def _are_tables_related(self, table1: Dict[str, Any], table2: Dict[str, Any]) -> bool:
-        """
-        Check if two tables are related and might be parts of the same table.
-        
-        Args:
-            table1: First table
-            table2: Second table
-            
-        Returns:
-            True if tables are related, False otherwise
-        """
-        # Check if tables have similar structure
-        if table1['num_cols'] != table2['num_cols']:
-            return False
-        
-        # Check if headers are similar
-        headers1 = table1.get('headers', [])
-        headers2 = table2.get('headers', [])
-        
-        # If both have headers and they're different, tables are likely not related
-        if headers1 and headers2 and not self._are_headers_similar(headers1, headers2):
-            return False
-        
-        # Check context for continuity indicators
-        context1 = table1.get('context', '').lower()
-        context2 = table2.get('context', '').lower()
-        
-        continuity_indicators = ['continued', 'continuation', 'cont.', 'cont\'d', 'continued from previous page']
-        if any(indicator in context2 for indicator in continuity_indicators):
-            return True
-        
-        return True  # Default to assuming they're related if structure matches
-
-    def _are_headers_similar(self, headers1: List[str], headers2: List[str]) -> bool:
-        """
-        Check if two sets of headers are similar.
-        
-        Args:
-            headers1: First set of headers
-            headers2: Second set of headers
-            
-        Returns:
-            True if headers are similar, False otherwise
-        """
-        if len(headers1) != len(headers2):
-            return False
-        
-        similarity_count = 0
-        for h1, h2 in zip(headers1, headers2):
-            if h1 == h2 or self._string_similarity(h1, h2) > 0.8:
-                similarity_count += 1
-        
-        # Consider headers similar if at least 70% match
-        return (similarity_count / len(headers1) >= 0.7) if headers1 else False
-
-    def _string_similarity(self, s1: str, s2: str) -> float:
-        """
-        Calculate the similarity between two strings using Levenshtein distance.
-        
-        Args:
-            s1: First string
-            s2: Second string
-            
-        Returns:
-            Similarity score between 0 and 1
-        """
-        # Simple implementation of Levenshtein distance
-        if len(s1) < len(s2):
-            return self._string_similarity(s2, s1)
-            
-        if len(s2) == 0:
-            return 0.0
-            
-        previous_row = range(len(s2) + 1)
-        for i, c1 in enumerate(s1):
-            current_row = [i + 1]
-            for j, c2 in enumerate(s2):
-                insertions = previous_row[j + 1] + 1
-                deletions = current_row[j] + 1
-                substitutions = previous_row[j] + (c1 != c2)
-                current_row.append(min(insertions, deletions, substitutions))
-            previous_row = current_row
-            
-        # Convert distance to similarity score
-        max_len = max(len(s1), len(s2))
-        distance = previous_row[-1]
-        return 1.0 - (distance / max_len) if max_len > 0 else 1.0
-
-    def _merge_tables(self, table1: Dict[str, Any], table2: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Merge two related tables into one.
-        
-        Args:
-            table1: First table
-            table2: Second table
-            
-        Returns:
-            Merged table
-        """
-        # Create a new merged table
-        merged_table = table1.copy()
-        
-        # Use headers from the first table
-        merged_table['headers'] = table1.get('headers', [])
-        
-        # Merge rows
-        rows1 = table1.get('rows', [])
-        rows2 = table2.get('rows', [])
-        
-        # Skip header row in the second table if it matches the first table's headers
-        if table2.get('headers') and self._are_headers_similar(table1.get('headers', []), table2.get('headers', [])):
-            rows2 = rows2[1:] if rows2 else []
-        
-        merged_table['rows'] = rows1 + rows2
-        merged_table['num_rows'] = len(merged_table['rows'])
-        
-        # Update metadata
-        merged_table['id'] = f"{table1['id']}_merged"
-        merged_table['cross_page'] = True
-        merged_table['pages'] = [table1['page'], table2['page']]
-        
-        # Average the confidence scores
-        merged_table['confidence'] = (table1.get('confidence', 0) + table2.get('confidence', 0)) / 2
-        
-        return merged_table
+            self.logger.warning(f"Camelot extraction failed: {str(e)}")
+            return []
 
     def _extract_with_tabula(self, pdf_path: str, page_number: int, lattice: bool = False, 
                            guess: bool = True) -> List[Dict[str, Any]]:
@@ -1398,97 +1901,257 @@ class PDFExtractor(BaseExtractor):
             self.logger.warning(f"pdfplumber extraction failed: {str(e)}")
             return []
 
-    def extract_tables(self, doc: fitz.Document, pdf_path: str) -> List[Dict[str, Any]]:
+    def _handle_cross_page_tables(self, tables: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
-        Unified table extraction strategy that combines the strengths of multiple libraries.
-        
-        This method implements a comprehensive approach to table extraction:
-        1. First attempts extraction with Camelot (both lattice and stream modes)
-        2. Then tries Tabula for tables Camelot might have missed
-        3. Finally uses pdfplumber as a fallback
-        4. Merges and deduplicates results based on spatial overlap
-        5. Ranks and selects the best extraction for each detected table region
-        6. Applies advanced structure analysis to refine the table structure
-        7. Detects and handles cross-page tables
+        Detect and merge tables that span across multiple pages.
         
         Args:
-            doc: PyMuPDF document object
-            pdf_path: Path to the PDF file
+            tables: List of tables from all pages
             
         Returns:
-            List of extracted tables with metadata and quality metrics
+            List of tables with cross-page tables merged
         """
-        all_tables = []
+        if not tables or len(tables) < 2:
+            return tables
         
-        # Check if any table extraction libraries are available
-        if not any([HAS_CAMELOT, HAS_TABULA, HAS_PDFPLUMBER]):
-            self.logger.warning("No table extraction libraries available. "
-                               "Please install at least one of: camelot-py, tabula-py, or pdfplumber.")
-            return []
-        
-        # Initialize TableStructureRecognizer if available
-        table_structure_recognizer = None
         try:
-            # Pass the config path to TableStructureRecognizer
-            config_path = os.path.join(get_project_base_directory(), "config/rag_config.yaml")
+            # Sort tables by page number
+            tables.sort(key=lambda t: (t['page'], t.get('bbox', [0, 0, 0, 0])[1]))
             
-            # Check if config file exists before initializing
-            if os.path.exists(config_path):
-                try:
-                    from ..core.vision.table_structure_recognizer import TableStructureRecognizer
-                    table_structure_recognizer = TableStructureRecognizer(config_path)
-                    self.logger.info("TableStructureRecognizer initialized successfully")
-                except Exception as e:
-                    self.logger.warning(f"Failed to initialize TableStructureRecognizer: {str(e)}")
-            else:
-                self.logger.warning(f"Config file not found at {config_path}, skipping TableStructureRecognizer initialization")
-        except Exception as e:
-            self.logger.warning(f"Failed to initialize TableStructureRecognizer: {str(e)}")
-            
-        # Process each page
-        for page_num, page in enumerate(doc):
-            page_number = page_num + 1  # Convert to 1-based page numbering
-            
-            try:
-                # Step 1: Analyze page to determine table characteristics
-                has_borders = self._detect_table_borders(page)
+            merged_tables = []
+            i = 0
+            while i < len(tables):
+                current_table = tables[i]
                 
-                # Step 2: Extract tables using the unified strategy
-                page_tables = self._extract_tables_unified(pdf_path, page_number, page, has_borders)
-                
-                # Step 3: Apply advanced structure analysis to refine the tables
-                if table_structure_recognizer and page_tables:
-                    try:
-                        page_tables = self._refine_table_structure(page_tables, page, table_structure_recognizer)
-                    except Exception as e:
-                        self.logger.warning(f"Table structure refinement failed on page {page_number}: {str(e)}")
-                
-                # Step 4: Add page information to each table
-                for table in page_tables:
-                    table['page'] = page_number
+                # Check if there's a next table that might be related
+                if i + 1 < len(tables):
+                    next_table = tables[i + 1]
                     
-                    # Add table context if region is available
-                    if 'region' in table:
-                        try:
-                            table['context'] = self._get_table_context(page, table['region'])
-                        except Exception as e:
-                            self.logger.warning(f"Failed to get table context on page {page_number}: {str(e)}")
+                    # Check if tables are on consecutive pages and have similar structure
+                    if next_table['page'] == current_table['page'] + 1 and self._are_tables_related(current_table, next_table):
+                        # Merge the tables
+                        merged_table = self._merge_tables(current_table, next_table)
+                        merged_tables.append(merged_table)
+                        i += 2  # Skip both tables
+                        continue
                 
-                all_tables.extend(page_tables)
-                
-            except Exception as e:
-                self.logger.error(f"Table extraction failed for page {page_number}: {str(e)}")
-                # Continue with next page instead of failing completely
-                continue
-        
-        # Step 5: Detect and handle cross-page tables
-        if len(all_tables) > 1:
-            try:
-                all_tables = self._handle_cross_page_tables(all_tables, doc)
-            except Exception as e:
-                self.logger.warning(f"Cross-page table handling failed: {str(e)}")
+                # If no merge happened, add the current table
+                merged_tables.append(current_table)
+                i += 1
             
-        return all_tables
+            return merged_tables
+            
+        except Exception as e:
+            self.logger.warning(f"Failed to handle cross-page tables: {str(e)}")
+            return tables
+
+    def _are_tables_related(self, table1: Dict[str, Any], table2: Dict[str, Any]) -> bool:
+        """
+        Check if two tables are related and might be parts of the same table.
+        
+        Args:
+            table1: First table
+            table2: Second table
+            
+        Returns:
+            True if tables are related, False otherwise
+        """
+        # Check if tables have similar structure
+        if table1.get('num_cols', 0) != table2.get('num_cols', 0):
+            return False
+        
+        # Check if headers are similar
+        headers1 = table1.get('headers', [])
+        headers2 = table2.get('headers', [])
+        
+        # If both have headers and they're different, tables are likely not related
+        if headers1 and headers2 and not self._are_headers_similar(headers1, headers2):
+            return False
+        
+        # Check context for continuity indicators
+        context1 = table1.get('context', '').lower()
+        context2 = table2.get('context', '').lower()
+        
+        continuity_indicators = ['continued', 'continuation', 'cont.', 'cont\'d', 'continued from previous page']
+        if any(indicator in context2 for indicator in continuity_indicators):
+            return True
+        
+        return True  # Default to assuming they're related if structure matches
+
+    def _are_headers_similar(self, headers1: List[str], headers2: List[str]) -> bool:
+        """
+        Check if two sets of headers are similar.
+        
+        Args:
+            headers1: First set of headers
+            headers2: Second set of headers
+            
+        Returns:
+            True if headers are similar, False otherwise
+        """
+        if len(headers1) != len(headers2):
+            return False
+        
+        similarity_count = 0
+        for h1, h2 in zip(headers1, headers2):
+            if h1 == h2 or self._string_similarity(h1, h2) > 0.8:
+                similarity_count += 1
+        
+        # Consider headers similar if at least 70% match
+        return (similarity_count / len(headers1) >= 0.7) if headers1 else False
+
+    def _string_similarity(self, s1: str, s2: str) -> float:
+        """
+        Calculate the similarity between two strings using Levenshtein distance.
+        
+        Args:
+            s1: First string
+            s2: Second string
+            
+        Returns:
+            Similarity score between 0 and 1
+        """
+        # Simple implementation of Levenshtein distance
+        if not isinstance(s1, str) or not isinstance(s2, str):
+            s1 = str(s1) if s1 is not None else ""
+            s2 = str(s2) if s2 is not None else ""
+            
+        if len(s1) < len(s2):
+            return self._string_similarity(s2, s1)
+            
+        if len(s2) == 0:
+            return 0.0
+            
+        previous_row = range(len(s2) + 1)
+        for i, c1 in enumerate(s1):
+            current_row = [i + 1]
+            for j, c2 in enumerate(s2):
+                insertions = previous_row[j + 1] + 1
+                deletions = current_row[j] + 1
+                substitutions = previous_row[j] + (c1 != c2)
+                current_row.append(min(insertions, deletions, substitutions))
+            previous_row = current_row
+            
+        # Convert distance to similarity score
+        max_len = max(len(s1), len(s2))
+        distance = previous_row[-1]
+        return 1.0 - (distance / max_len) if max_len > 0 else 1.0
+
+    def _merge_tables(self, table1: Dict[str, Any], table2: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Merge two related tables into one.
+        
+        Args:
+            table1: First table
+            table2: Second table
+            
+        Returns:
+            Merged table
+        """
+        # Create a new table with merged data
+        merged_table = {
+            'data': table1['data'] + table2['data'],
+            'headers': table1['headers'],  # Keep headers from first table
+            'page': table1['page'],  # Keep page from first table
+            'bbox': table1['bbox'],  # Keep bbox from first table
+            'confidence': (table1.get('confidence', 0.5) + table2.get('confidence', 0.5)) / 2,  # Average confidence
+            'extraction_method': table1.get('extraction_method', 'merged'),
+            'is_merged': True,
+            'merged_from': [table1.get('page', 0), table2.get('page', 0)]
+        }
+        
+        return merged_table
+        
+    def _refine_table_structure(self, table: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Refine the structure of an extracted table.
+        
+        This method improves table structure by:
+        1. Removing empty rows and columns
+        2. Identifying and fixing merged cells
+        3. Normalizing header rows
+        4. Improving data type detection
+        
+        Args:
+            table: The table dictionary containing data and metadata
+            
+        Returns:
+            Refined table dictionary
+        """
+        if not table or 'data' not in table or not table['data']:
+            return table
+            
+        # Get table data
+        data = table['data']
+        
+        # 1. Remove completely empty rows
+        data = [row for row in data if any(cell.strip() if isinstance(cell, str) else cell for cell in row)]
+        
+        # 2. Remove completely empty columns
+        if data:
+            # Transpose to work with columns
+            transposed = list(zip(*data))
+            # Filter empty columns
+            transposed = [col for col in transposed if any(cell.strip() if isinstance(cell, str) else cell for cell in col)]
+            # Transpose back to rows
+            if transposed:
+                data = list(zip(*transposed))
+        
+        # 3. Normalize header row if present
+        headers = table.get('headers', [])
+        if not headers and len(data) > 0:
+            # Use first row as header if not explicitly defined
+            headers = data[0]
+            data = data[1:]
+        
+        # 4. Clean and normalize headers
+        cleaned_headers = []
+        for header in headers:
+            if isinstance(header, str):
+                # Remove extra whitespace and normalize
+                cleaned_header = ' '.join(header.strip().split())
+                cleaned_headers.append(cleaned_header)
+            else:
+                cleaned_headers.append(header)
+        
+        # 5. Clean data cells
+        cleaned_data = []
+        for row in data:
+            cleaned_row = []
+            for cell in row:
+                if isinstance(cell, str):
+                    # Remove extra whitespace and normalize
+                    cleaned_cell = ' '.join(cell.strip().split())
+                    cleaned_row.append(cleaned_cell)
+                else:
+                    cleaned_row.append(cell)
+            cleaned_data.append(cleaned_row)
+        
+        # Update table with refined data
+        refined_table = table.copy()
+        refined_table['data'] = cleaned_data
+        refined_table['headers'] = cleaned_headers
+        refined_table['refined'] = True
+        
+        return refined_table
+
+    def _regions_overlap(self, region1, region2):
+        """Check if two regions (bounding boxes) overlap."""
+        if not region1 or not region2:
+            return False
+            
+        x01, y01, x11, y11 = region1
+        x02, y02, x12, y12 = region2
+        
+        # Check if one rectangle is to the left of the other
+        if x11 < x02 or x12 < x01:
+            return False
+            
+        # Check if one rectangle is above the other
+        if y11 < y02 or y12 < y01:
+            return False
+            
+        return True
 
 # Test function to verify Ghostscript detection
 def test_ghostscript_detection():
@@ -1543,6 +2206,6 @@ def test_ghostscript_detection():
         # If the command failed or the executable wasn't found
         return False
 
-# Run the test when the module is imported
-test_result = test_ghostscript_detection()
-print(f"Ghostscript detection test result: {test_result}")
+# # Run the test when the module is imported
+# test_result = test_ghostscript_detection()
+# print(f"Ghostscript detection test result: {test_result}")

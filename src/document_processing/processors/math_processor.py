@@ -63,8 +63,106 @@ class MathProcessor:
             'algebraic': r'([a-z]\s*=\s*[-+]?\d*\.?\d+)',
             'quadratic': r'([-+]?\d*x\^2\s*[-+]\s*\d*x\s*[-+]\s*\d+\s*=\s*0)',
             'trigonometric': r'(sin|cos|tan)[\s\(].*[\)]',
-            'calculus': r'(\∫|\lim|\frac{d}{dx})',
+            'calculus': r'(\∫|\\lim|\\frac\{d\}\{dx\})',
         }
+        self._has_math_content = False
+        
+    def has_math_content(self, text: str) -> bool:
+        """
+        Check if the text contains mathematical content.
+        
+        This method uses multiple detection strategies to determine if the text
+        contains mathematical elements, including:
+        - LaTeX expressions
+        - Mathematical symbols and operators
+        - Equation patterns
+        - Common mathematical terms and keywords
+        
+        Args:
+            text: Input text to check for mathematical content
+            
+        Returns:
+            bool: True if mathematical content is detected, False otherwise
+        """
+        if not text or len(text.strip()) == 0:
+            return False
+            
+        # Check for LaTeX expressions
+        latex_patterns = [
+            r'\$.*?\$',                     # Inline LaTeX
+            r'\$\$.*?\$\$',                 # Display LaTeX
+            r'\\begin\{equation\}.*?\\end\{equation\}',  # Equation environment
+            r'\\begin\{align\}.*?\\end\{align\}',        # Align environment
+            r'\\begin\{math\}.*?\\end\{math\}',          # Math environment
+            r'\\begin\{displaymath\}.*?\\end\{displaymath\}',  # Display math environment
+            r'\\begin\{eqnarray\}.*?\\end\{eqnarray\}',  # Equation array environment
+            r'\\begin\{multline\}.*?\\end\{multline\}',  # Multiline environment
+            r'\\begin\{gather\}.*?\\end\{gather\}',      # Gather environment
+            r'\\begin\{flalign\}.*?\\end\{flalign\}'     # Full-length align environment
+        ]
+        
+        for pattern in latex_patterns:
+            if re.search(pattern, text, re.DOTALL):
+                return True
+                
+        # Check for mathematical symbols and operators
+        math_symbols = [
+            r'[=<>≤≥≈≠∈∉⊂⊃∪∩]',            # Comparison and set operators
+            r'[+\-*/÷×±]',                  # Basic arithmetic operators
+            r'[∑∏∫∂∇∆√∛∜]',                # Advanced mathematical symbols
+            r'[πΠθΘαβγΓλΛφΦ]',              # Greek letters commonly used in math
+            r'[∞∀∃∄∴∵]',                   # Logical and infinity symbols
+            r'[\^_]',                       # Superscript and subscript indicators
+            r'\\frac\{.*?\}\{.*?\}',        # Fractions
+            r'\\sqrt\{.*?\}'                # Square roots
+        ]
+        
+        for pattern in math_symbols:
+            if re.search(pattern, text):
+                return True
+                
+        # Check for equation patterns
+        for pattern in self.equation_patterns.values():
+            if re.search(pattern, text):
+                return True
+                
+        # Check for common mathematical terms and keywords
+        math_keywords = [
+            r'\b(equation|formula|theorem|lemma|proof|solve|calculate|compute)\b',
+            r'\b(algebra|geometry|calculus|trigonometry|statistics|probability)\b',
+            r'\b(function|variable|constant|coefficient|exponent|logarithm)\b',
+            r'\b(matrix|vector|scalar|tensor|determinant|eigenvalue)\b',
+            r'\b(triangle|circle|square|rectangle|polygon|angle|degree|radian)\b',
+            r'\b(mean|median|mode|variance|standard deviation|distribution)\b',
+            r'\b(derivative|integral|limit|differential|series|sequence)\b',
+            r'\b(sin|cos|tan|arcsin|arccos|arctan|sinh|cosh|tanh)\b',
+            r'\b(polynomial|quadratic|cubic|linear|exponential|logarithmic)\b',
+            r'\b(x-axis|y-axis|z-axis|coordinate|graph)\b',
+            r'\b(plot\s+(?:the\s+)?(?:graph|function|equation|data|points|curve))\b',
+            r'\b(curve\s+(?:the\s+)?(?:graph|function|equation|line))\b'
+        ]
+        
+        for pattern in math_keywords:
+            if re.search(pattern, text, re.IGNORECASE):
+                return True
+                
+        # Check for numerical patterns that suggest mathematical content
+        numerical_patterns = [
+            r'\d+\s*[+\-*/÷×]\s*\d+',       # Basic arithmetic: 2 + 3
+            r'\d+\s*=\s*\d+',               # Equality: 2 = 2
+            r'[a-zA-Z]\s*[+\-*/÷×]\s*[a-zA-Z]',  # Variable operations: a + b
+            r'[a-zA-Z]\s*=\s*\d+',          # Variable assignment: x = 5
+            r'[a-zA-Z]\(\s*[a-zA-Z0-9,\s]+\s*\)',  # Function calls: f(x)
+            r'\d+\s*[<>≤≥]\s*\d+',          # Inequalities: 5 > 3
+            r'\(\s*\d+\s*[+\-*/÷×]\s*\d+\s*\)'  # Parenthesized expressions: (2 + 3)
+        ]
+        
+        for pattern in numerical_patterns:
+            if re.search(pattern, text):
+                return True
+                
+        # If none of the above patterns matched, assume no mathematical content
+        return False
         
     def process(self, text: str) -> Dict[str, Any]:
         """
@@ -77,6 +175,20 @@ class MathProcessor:
             Dictionary containing processed mathematical information
         """
         try:
+            # Check if the text contains mathematical content
+            self._has_math_content = self.has_math_content(text)
+            
+            # If no mathematical content, return early with empty results
+            if not self._has_math_content:
+                return {
+                    "equations": [],
+                    "complexity": 0.0,
+                    "topic_distribution": {},
+                    "has_solutions": False,
+                    "total_equations": 0,
+                    "has_math_content": False
+                }
+            
             # Extract equations
             equations = self._extract_equations(text)
             
@@ -96,14 +208,16 @@ class MathProcessor:
                 "complexity": complexity,
                 "topic_distribution": self._get_topic_distribution(equations),
                 "has_solutions": any(eq.is_solved for eq in equations),
-                "total_equations": len(equations)
+                "total_equations": len(equations),
+                "has_math_content": True
             }
             
         except Exception as e:
             return {
                 "error": str(e),
                 "equations": [],
-                "complexity": 0.0
+                "complexity": 0.0,
+                "has_math_content": False
             }
 
     def _extract_equations(self, text: str) -> List[Equation]:

@@ -156,6 +156,21 @@ class ExtractionStage(PipelineStage):
         if 'acceleration' not in pdf_config:
             pdf_config['acceleration'] = acceleration_config
             
+        # Ensure secondary API keys are properly configured for fallback
+        model_config = config.get('model', {})
+        
+        # Configure picture annotation with secondary API key if available
+        picture_config = pdf_config.get('picture_annotation', {})
+        if 'second_api_key' not in picture_config and 'second_api_key' in model_config:
+            picture_config['second_api_key'] = model_config['second_api_key']
+            pdf_config['picture_annotation'] = picture_config
+            
+        # Configure layout recognition with secondary API key if available
+        layout_config = pdf_config.get('layout', {})
+        if 'second_api_key' not in layout_config and 'second_api_key' in model_config:
+            layout_config['second_api_key'] = model_config['second_api_key']
+            pdf_config['layout'] = layout_config
+            
         # Initialize extractors with their configs
         self.extractors = {
             ContentModality.PDF: PDFExtractor(config=pdf_config),
@@ -261,16 +276,45 @@ class ChunkingStage(PipelineStage):
             # Create chunks
             chunks = []
             current_chunk = []
+            current_pos = 0
             
             for sentence in sentences:
                 current_chunk.append(sentence)
                 chunk_text = " ".join(current_chunk)
                 
-                if validate_chunk(Chunk(text=chunk_text)):
-                    chunks.append(chunk_text)
+                # Create a temporary chunk to validate
+                # Using a simple object with a text attribute for validation
+                class TempChunk:
+                    def __init__(self, text):
+                        self.text = text
+                
+                temp_chunk = TempChunk(chunk_text)
+                
+                if validate_chunk(temp_chunk):
+                    # Calculate positions
+                    start_pos = current_pos
+                    end_pos = start_pos + len(chunk_text)
+                    
+                    # Create a proper chunk with all required fields
+                    chunks.append({
+                        "text": chunk_text,
+                        "start_pos": start_pos,
+                        "end_pos": end_pos
+                    })
+                    
+                    # Update position for next chunk
+                    current_pos = end_pos + 1  # +1 for the space between chunks
                     current_chunk = []
             
-            document.chunks = [Chunk(text=chunk) for chunk in chunks]
+            # Create proper Chunk objects with all required fields
+            document.chunks = [
+                Chunk(
+                    text=chunk["text"],
+                    document_id=document.id,
+                    start_pos=chunk["start_pos"],
+                    end_pos=chunk["end_pos"]
+                ) for chunk in chunks
+            ]
             
         self._record_metrics(document, ProcessingMetrics(
             processing_time=timer.elapsed,

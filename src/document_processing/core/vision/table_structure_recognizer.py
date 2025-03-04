@@ -127,7 +127,17 @@ class TableStructureRecognizer(Recognizer):
                 
                 # Check if we should use Gemini model
                 model_name = cross_modal_config.get('model_name', '')
-                if isinstance(model_name, str) and model_name.lower().startswith('gemini'):
+                
+                # Handle case where model_name might be a list or other non-string type
+                if not isinstance(model_name, str):
+                    logging.warning(f"model_name is not a string but a {type(model_name).__name__}. Converting to string representation.")
+                    try:
+                        model_name = str(model_name)
+                    except Exception as e:
+                        logging.warning(f"Failed to convert model_name to string: {str(e)}")
+                        model_name = ''
+                
+                if model_name and model_name.lower().startswith('gemini'):
                     logging.info(f"Using Gemini model: {model_name}")
                     # Will use Gemini configuration later
                 else:
@@ -140,7 +150,17 @@ class TableStructureRecognizer(Recognizer):
         # Check if we should use Gemini model
         use_gemini = False
         model_name = cross_modal_config.get('model_name', '')
-        if isinstance(model_name, str) and model_name.lower().startswith('gemini'):
+        
+        # Handle case where model_name might be a list or other non-string type
+        if not isinstance(model_name, str):
+            logging.warning(f"model_name is not a string but a {type(model_name).__name__}. Converting to string representation.")
+            try:
+                model_name = str(model_name)
+            except Exception as e:
+                logging.warning(f"Failed to convert model_name to string: {str(e)}")
+                model_name = ''
+        
+        if model_name and model_name.lower().startswith('gemini'):
             try:
                 # Try to import and initialize Gemini
                 import google.generativeai as genai
@@ -196,9 +216,10 @@ class TableStructureRecognizer(Recognizer):
         if use_gemini:
             # If using Gemini, we still need to initialize the base class
             # but we'll override the __call__ method
-            super().__init__(self.labels, "tsr", os.path.join(
-                    get_project_base_directory(),
-                    "rag/res/deepdoc"))
+            super().__init__(model_type="ollama", label_list=self.labels, task_name="tsr", 
+                    model_name="Qwen/Qwen2.5-VL-7B",
+                    ollama_host="http://localhost:11434",
+                    model_dir=os.path.join(get_project_base_directory(), "rag/res/deepdoc"))
             # Set a flag to indicate we're using Gemini
             self.use_gemini = True
             return
@@ -214,22 +235,29 @@ class TableStructureRecognizer(Recognizer):
                         device = 'cuda' if torch.cuda.is_available() else 'mps' if hasattr(torch, 'mps') and torch.backends.mps.is_available() else 'cpu'
                     
                     super().__init__(
-                        self.labels, 
-                        "tsr", 
-                        model_dir=os.path.join(get_project_base_directory(), "models", model_name),
-                        device=device
+                        model_type="ollama",
+                        label_list=self.labels, 
+                        task_name="tsr", 
+                        model_name=model_name,
+                        ollama_host="http://localhost:11434",
+                        device=device,
+                        model_dir=os.path.join(get_project_base_directory(), "models", model_name)
                     )
                     self.use_gemini = False
                     return
             
             # If no local model specified or configuration failed, try the default path
-            super().__init__(self.labels, "tsr", os.path.join(
-                    get_project_base_directory(),
-                    "rag/res/deepdoc"))
+            super().__init__(model_type="ollama", label_list=self.labels, task_name="tsr", 
+                    model_name="Qwen/Qwen2.5-VL-7B",
+                    ollama_host="http://localhost:11434",
+                    model_dir=os.path.join(get_project_base_directory(), "rag/res/deepdoc"))
             self.use_gemini = False
         except Exception:
             # Fall back to downloading from HuggingFace
-            super().__init__(self.labels, "tsr", snapshot_download(repo_id="InfiniFlow/deepdoc",
+            super().__init__(model_type="ollama", label_list=self.labels, task_name="tsr", 
+                    model_name="Qwen/Qwen2.5-VL-7B",
+                    ollama_host="http://localhost:11434",
+                    model_dir=snapshot_download(repo_id="InfiniFlow/deepdoc",
                                               local_dir=os.path.join(get_project_base_directory(), "rag/res/deepdoc"),
                                               local_dir_use_symlinks=False))
             self.use_gemini = False
