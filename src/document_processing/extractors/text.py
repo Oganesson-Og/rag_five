@@ -41,10 +41,35 @@ from .base import BaseExtractor, ExtractorResult, DocumentContent
 class TextExtractor(BaseExtractor):
     """Handles plain text documents with advanced processing capabilities."""
     
+    async def _read_file_content(self, file_path: Union[str, Path]) -> bytes:
+        """Read file content as bytes."""
+        if isinstance(file_path, str):
+            file_path = Path(file_path)
+            
+        if not file_path.exists():
+            raise FileNotFoundError(f"File not found: {file_path}")
+            
+        with open(file_path, 'rb') as f:
+            return f.read()
+    
     async def extract(self, document: Document) -> Document:
         """Extract text content from document."""
         try:
-            raw_content = await self._read_file_content(document.file_path)
+            # If document already has content, use it
+            if document.content:
+                if isinstance(document.content, str):
+                    document.content = self._process_text(document.content)
+                    return document
+                elif isinstance(document.content, bytes):
+                    raw_content = document.content
+                else:
+                    raise ValueError(f"Unsupported content type: {type(document.content)}")
+            # Otherwise, read from source
+            elif document.source and isinstance(document.source, str):
+                document.file_path = document.source
+                raw_content = await self._read_file_content(document.file_path)
+            else:
+                raise ValueError("Document must have either content or a valid source file path")
             
             # Try multiple encodings in order of likelihood
             encodings_to_try = ['utf-8', 'latin-1', 'cp1252', 'iso-8859-1']

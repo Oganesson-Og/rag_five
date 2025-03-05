@@ -28,29 +28,30 @@ Usage:
     response = await pipeline.generate_response("What is...")
 """
 
-import asyncio
-import logging
-from pathlib import Path
-from typing import List, Dict, Any, Set, Union, Optional
-import argparse
-from datetime import datetime
-from tqdm import tqdm
+import os
 import sys
+import logging
+import asyncio
+import argparse
+import yaml
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Any, Optional, Union, Set
+from tqdm import tqdm
 import time
 import warnings
-import yaml
 import traceback
+
+# Add parent directory to path to allow imports
+sys.path.append(str(Path(__file__).parent.parent.parent))
 
 from src.rag.pipeline import Pipeline
 from src.rag.models import Document, ContentModality, ProcessingStage
 from src.config.rag_config import ConfigManager
-from ..document_processing.extractors.text import TextExtractor
-from ..document_processing.extractors.pdf import PDFExtractor
-from ..document_processing.extractors.docx import DocxExtractor
-
-# Add project root to Python path
-project_root = Path(__file__).parent.parent.parent
-sys.path.append(str(project_root))
+from src.document_processing.extractors.text import TextExtractor
+from src.document_processing.extractors.pdf import PDFExtractor
+from src.document_processing.extractors.docx import DocxExtractor
+from src.utils.logging_config import configure_logging
 
 # Filter specific warnings
 warnings.filterwarnings('ignore', message='could not convert string to float: .*')
@@ -355,25 +356,51 @@ class ContentIngester:
                 # Determine modality
                 modality = self._detect_modality(file_path)
                 
-                # Process through pipeline using the file path directly
-                # This matches how process_document expects to be called
-                processed_doc = await self.pipeline.process_document(
-                    source=str(file_path),
-                    modality=modality,
-                    options={
-                        'subject': subject,
-                        'file_path': str(file_path)
-                    }
-                )
+                # Ensure file exists and is readable
+                if not file_path.exists():
+                    self.error_handler.log_error(f"File not found: {file_path}")
+                    self.progress_tracker.update(success=False)
+                    continue
                 
-                # Mark as processed
-                self.processed_files.add(str(file_path))
-                self.progress_tracker.update(success=True)
+                try:
+                    # Read file content
+                    with open(file_path, 'rb') as f:
+                        content = f.read()
+                except Exception as e:
+                    self.error_handler.log_error(f"Failed to read file {file_path}: {str(e)}")
+                    self.progress_tracker.update(success=False)
+                    continue
                 
-                self.logger.info(f"Processed {file_path} for subject {subject}")
+                # Create options with metadata
+                options = {
+                    'file_path': str(file_path),
+                    'subject': subject,
+                    'title': file_path.stem,
+                    'extension': file_path.suffix,
+                    'size': file_path.stat().st_size,
+                    'last_modified': datetime.fromtimestamp(file_path.stat().st_mtime).isoformat()
+                }
+                
+                # Process through pipeline
+                try:
+                    processed_doc = await self.pipeline.process_document(
+                        source=content,  # Pass the actual content
+                        modality=modality,
+                        options=options
+                    )
+                    
+                    # Update progress
+                    self.progress_tracker.update(success=True)
+                    
+                    # Log success
+                    logging.info(f"Successfully processed {file_path}")
+                    
+                except Exception as e:
+                    self.error_handler.log_error(f"Error processing {file_path}: {str(e)}")
+                    self.progress_tracker.update(success=False)
                 
             except Exception as e:
-                self.logger.error(f"Error processing {file_path}: {str(e)}")
+                self.error_handler.log_error(f"Error processing {file_path}: {str(e)}")
                 self.progress_tracker.update(success=False)
                 
     def _extract_course_structure(self, document: Document) -> Dict[str, Any]:

@@ -135,7 +135,7 @@ class AudioExtractor(BaseExtractor):
             ))
             
             # Cache processed document
-            await self.cache.set(cache_key, document)
+            await self.cache.set(cache_key, document, modality="audio")
             
             return document
             

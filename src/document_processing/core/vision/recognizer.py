@@ -124,6 +124,9 @@ class Recognizer:
                     raise ConnectionError(f"Failed to connect to Ollama at {self.ollama_host}")
             except Exception as e:
                 raise ConnectionError(f"Failed to connect to Ollama: {str(e)}")
+        elif self.model_type == "spacy":
+            # For spaCy model type, initialization is handled in the SpaCyLayoutRecognizer class
+            pass
         else:
             raise ValueError(f"Unsupported model type: {model_type}")
 

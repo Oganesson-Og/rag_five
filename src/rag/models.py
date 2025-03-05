@@ -64,7 +64,7 @@ License: MIT
 from datetime import datetime
 from typing import Dict, List, Optional, Union, Any
 from enum import Enum, auto
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, validator
 import numpy as np
 from uuid import uuid4
 from dataclasses import dataclass, field
@@ -86,6 +86,7 @@ class ContentModality(Enum):
     DOCX = 'docx'
     EXCEL = 'excel'
     CSV = 'csv'
+    UNKNOWN = 'unknown'
     
     @property
     def required_metadata(self) -> List[str]:
@@ -144,15 +145,34 @@ class EmbeddingVector(BaseModel):
 
 class Document(BaseModel):
     """Document representation with metadata."""
-    content: Any  # Changed from Union[str, bytes] to Any
-    source: str
-    modality: Optional[ContentModality] = None
-    content_type: Optional[str] = None  # Add this field
+    content: Any  # Can be str, bytes, or other content types
+    source: str = "unknown"  # Default to "unknown" if not provided
+    modality: Optional[ContentModality] = ContentModality.UNKNOWN
+    content_type: Optional[str] = None
     doc_info: Dict[str, Any] = Field(default_factory=dict)
     id: str = Field(default_factory=lambda: str(uuid4()))
     created_at: datetime = Field(default_factory=datetime.now)
     processing_events: List[ProcessingEvent] = Field(default_factory=list)
     chunks: List[Chunk] = Field(default_factory=list)
+    
+    class Config:
+        # Allow arbitrary types for content field
+        arbitrary_types_allowed = True
+        
+    @validator('content')
+    def validate_content(cls, v):
+        """Validate that content is not None and has appropriate type."""
+        if v is None:
+            raise ValueError("Content cannot be None")
+        # Allow various content types (str, bytes, dict, etc.)
+        return v
+        
+    @validator('source')
+    def validate_source(cls, v):
+        """Ensure source is a string."""
+        if v is None:
+            return "unknown"
+        return str(v)
     
     def add_processing_event(self, event: ProcessingEvent):
         """Add a processing event to the document history."""
@@ -176,12 +196,6 @@ class Document(BaseModel):
         """Get list of processed content modalities."""
         return list(set(event.processor for event in self.processing_events))
 
-    class Config:
-        arbitrary_types_allowed = True
-        model_config = {
-            "from_attributes": True
-        }
-
     def encode(self) -> bytes:
         """Convert content to bytes."""
         if isinstance(self.content, bytes):
@@ -192,14 +206,6 @@ class Document(BaseModel):
             return str(self.content.content).encode('utf-8')
         else:
             return str(self.content).encode('utf-8')
-
-    @field_validator('content')
-    @classmethod
-    def validate_content(cls, v):
-        """Validate content field."""
-        if isinstance(v, (str, bytes, Document)):
-            return v
-        raise ValueError('Content must be string, bytes, or Document')
 
 class SearchResult(BaseModel):
     """Search result with relevance information."""

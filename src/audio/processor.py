@@ -218,7 +218,15 @@ class AudioProcessor:
         """Initialize speaker diarization model."""
         try:
             # Import the specific module
-            from speechbrain.pretrained.interfaces import SpeakerDiarization
+            import sys
+            import importlib.util
+            
+            # Check if speechbrain is installed
+            if importlib.util.find_spec("speechbrain") is None:
+                self.logger.error("speechbrain package is not installed. Please install it with: pip install speechbrain==1.0.2")
+                return self._initialize_fallback_diarization()
+                
+            from speechbrain.processing import SpeakerDiarization
             
             diarization = SpeakerDiarization.from_hparams(
                 source="speechbrain/spkrec-ecapa-voxceleb",
@@ -235,9 +243,91 @@ class AudioProcessor:
             # model = nemo_asr.models.ClusteringDiarizer.from_pretrained('titanet_large')
             # return model
             
-        except ImportError:
-            self.logger.warning("Diarization libraries not installed. Diarization disabled.")
-            return None
+        except ImportError as e:
+            self.logger.error(f"Diarization import error: {str(e)}. Make sure speechbrain is installed correctly.")
+            self.logger.warning("Diarization libraries not installed. Using fallback diarization.")
+            return self._initialize_fallback_diarization()
+            
+    def _initialize_fallback_diarization(self):
+        """Initialize a simple fallback diarization that doesn't rely on external libraries."""
+        self.logger.info("Using simple fallback diarization implementation.")
+        
+        class SimpleDiarization:
+            """Simple diarization class that assigns speakers based on pauses."""
+            
+            def __init__(self):
+                self.min_pause = 0.75  # seconds
+            
+            def diarize(self, audio_file, num_speakers=2):
+                """Simple diarization based on pauses in speech."""
+                try:
+                    import numpy as np
+                    from pydub import AudioSegment
+                    import librosa
+                    
+                    # Load audio
+                    y, sr = librosa.load(audio_file, sr=16000)
+                    
+                    # Detect speech segments using energy
+                    energy = librosa.feature.rms(y=y)[0]
+                    threshold = 0.1 * np.max(energy)
+                    speech = energy > threshold
+                    
+                    # Find pauses (gaps between speech)
+                    pauses = []
+                    in_speech = False
+                    start = 0
+                    
+                    for i, is_speech in enumerate(speech):
+                        if is_speech and not in_speech:
+                            in_speech = True
+                            if i > 0:
+                                pause_duration = (i - start) / len(speech) * len(y) / sr
+                                if pause_duration > self.min_pause:
+                                    pauses.append((start, i))
+                            start = i
+                        elif not is_speech and in_speech:
+                            in_speech = False
+                            start = i
+                    
+                    # Create segments with speaker labels
+                    segments = []
+                    current_speaker = 0
+                    last_end = 0
+                    
+                    for pause_start, pause_end in pauses:
+                        # Add segment before pause
+                        if last_end < pause_start:
+                            segment_start = last_end / len(speech) * len(y) / sr
+                            segment_end = pause_start / len(speech) * len(y) / sr
+                            segments.append({
+                                "start": segment_start,
+                                "end": segment_end,
+                                "speaker": f"SPEAKER_{current_speaker}"
+                            })
+                        
+                        # Switch speaker
+                        current_speaker = (current_speaker + 1) % num_speakers
+                        last_end = pause_end
+                    
+                    # Add final segment
+                    if last_end < len(speech):
+                        segment_start = last_end / len(speech) * len(y) / sr
+                        segment_end = len(y) / sr
+                        segments.append({
+                            "start": segment_start,
+                            "end": segment_end,
+                            "speaker": f"SPEAKER_{current_speaker}"
+                        })
+                    
+                    return {"segments": segments}
+                    
+                except Exception as e:
+                    print(f"Error in fallback diarization: {str(e)}")
+                    # Return empty diarization
+                    return {"segments": []}
+        
+        return SimpleDiarization()
 
     def _initialize_term_extractor(self):
         """Initialize technical term extraction model."""

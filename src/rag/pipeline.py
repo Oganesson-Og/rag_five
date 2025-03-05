@@ -56,14 +56,20 @@ License: MIT
 """
 
 import logging
-from typing import List, Dict, Any, Optional, Union
-from pathlib import Path
+import time
 import asyncio
+from typing import List, Dict, Any, Optional, Union, Set
+from pathlib import Path
 from datetime import datetime
 import yaml
 import torch
 import ollama
 from uuid import uuid4
+import sys
+import os
+import json
+import numpy as np
+from concurrent.futures import ThreadPoolExecutor
 
 from .models import (
     Document,
@@ -118,12 +124,26 @@ class PipelineStage:
         """Process document and update its state."""
         raise NotImplementedError
     
-    def _record_metrics(self, document: Document, metrics: ProcessingMetrics):
+    def _record_metrics(self, document: Document, metrics: Union[ProcessingMetrics, MetricsCollector]):
         """Record processing metrics."""
+        # Convert MetricsCollector to ProcessingMetrics if needed
+        if isinstance(metrics, MetricsCollector):
+            # Get the average processing time
+            processing_time = metrics.get_average_time() if hasattr(metrics, 'get_average_time') else 0.0
+            
+            # Create ProcessingMetrics from MetricsCollector
+            metrics_obj = ProcessingMetrics(
+                processing_time=processing_time,
+                token_count=metrics.get_counter('tokens') if hasattr(metrics, 'get_counter') else None,
+                chunk_count=metrics.get_counter('chunks') if hasattr(metrics, 'get_counter') else None
+            )
+        else:
+            metrics_obj = metrics
+            
         event = ProcessingEvent(
             stage=self.stage,
             processor=self.__class__.__name__,
-            metrics=metrics,
+            metrics=metrics_obj,
             config_snapshot=self.config
         )
         document.add_processing_event(event)
@@ -362,19 +382,19 @@ class EducationalProcessingStage(PipelineStage):
             
             # Map educational standards
             standards_mapping = await self.standards_manager.map_content(document.content)
-            document.metadata['standards'] = standards_mapping
+            document.doc_info['standards'] = standards_mapping
             
-            # Cross-modal educational analysis
+            # Process cross-modal content if present
             if document.has_multiple_modalities():
                 document = await self.cross_modal_processor.process(document)
             
-        self._record_metrics(document, ProcessingMetrics(
-            processing_time=timer.elapsed,
-            math_content_processed=bool(document.metadata.get('math_processed')),
-            standards_mapped=len(standards_mapping),
-            modalities_processed=len(document.processed_modalities)
-        ))
-        return document
+            # Record metrics
+            self._record_metrics(document, ProcessingMetrics(
+                processing_time=timer.elapsed,
+                token_count=len(str(document.content)) if document.content else 0
+            ))
+            
+            return document
 
 class FeedbackProcessingStage(PipelineStage):
     """Educational feedback processing stage."""
@@ -383,31 +403,28 @@ class FeedbackProcessingStage(PipelineStage):
     
     def __init__(self, config: Dict[str, Any]):
         super().__init__(config)
-        self.feedback_processor = FeedbackProcessor(config.get('feedback', {}))
+        self.feedback_processor = FeedbackProcessor(config)
     
     async def process(self, document: Document) -> Document:
-        """Process educational feedback."""
+        """Process document with feedback analysis."""
         with self.metrics.measure_time() as timer:
-            feedback = await self.feedback_processor.process_document(
-                document.content,
-                document.metadata
-            )
-            document.metadata['educational_feedback'] = feedback
-            
-            # Update learning progress if student ID is present
-            if student_id := document.metadata.get('student_id'):
-                await self.feedback_processor.update_learning_progress(
-                    student_id=student_id,
-                    topic=document.metadata.get('topic'),
-                    performance=feedback.get('performance_metrics')
+            # Only process if document has educational content
+            if 'standards' in document.doc_info:
+                feedback = await self.feedback_processor.process(
+                    document.content,
+                    document.doc_info.get('standards', {})
                 )
-        
-        self._record_metrics(document, ProcessingMetrics(
-            processing_time=timer.elapsed,
-            feedback_generated=bool(feedback),
-            learning_progress_updated=bool(student_id)
-        ))
-        return document
+                
+                # Add feedback to document
+                document.doc_info['feedback'] = feedback
+            
+            # Record metrics
+            self._record_metrics(document, ProcessingMetrics(
+                processing_time=timer.elapsed,
+                token_count=len(str(document.content)) if document.content else 0
+            ))
+            
+            return document
 
 class Pipeline:
     """RAG pipeline implementation."""
@@ -430,6 +447,17 @@ class Pipeline:
             
             # Initialize logger
             self.logger = logging.getLogger(__name__)
+            
+            # Add request batching configuration
+            self.request_config = {
+                'batch_size': config.get('batch_size', 5),
+                'buffer_time': config.get('buffer_time', 5),
+                'max_retries': config.get('max_retries', 3)
+            }
+            
+            # Initialize request tracking
+            self.last_request_time = 0
+            self.current_batch = []
             
             # Initialize components
             self._init_stages()
@@ -509,7 +537,7 @@ class Pipeline:
             
             # Test model availability
             try:
-                model_name = model_config.get('model_name', 'qwen2.5')  # Default to qwen2.5 if not specified
+                model_name = model_config.get('model_name', 'deepseek-r1:32b')  # Default to qwen2.5 if not specified
                 self.llm.chat(
                     model=model_name,
                     messages=[{'role': 'system', 'content': 'Test connection'}]
@@ -535,24 +563,45 @@ class Pipeline:
             self.db_connection.close()
         
     def _create_document(self, source: Union[str, Path, bytes], modality: ContentModality, options: Optional[Dict[str, Any]] = None) -> Document:
-        """Create a document instance with proper schema mapping."""
-        options = options or {}
+        """Create a document object from source.
         
-        # Generate title from source if it's a path
-        title = str(Path(source).stem) if isinstance(source, (str, Path)) else "Untitled Document"
-        
-        return Document(
-            title=title,
-            source=str(source) if isinstance(source, Path) else None,
-            content_type=modality.value,  # Assuming ContentModality is an Enum
-            doc_info={
-                "content": source if isinstance(source, (str, bytes)) else None,
-                "modality": modality.value,
-                "processing_options": options,
-                "status": "pending",
-                **options  # Include any additional metadata
-            },
-        )
+        Args:
+            source: Source content (file path, raw bytes, etc.)
+            modality: Content modality
+            options: Additional options
+            
+        Returns:
+            Document object
+        """
+        try:
+            # Handle file path
+            if isinstance(source, (str, Path)) and Path(source).exists():
+                try:
+                    with open(source, 'rb') as f:
+                        content = f.read()
+                    source_path = str(source)
+                    self.logger.debug(f"Successfully read file: {source}")
+                except Exception as e:
+                    self.logger.error(f"Failed to read file {source}: {str(e)}")
+                    raise
+            # Handle raw content
+            else:
+                content = source
+                source_path = options.get('file_path', 'unknown') if options else 'unknown'
+            
+            # Create document with required fields
+            document = Document(
+                content=content,  # This must be the actual content (bytes or string)
+                source=str(source_path),  # Must be a string
+                modality=modality,
+                doc_info={'options': options or {}}
+            )
+            
+            return document
+            
+        except Exception as e:
+            self.logger.error(f"Document creation failed: {str(e)}")
+            raise
 
     async def process_document(
         self,
@@ -560,77 +609,49 @@ class Pipeline:
         modality: Optional[ContentModality] = None,
         options: Optional[Dict[str, Any]] = None
     ) -> Document:
-        """Process document through pipeline stages.
-        
-        Args:
-            source: Either a file path (str), raw content (bytes), or Document object
-            modality: Content modality (PDF, TEXT, etc.)
-            options: Additional processing options
-            
-        Returns:
-            Processed Document object
-        """
+        """Process a document through the pipeline with batching support."""
         try:
-            # If source is already a Document object, use it directly
-            if isinstance(source, Document):
-                document = source
-                self.logger.debug(f"Using provided Document object with ID: {document.id}")
-                
-                # Update with any new options if provided
-                if options:
-                    document.doc_info.update({'options': options})
-                
-                # Update modality if provided
-                if modality and not document.modality:
-                    document.modality = modality
+            # Create document if needed
+            if not isinstance(source, Document):
+                if modality is None:
+                    if isinstance(source, bytes):
+                        modality = ContentModality.BINARY
+                    elif isinstance(source, str) and Path(source).exists():
+                        modality = self._detect_modality(source)
+                    else:
+                        modality = ContentModality.TEXT
+                document = self._create_document(source, modality, options)
             else:
-                # Handle file path or raw content
-                content = None
-                source_path = None
+                document = source
+                # Ensure document has required fields
+                if not document.content:
+                    raise ValueError("Document must have content")
+                if not document.source:
+                    document.source = "unknown"
+                if not document.modality:
+                    document.modality = modality or ContentModality.UNKNOWN
+
+            # Process through stages with batching
+            for stage_key, stage in self.stages.items():
+                # Pass batching config to extractors
+                if isinstance(stage, ExtractionStage):
+                    for extractor in stage.extractors:
+                        if hasattr(extractor, 'batch_config'):
+                            extractor.batch_config.update(self.request_config)
                 
-                # Case 1: Source is a file path
-                if isinstance(source, str) and Path(source).exists():
-                    try:
-                        with open(source, 'rb') as f:
-                            content = f.read()
-                        source_path = source
-                        self.logger.debug(f"Successfully read file: {source}")
-                        self.logger.debug(f"Content size: {len(content)} bytes")
-                    except Exception as e:
-                        self.logger.error(f"Failed to read file {source}: {str(e)}")
-                        raise
-                # Case 2: Source is raw content
-                else:
-                    content = source
-                    source_path = options.get('file_path') if options else None
-                    self.logger.debug(f"Using provided content directly")
+                document = await stage.process(document)
                 
-                # Create document object with required fields
-                document = Document(
-                    content=content,
-                    source=source_path,
-                    modality=modality,
-                    doc_info={'options': options or {}}
-                )
-                self.logger.debug(f"Created new Document object with ID: {document.id}")
-            
-            # Process through stages
-            for stage in ProcessingStage:
-                if stage in self.stages:
-                    try:
-                        self.logger.debug(f"Starting stage: {stage}")
-                        document = await self.stages[stage].process(document)
-                        self.logger.debug(f"Completed stage: {stage}")
-                    except Exception as e:
-                        self.logger.error(f"Stage {stage} failed: {str(e)}")
-                        self.logger.error(f"Document state at failure: ID={document.id}, stage={stage}")
-                        raise
-                        
+                # Record metrics after each stage
+                if isinstance(stage, PipelineStage):
+                    stage._record_metrics(document, stage.metrics)
+
+            # Cache processed document
+            await self._cache_document(document)
+
             return document
-            
+
         except Exception as e:
-            self.logger.error(f"Pipeline processing failed: {str(e)}")
-            self.logger.error(f"Full error details:", exc_info=True)
+            self.logger.error(f"Document processing failed: {str(e)}")
             raise
 
     async def generate_response(
@@ -639,59 +660,75 @@ class Pipeline:
         context: Optional[Dict[str, Any]] = None,
         options: Optional[Dict[str, Any]] = None
     ) -> GenerationResult:
-        """
-        Generate a response using RAG.
-        
-        Args:
-            query: User query
-            context: Additional context
-            options: Generation options
-            
-        Returns:
-            Generation result
-        """
+        """Generate a response using RAG with rate limiting."""
         try:
-            model_config = self.config.get('model', {})
-            model_name = model_config.get('model_name', 'qwen2.5')  # Default to qwen2.5 if not specified
+            # Apply rate limiting
+            current_time = time.time()
+            time_since_last = current_time - self.last_request_time
+            if time_since_last < self.request_config['buffer_time']:
+                await asyncio.sleep(self.request_config['buffer_time'] - time_since_last)
             
-            response = self.llm.chat(
-                model=model_name,
-                messages=[
-                    {
-                        'role': 'system',
-                        'content': self.prompt_generator.generate_system_prompt(context)
-                    },
-                    {
-                        'role': 'user',
-                        'content': query
-                    }
-                ]
-            )
+            model_config = self.config.get('model', {})
+            model_name = model_config.get('model_name', 'deepseek-r1:32b')
+            
+            # Make the API request with retries
+            max_retries = self.request_config['max_retries']
+            retry_count = 0
+            
+            while retry_count < max_retries:
+                try:
+                    response = await self.llm.chat(
+                        model=model_name,
+                        messages=[
+                            {
+                                'role': 'system',
+                                'content': self.prompt_generator.generate_system_prompt(context)
+                            },
+                            {
+                                'role': 'user',
+                                'content': query
+                            }
+                        ]
+                    )
+                    
+                    self.last_request_time = time.time()
+                    break
+                    
+                except Exception as e:
+                    retry_count += 1
+                    if "429" in str(e) or "rate limit" in str(e).lower():
+                        if retry_count == max_retries:
+                            raise
+                        await asyncio.sleep(self.request_config['buffer_time'] * (2 ** retry_count))
+                        continue
+                    raise
+            
             return GenerationResult(
                 text=response.message.content,
                 chunks_used=[],
-                confidence_score=0.9,  # TODO: Implement confidence scoring
+                confidence_score=0.9,
                 metadata={
                     "query": query,
-                    "context": context,
-                    "options": options,
-                    "educational_feedback": None,
-                    "standards_alignment": self._get_standards_alignment(
-                        response.message.content,
-                        context.get('grade_level') if context else None
-                    )
+                    "model": model_name,
+                    "timestamp": datetime.now().isoformat()
                 }
             )
             
         except Exception as e:
-            logger.error(f"Response generation failed: {str(e)}")
+            self.logger.error(f"Response generation failed: {str(e)}")
             raise
     
     async def _cache_document(self, document: Document):
-        """Cache document state."""
-        await self.cache.set(f"doc:{document.id}", document)
-        if document.embeddings:
-            await self.vector_cache.set(document.id, document.embeddings)
+        """Cache processed document."""
+        if self.cache:
+            await self.cache.set(
+                f"doc:{document.id}", 
+                document, 
+                modality=document.modality.value if document.modality else "unknown"
+            )
+            self.logger.debug(f"Document cached: {document.id}")
+        else:
+            self.logger.debug(f"Document not cached (cache disabled): {document.id}")
     
     async def _retrieve_chunks(
         self,
@@ -749,7 +786,7 @@ class Pipeline:
             )
 
             # Cache results
-            await self.cache.set(cache_key, final_results)
+            await self.cache.set(cache_key, final_results, modality="search_results")
             
             return final_results
 
@@ -972,3 +1009,31 @@ class Pipeline:
         except Exception as e:
             logger.error(f"Processing failed: {str(e)}")
             raise 
+
+    def _detect_modality(self, source: Union[str, Path]) -> ContentModality:
+        """Detect content modality from file extension."""
+        if isinstance(source, str):
+            source = Path(source)
+            
+        ext = source.suffix.lower()
+        
+        if ext in ['.pdf']:
+            return ContentModality.PDF
+        elif ext in ['.txt', '.md', '.rst']:
+            return ContentModality.TEXT
+        elif ext in ['.jpg', '.jpeg', '.png', '.gif', '.bmp']:
+            return ContentModality.IMAGE
+        elif ext in ['.mp4', '.avi', '.mov', '.wmv']:
+            return ContentModality.VIDEO
+        elif ext in ['.mp3', '.wav', '.ogg', '.flac']:
+            return ContentModality.AUDIO
+        elif ext in ['.doc', '.docx']:
+            return ContentModality.DOCX
+        elif ext in ['.ppt', '.pptx']:
+            return ContentModality.PPTX
+        elif ext in ['.xls', '.xlsx']:
+            return ContentModality.XLSX
+        elif ext in ['.html', '.htm']:
+            return ContentModality.HTML
+        else:
+            return ContentModality.UNKNOWN 

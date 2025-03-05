@@ -62,6 +62,7 @@ import cv2  # For diagram / image analysis
 from src.utils.file_utils import get_project_base_directory
 import statistics
 import time
+import asyncio
 
 # Check if OpenCV is available
 try:
@@ -150,6 +151,12 @@ class PDFExtractor(BaseExtractor):
             'line_spacing': 1.2,
             'row_tolerance': 5,
             'char_spacing': 0.1,
+            'request_batching': {
+                'enabled': True,
+                'batch_size': 5,  # Number of requests to batch together
+                'buffer_time': 5,  # Seconds to wait between batches
+                'max_retries': 3   # Maximum number of retries for failed requests
+            },
             'table_extraction': {
                 'method': 'auto',
                 'strategy': 'adaptive',
@@ -165,7 +172,7 @@ class PDFExtractor(BaseExtractor):
                     'scanned': 'tabula'
                 }
             },
-            'use_ocr': False,  # If True, we will initialize an OCR instance.
+            'use_ocr': False,
             'enhance_resolution': False,
             'preserve_layout': True,
             'diagram_detection': {
@@ -176,7 +183,7 @@ class PDFExtractor(BaseExtractor):
             },
             'acceleration': {
                 'num_threads': 8,
-                'device': 'mps'  # 'auto', 'cuda', 'mps', 'cpu'
+                'device': 'mps'
             }
         }
 
@@ -185,48 +192,225 @@ class PDFExtractor(BaseExtractor):
 
         super().__init__(config=default_config)
         self._init_components()
-        self.base_font_size = 12.0  # Updated during processing
+        self.base_font_size = 12.0
 
-        # Determine device for acceleration
+        # Initialize request batching and rate limiting
+        self.batch_config = default_config.get('request_batching', {})
+        self.request_queue = []
+        self.last_request_time = 0
+        self.current_batch = []
+        
+        # Device setup
         self.device = self._get_device_from_config()
-        
-        # Initialize OCR if requested
         self.ocr = self._init_ocr()
-        
-        # # Check for Ghostscript if Camelot is available
-        # if HAS_CAMELOT:
-        #     if not self._check_ghostscript_installed():
-        #         self.logger.warning("Ghostscript is not installed, which is required for Camelot table extraction. "
-        #                            "You can install it using the instructions here: "
-        #                            "https://camelot-py.readthedocs.io/en/master/user/install-deps.html")
-        #         self.logger.warning("Table extraction will fall back to alternative methods.")
 
-        # Initialize Docling extractor with acceleration and picture annotation support
+    async def _process_request_batch(self, batch):
+        """Process a batch of requests with rate limiting."""
+        import time
+        import asyncio
+        from concurrent.futures import ThreadPoolExecutor
+        
+        results = []
+        
+        for request in batch:
+            # Check if we need to wait before making the next request
+            current_time = time.time()
+            time_since_last_request = current_time - self.last_request_time
+            
+            if time_since_last_request < self.batch_config.get('buffer_time', 5):
+                wait_time = self.batch_config.get('buffer_time', 5) - time_since_last_request
+                await asyncio.sleep(wait_time)
+            
+            # Process the request with retries
+            max_retries = self.batch_config.get('max_retries', 3)
+            retry_count = 0
+            
+            while retry_count < max_retries:
+                try:
+                    # Execute the request function with its arguments
+                    func, args, kwargs = request
+                    if asyncio.iscoroutinefunction(func):
+                        result = await func(*args, **kwargs)
+                    else:
+                        # Run synchronous functions in a thread pool
+                        with ThreadPoolExecutor() as executor:
+                            result = await asyncio.get_event_loop().run_in_executor(
+                                executor, func, *args, **kwargs
+                            )
+                    
+                    results.append(result)
+                    self.last_request_time = time.time()
+                    break
+                    
+                except Exception as e:
+                    retry_count += 1
+                    if "429" in str(e) or "rate limit" in str(e).lower():
+                        # Handle rate limiting by switching to fallback API
+                        if self._switch_to_fallback_api():
+                            self.logger.info("Switched to fallback API after rate limit")
+                            continue
+                    
+                    if retry_count == max_retries:
+                        self.logger.error(f"Request failed after {max_retries} retries: {str(e)}")
+                        raise
+                    
+                    # Wait before retrying
+                    await asyncio.sleep(self.batch_config.get('buffer_time', 5))
+            
+        return results
+
+    async def _add_to_batch(self, func, *args, **kwargs):
+        """Add a request to the batch queue."""
+        self.current_batch.append((func, args, kwargs))
+        
+        # Process batch if it reaches the configured size
+        if len(self.current_batch) >= self.batch_config.get('batch_size', 5):
+            results = await self._process_request_batch(self.current_batch)
+            self.current_batch = []
+            return results
+        
+        return None
+
+    async def _flush_batch(self):
+        """Process any remaining requests in the current batch."""
+        if self.current_batch:
+            results = await self._process_request_batch(self.current_batch)
+            self.current_batch = []
+            return results
+        return []
+
+    async def _process_image_with_gemini(self, image_bytes: bytes) -> Tuple[str, str]:
+        """Process image with Gemini Vision API using batching and rate limiting."""
+        if self.batch_config.get('enabled', True):
+            results = await self._add_to_batch(self._gemini_process_single_image, image_bytes)
+            if results is not None:
+                return results[0]  # Return the first result since we're only processing one image
+            return None  # Will be processed later when batch is full or flushed
+        else:
+            # Process immediately if batching is disabled
+            return await self._gemini_process_single_image(image_bytes)
+
+    async def _gemini_process_single_image(self, image_bytes: bytes) -> Tuple[str, str]:
+        """Process a single image with Gemini Vision API."""
         try:
-            from ..extractors.docling_extractor import DoclingExtractor
-            picture_config = default_config.get('picture_annotation', {})
+            import google.generativeai as genai
+            import base64
             
-            # Determine if remote services should be enabled
-            enable_remote = picture_config.get('enable_remote_services', True)
+            # Encode image to base64
+            image_b64 = base64.b64encode(image_bytes).decode('utf-8')
             
-            self.docling = DoclingExtractor(
-                offline_mode=config.get('offline_mode', False),
-                artifacts_path=config.get('artifacts_path'),
-                model_type=picture_config.get('model_type', 'local'),
-                model_name=picture_config.get('model_name', 
-                    'ibm-granite/granite-vision-3.1-2b-preview'),
-                image_scale=picture_config.get('image_scale', 2.0),
-                picture_prompt=picture_config.get('prompt', 
-                    "Describe the image in three sentences. Be concise and accurate."),
-                api_config=picture_config.get('api_config'),
-                num_threads=default_config['acceleration'].get('num_threads', 8),
-                enable_remote_services=enable_remote  # Explicitly enable remote services
+            # Prepare the request
+            prompt = "Analyze this image and provide: 1) A detailed description 2) The type of diagram or visual content"
+            
+            # Make the API request
+            response = await self.gemini_image_processor.generate_content(
+                [prompt, {"mime_type": "image/jpeg", "data": image_b64}],
+                generation_config=self.gemini_generation_config
             )
-            self.has_docling = True
-            self.logger.info(f"Docling extraction initialized successfully on {self.device} with remote services {'enabled' if enable_remote else 'disabled'}")
-        except ImportError:
-            self.has_docling = False
-            self.logger.warning("Docling not available, falling back to default extraction")
+            
+            # Process response
+            if response and response.text:
+                # Extract description and diagram type from response
+                description = response.text
+                diagram_type = self._determine_diagram_type(description)
+                return description, diagram_type
+                
+            return "", DiagramType.UNKNOWN.value
+            
+        except Exception as e:
+            self.logger.error(f"Error processing image with Gemini: {str(e)}")
+            if "429" in str(e) or "rate limit" in str(e).lower():
+                raise  # Let the batch processor handle rate limiting
+            return "", DiagramType.UNKNOWN.value
+
+    async def extract(self, document: 'Document') -> 'Document':
+        """Main extraction method with batching support."""
+        try:
+            # Initialize components if not already initialized
+            if not hasattr(self, '_components_initialized') or not self._components_initialized:
+                self._init_components()
+                self._components_initialized = True
+            
+            # Get the PDF content
+            if isinstance(document.content, bytes):
+                pdf_bytes = document.content
+            elif isinstance(document.source, str) and os.path.exists(document.source):
+                with open(document.source, 'rb') as f:
+                    pdf_bytes = f.read()
+            else:
+                raise ValueError("Document must have either content bytes or a valid source file path")
+            
+            # Create a temporary file to work with
+            with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as temp_file:
+                temp_path = temp_file.name
+                temp_file.write(pdf_bytes)
+            
+            try:
+                # Open the PDF with PyMuPDF
+                doc = fitz.open(temp_path)
+                
+                # Extract metadata
+                metadata = self._extract_pdf_metadata(doc)
+                document.doc_info.update(metadata)
+                
+                # Check if scanned
+                is_scanned = self._check_if_scanned(doc)
+                document.doc_info['is_scanned'] = is_scanned
+                
+                # Extract text content
+                text_content = []
+                for page_num, page in enumerate(doc):
+                    text = page.get_text()
+                    text_content.append(text)
+                
+                # Extract tables if present
+                tables = self.extract_tables(doc, temp_path)
+                if tables:
+                    document.doc_info['tables'] = tables
+                
+                # Set the extracted content
+                document.content = "\n\n".join(text_content)
+                document.doc_info['page_count'] = len(doc)
+                
+                # Add cross-references
+                self._add_cross_references(document)
+                
+                # Extract layout information if available
+                if self.has_layout_recognition:
+                    # Determine which layout engine is being used
+                    layout_engine = self.config.get('layout', {}).get('engine', 'gemini').lower()
+                    
+                    if layout_engine == 'spacy':
+                        # Use spaCy layout
+                        layout_info = await self._extract_layout_with_spacy(temp_path)
+                        if layout_info:
+                            document.doc_info['layout'] = layout_info
+                            
+                            # If markdown is available, add it to the document
+                            if layout_info.get('markdown'):
+                                document.doc_info['markdown'] = layout_info['markdown']
+                                
+                            # Add tables from layout if not already extracted
+                            if layout_info.get('tables') and not document.doc_info.get('tables'):
+                                document.doc_info['tables'] = layout_info['tables']
+                    else:
+                        # Use existing layout recognition (Gemini or LayoutLMv3)
+                        # This would be implemented in a separate method if needed
+                        pass
+                
+                # Flush any remaining batched requests
+                await self._flush_batch()
+                
+                return document
+                
+            finally:
+                # Clean up the temporary file
+                if os.path.exists(temp_path):
+                    os.unlink(temp_path)
+            
+        except Exception as e:
+            self.logger.error(f"Extraction failed: {str(e)}")
+            raise
 
     def _init_components(self):
         """Initialize sub-components for layout recognition and device settings."""
@@ -302,14 +486,15 @@ class PDFExtractor(BaseExtractor):
     def _init_layout_recognizer(self):
         """Initialize layout recognition capabilities."""
         try:
-            from ..core.vision.recognizer import Recognizer
-
             # Get layout config from PDF section
             pdf_config = self.config
             layout_config = pdf_config.get('layout', {})
             
+            # Determine which layout engine to use
+            layout_engine = layout_config.get('engine', 'gemini').lower()
+            
             # If API key not in layout config, try to get from model config
-            if not layout_config.get('api_key'):
+            if layout_engine in ['gemini', 'layoutlmv3'] and not layout_config.get('api_key'):
                 model_config = self.config.get('model', {})
                 # Try Gemini API key first, then fallback to other options
                 layout_config['api_key'] = (
@@ -317,30 +502,75 @@ class PDFExtractor(BaseExtractor):
                     model_config.get('api_key')
                 )
 
-            if not layout_config.get('api_key'):
-                raise ValueError("No API key found in configuration for layout recognition")
-
             # Get device from config or use system default
             device = layout_config.get('device') or self.config.get('acceleration', {}).get('device', 'cpu')
-
-            self.layout_recognizer = Recognizer(
-                model_type=layout_config.get('model_type', 'gemini'),  # Default to Gemini
-                model_name=layout_config.get('model_name', 'gemini-pro-vision'),  # Use Gemini Pro Vision by default
-                api_key=layout_config['api_key'],
-                device=device,
-                batch_size=layout_config.get('batch_size', 32),
-                cache_dir=layout_config.get('cache_dir'),
-                confidence=layout_config.get('confidence', 0.5),
-                merge_boxes=layout_config.get('merge_boxes', True),
-                label_list=layout_config.get('label_list', [
-                    "title", "text", "list", "table", "figure",
-                    "header", "footer", "sidebar", "caption"
-                ]),
-                task_name=layout_config.get('task_name', 'document_layout'),
-                ollama_host=layout_config.get('ollama_host', 'http://localhost:11434')
-            )
-            self.has_layout_recognition = True
-            self.logger.info("Layout recognition initialized successfully with Gemini Vision")
+            
+            if layout_engine == 'spacy':
+                # Initialize SpaCyLayoutRecognizer
+                from ..core.vision.spacy_layout_recognizer import SpaCyLayoutRecognizer
+                
+                self.layout_recognizer = SpaCyLayoutRecognizer(
+                    model_name=layout_config.get('spacy_model', 'en_core_web_sm'),
+                    device=device,
+                    batch_size=layout_config.get('batch_size', 32),
+                    cache_dir=layout_config.get('cache_dir'),
+                    confidence_threshold=layout_config.get('confidence', 0.5),
+                    merge_boxes=layout_config.get('merge_boxes', True),
+                    label_list=layout_config.get('label_list', [
+                        "title", "text", "list", "table", "figure",
+                        "header", "footer", "sidebar", "caption"
+                    ])
+                )
+                self.has_layout_recognition = True
+                self.logger.info("Layout recognition initialized successfully with SpaCy Layout")
+                
+            elif layout_engine == 'layoutlmv3':
+                # Initialize LayoutLMv3-based recognizer
+                from ..core.vision.layout_recognizer import LayoutRecognizer
+                
+                if not layout_config.get('api_key'):
+                    raise ValueError("No API key found in configuration for LayoutLMv3 layout recognition")
+                
+                self.layout_recognizer = LayoutRecognizer(
+                    model_name=layout_config.get('model_name', 'Kwan0/layoutlmv3-base-finetune-DocLayNet-100k'),
+                    device=device,
+                    batch_size=layout_config.get('batch_size', 32),
+                    cache_dir=layout_config.get('cache_dir'),
+                    confidence_threshold=layout_config.get('confidence', 0.5),
+                    merge_boxes=layout_config.get('merge_boxes', True),
+                    label_list=layout_config.get('label_list', [
+                        "title", "text", "list", "table", "figure",
+                        "header", "footer", "sidebar", "caption"
+                    ])
+                )
+                self.has_layout_recognition = True
+                self.logger.info("Layout recognition initialized successfully with LayoutLMv3")
+                
+            else:
+                # Default to Gemini Vision API
+                from ..core.vision.recognizer import Recognizer
+                
+                if not layout_config.get('api_key'):
+                    raise ValueError("No API key found in configuration for Gemini layout recognition")
+                
+                self.layout_recognizer = Recognizer(
+                    model_type=layout_config.get('model_type', 'gemini'),  # Default to Gemini
+                    model_name=layout_config.get('model_name', 'gemini-pro-vision'),  # Use Gemini Pro Vision by default
+                    api_key=layout_config['api_key'],
+                    device=device,
+                    batch_size=layout_config.get('batch_size', 32),
+                    cache_dir=layout_config.get('cache_dir'),
+                    confidence=layout_config.get('confidence', 0.5),
+                    merge_boxes=layout_config.get('merge_boxes', True),
+                    label_list=layout_config.get('label_list', [
+                        "title", "text", "list", "table", "figure",
+                        "header", "footer", "sidebar", "caption"
+                    ]),
+                    task_name=layout_config.get('task_name', 'document_layout'),
+                    ollama_host=layout_config.get('ollama_host', 'http://localhost:11434')
+                )
+                self.has_layout_recognition = True
+                self.logger.info("Layout recognition initialized successfully with Gemini Vision")
 
         except Exception as e:
             self.logger.warning(f"Layout recognition not available: {str(e)}")
@@ -492,701 +722,6 @@ class PDFExtractor(BaseExtractor):
                 return 'cpu'
                 
         return device
-
-    async def extract(self, document: 'Document') -> 'Document':
-        """
-        Main extraction method that orchestrates the entire PDF extraction process.
-        
-        Args:
-            document: Document object containing PDF content or path
-            
-        Returns:
-            Document: Processed document with extracted content and metadata
-        """
-        try:
-            # Convert document content to bytes if it's a file path
-            content = document.content
-            if isinstance(content, str):
-                with open(content, 'rb') as f:
-                    content = f.read()
-            
-            # Open PDF from binary content
-            doc = fitz.open(stream=content, filetype="pdf")
-            
-            # Extract text using Docling if available
-            if self.has_docling:
-                try:
-                    docling_result = self.docling.process_file(content)
-                    if docling_result.success:
-                        document.content = docling_result.text
-                    else:
-                        self.logger.warning(f"Docling extraction failed: {docling_result.error}")
-                        # Fall back to default text extraction
-                        document.content = self._extract_structured_text(doc, {})
-                except Exception as e:
-                    self.logger.warning(f"Docling extraction failed with exception: {str(e)}")
-                    # Fall back to default text extraction
-                    document.content = self._extract_structured_text(doc, {})
-            else:
-                # Use default text extraction
-                document.content = self._extract_structured_text(doc, {})
-            
-            # Extract tables using voting/adaptive approach
-            try:
-                tables = self._extract_tables_with_structure(doc)
-                if tables:
-                    document.doc_info['tables'] = tables
-                    
-                    # Add table context and references
-                    for table in tables:
-                        if 'region' in table:
-                            table['context'] = self._get_table_context(doc[table.get('page', 1) - 1], table['region'])
-            except Exception as e:
-                self.logger.warning(f"Table extraction failed: {str(e)}")
-                document.doc_info['tables'] = []
-            
-            # Extract and analyze images/diagrams with enhanced context
-            try:
-                images = self._extract_images_with_context(doc)
-                if images:
-                    document.doc_info['images'] = images
-                    # Separate diagrams from regular images
-                    diagrams = [img for img in images if img['metadata'].get('is_diagram')]
-                    if diagrams:
-                        document.doc_info['diagrams'] = diagrams
-            except Exception as e:
-                self.logger.warning(f"Image extraction failed: {str(e)}")
-                document.doc_info['images'] = []
-            
-            # Add metadata
-            document.doc_info['metadata'] = self._extract_pdf_metadata(doc)
-            
-            # Add cross-references
-            self._add_cross_references(document)
-            
-            # Check if document is scanned
-            document.doc_info['is_scanned'] = self._check_if_scanned(doc)
-            
-            # Close the document
-            doc.close()
-            
-            return document
-            
-        except Exception as e:
-            self.logger.error(f"PDF extraction failed: {str(e)}")
-            raise
-
-    def _process_document_structure(self, doc: fitz.Document) -> Dict[str, Any]:
-        """Process document structure and hierarchy for headings, layout info, etc."""
-        structure = {
-            'hierarchy': [],
-            'page_layouts': [],
-            'content_map': {}
-        }
-
-        for page_num, page in enumerate(doc):
-            layout = self._analyze_page_layout(page)
-            structure['page_layouts'].append(layout)
-
-            # Build content hierarchy from recognized headings / titles
-            for element in layout:
-                if element.type in ['title', 'subtitle', 'heading']:
-                    structure['hierarchy'].append({
-                        'text': element.text,
-                        'level': self._determine_heading_level(element),
-                        'page': page_num + 1
-                    })
-        return structure
-
-    def _determine_heading_level(self, element: LayoutElement) -> int:
-        """
-        Dummy function: infer heading level from font size, boldness, or heuristics.
-        For real usage, expand logic as needed.
-        """
-        # Example: large font => level 1, medium => level 2, else => 3+ etc.
-        if element.font_size >= self.base_font_size * 1.4:
-            return 1
-        elif element.font_size >= self.base_font_size * 1.2:
-            return 2
-        else:
-            return 3
-
-    def _analyze_page_layout(self, page: fitz.Page) -> List[LayoutElement]:
-        """Analyze page layout to detect text, heading, title, etc."""
-        elements = []
-        page_dict = page.get_text("dict")
-        base_font_size = self._get_base_font_size(page_dict)
-
-        for block in page_dict.get('blocks', []):
-            if block.get('type') == 0:  # text block
-                element = self._process_text_block(block, base_font_size)
-                if element:
-                    elements.append(element)
-
-        # Possibly merge or further refine elements. E.g. self._merge_related_elements(...)
-        elements = self._merge_related_elements(elements)
-        return elements
-
-    def _process_text_block(
-        self,
-        block: Dict[str, Any],
-        base_font_size: float
-    ) -> Optional[LayoutElement]:
-        """
-        Process a text block from PyMuPDF.
-        
-        Args:
-            block: Text block dictionary from PyMuPDF
-            base_font_size: Base font size for determining element type
-            
-        Returns:
-            LayoutElement or None if processing fails
-        """
-        try:
-            # Check if 'spans' key exists directly in the block
-            if 'spans' in block:
-                spans = block['spans']
-            # Check if 'lines' exists and contains 'spans'
-            elif 'lines' in block and block['lines'] and 'spans' in block['lines'][0]:
-                # Use the spans from the first line
-                spans = block['lines'][0]['spans']
-            else:
-                self.logger.warning(f"Text block missing 'spans' key: {block}")
-                return None
-                
-            # Get the first span for font information
-            if not spans:
-                return None
-                
-            # Extract text from all spans
-            text = ""
-            for s in spans:
-                text += s.get('text', '')
-            
-            # Get font information
-            font_info = spans[0]
-            font_size = font_info.get('size', 0)
-            
-            # Check if font is bold
-            font_name = font_info.get('font', '')
-            is_bold = False
-            
-            # Check if font_name is a string before using lower()
-            if isinstance(font_name, str):
-                is_bold = 'bold' in font_name.lower() or '-b' in font_name.lower()
-            
-            # Check if flags is iterable before checking if 'bold' is in it
-            flags = font_info.get('flags', 0)
-            if isinstance(flags, int):
-                # For integer flags, we can't use 'in' operator
-                # This might be a bitmask or other numeric representation
-                pass  # Handle according to your specific flag encoding
-            elif hasattr(flags, '__iter__'):  # Check if it's iterable
-                is_bold = is_bold or 'bold' in flags
-            
-            # Determine element type (heading, title, normal text...)
-            element_type = self._determine_element_type(font_size, base_font_size, is_bold)
-            
-            # Create layout element
-            return LayoutElement(
-                type=element_type,
-                text=text,
-                bbox=block['bbox'],
-                font_size=font_size,
-                font_name=font_info.get('font', ''),
-                is_bold=is_bold
-            )
-        except Exception as e:
-            self.logger.warning(f"Error processing text block: {str(e)}")
-            return None
-
-    def _determine_element_type(
-        self, font_size: float, base_font_size: float, is_bold: bool
-    ) -> str:
-        if font_size >= base_font_size * 1.5:
-            return 'title'
-        elif font_size >= base_font_size * 1.2 or (font_size > base_font_size and is_bold):
-            return 'subtitle'
-        elif is_bold:
-            return 'heading'
-        else:
-            return 'text'
-
-    def _get_base_font_size(self, page_dict: Dict[str, Any]) -> float:
-        """
-        Calculate the median font size on a page to establish a baseline for
-        determining element types.
-        """
-        font_sizes = []
-        for block in page_dict.get('blocks', []):
-            if block.get('type') == 0:  # text block
-                # Check if 'spans' key exists directly in the block
-                if 'spans' in block and block['spans']:
-                    for span in block['spans']:
-                        if 'size' in span:
-                            font_sizes.append(span['size'])
-                # Check if 'lines' exists and contains 'spans'
-                elif 'lines' in block and block['lines']:
-                    for line in block['lines']:
-                        if 'spans' in line and line['spans']:
-                            for span in line['spans']:
-                                if 'size' in span:
-                                    font_sizes.append(span['size'])
-        
-        if not font_sizes:
-            return 11.0  # Default font size if none found
-        
-        return statistics.median(font_sizes)
-
-    def _merge_related_elements(self, elements: List[LayoutElement]) -> List[LayoutElement]:
-        """Heuristic to combine adjacent text blocks of the same type, etc."""
-        merged = []
-        if not elements:
-            return merged
-
-        current = elements[0]
-        for elem in elements[1:]:
-            if self._should_merge_elements(current, elem):
-                # Concatenate text, update bounding box if needed, etc.
-                combined_text = current.text + " " + elem.text
-                new_bbox = (
-                    min(current.bbox[0], elem.bbox[0]),
-                    min(current.bbox[1], elem.bbox[1]),
-                    max(current.bbox[2], elem.bbox[2]),
-                    max(current.bbox[3], elem.bbox[3]),
-                )
-                current = LayoutElement(
-                    type=current.type,
-                    text=combined_text,
-                    bbox=new_bbox,
-                    font_size=(current.font_size + elem.font_size) / 2.0,
-                    font_name=current.font_name,
-                    is_bold=(current.is_bold or elem.is_bold)
-                )
-            else:
-                merged.append(current)
-                current = elem
-        merged.append(current)
-        return merged
-
-    def _should_merge_elements(self, e1: LayoutElement, e2: LayoutElement) -> bool:
-        """Example heuristic: same type, overlap, close in vertical space, etc."""
-        if e1.type != e2.type:
-            return False
-        vertical_gap = e2.bbox[1] - e1.bbox[3]
-        if abs(vertical_gap) < self.config['merge_tolerance'] * 10:
-            return True
-        return False
-
-    def _extract_structured_text(self, doc: fitz.Document, structure: Dict[str, Any]) -> str:
-        """
-        Simple aggregator that joins recognized text blocks from the structure.
-        A real implementation might produce a more advanced layout/JSON, etc.
-        
-        If structure is empty or doesn't contain page_layouts, falls back to basic text extraction.
-        """
-        # Check if structure has page_layouts
-        if not structure or 'page_layouts' not in structure:
-            # Fall back to basic text extraction
-            combined_text = []
-            for page_num in range(len(doc)):
-                page = doc[page_num]
-                page_text = page.get_text().strip()
-                if page_text:
-                    combined_text.append(f"--- Page {page_num+1} ---\n{page_text}")
-            return "\n\n".join(combined_text)
-        
-        # Process structured layout if available
-        combined_text = []
-        for page_num, page_layout in enumerate(structure['page_layouts']):
-            page_text = []
-            for elem in page_layout:
-                if elem.type in ['text', 'heading', 'title', 'subtitle']:
-                    page_text.append(elem.text.strip())
-            if page_text:
-                combined_text.append(f"--- Page {page_num+1} ---\n" + "\n".join(page_text))
-        return "\n\n".join(combined_text)
-
-    def _extract_tables_with_structure(self, doc: fitz.Document) -> List[Dict[str, Any]]:
-        """
-        Extract tables from the document using the PDF path.
-        
-        Args:
-            doc: PyMuPDF document object
-            
-        Returns:
-            List of extracted tables with metadata
-        """
-        # Get the temporary file path
-        with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as temp_file:
-            pdf_path = temp_file.name
-            doc.save(pdf_path)
-        
-        try:
-            # Extract tables using the unified approach
-            return self.extract_tables(doc, pdf_path)
-        finally:
-            # Clean up the temporary file
-            if os.path.exists(pdf_path):
-                os.unlink(pdf_path)
-                
-    def _extract_images_with_context(self, doc: fitz.Document) -> List[Dict[str, Any]]:
-        """
-        Extract images from the document with contextual information.
-        
-        Args:
-            doc: PyMuPDF document object
-            
-        Returns:
-            List of extracted images with metadata and context
-        """
-        images = []
-        
-        try:
-            for page_num, page in enumerate(doc):
-                # Extract images from the page
-                image_list = page.get_images(full=True)
-                
-                for img_index, img_info in enumerate(image_list):
-                    try:
-                        xref = img_info[0]
-                        base_image = doc.extract_image(xref)
-                        
-                        if base_image:
-                            # Get image data
-                            image_bytes = base_image["image"]
-                            image_ext = base_image["ext"]
-                            
-                            # Get image position on page
-                            for img_rect in page.get_image_rects(xref):
-                                # Create image metadata
-                                image_data = {
-                                    'page': page_num + 1,
-                                    'index': img_index,
-                                    'bbox': [img_rect.x0, img_rect.y0, img_rect.x1, img_rect.y1],
-                                    'width': img_rect.width,
-                                    'height': img_rect.height,
-                                    'format': image_ext,
-                                    'size_bytes': len(image_bytes),
-                                    'context': self._get_image_context(page, img_rect),
-                                }
-                                
-                                # Process with Gemini if available
-                                if hasattr(self, 'gemini_image_processor') and self.gemini_image_processor:
-                                    try:
-                                        description, diagram_type = self._process_image_with_gemini(image_bytes)
-                                        image_data['description'] = description
-                                        image_data['metadata'] = {
-                                            'is_diagram': diagram_type != DiagramType.UNKNOWN.value,
-                                            'diagram_type': diagram_type
-                                        }
-                                    except Exception as e:
-                                        self.logger.warning(f"Gemini image processing failed: {str(e)}")
-                                        # Fall back to basic classification
-                                        image_data['metadata'] = {
-                                            'is_diagram': self._is_likely_diagram(image_bytes, image_ext),
-                                            'diagram_type': self._classify_diagram_type(image_bytes, image_ext) if self._is_likely_diagram(image_bytes, image_ext) else DiagramType.UNKNOWN.value
-                                        }
-                                else:
-                                    # Use basic classification
-                                    image_data['metadata'] = {
-                                        'is_diagram': self._is_likely_diagram(image_bytes, image_ext),
-                                        'diagram_type': self._classify_diagram_type(image_bytes, image_ext) if self._is_likely_diagram(image_bytes, image_ext) else DiagramType.UNKNOWN.value
-                                    }
-                                
-                                # Add base64 encoded image
-                                image_data['data'] = base64.b64encode(image_bytes).decode('utf-8')
-                                
-                                images.append(image_data)
-                    except Exception as e:
-                        self.logger.warning(f"Failed to extract image {img_index} on page {page_num+1}: {str(e)}")
-                        continue
-        except Exception as e:
-            self.logger.warning(f"Image extraction process failed: {str(e)}")
-            
-        return images
-    
-    def _get_image_context(self, page: fitz.Page, rect: fitz.Rect, context_range: int = 200) -> str:
-        """
-        Get the text context around an image.
-        
-        Args:
-            page: PyMuPDF page object
-            rect: Rectangle defining the image position
-            context_range: Range in points to consider for context
-            
-        Returns:
-            Text context around the image
-        """
-        # Expand the rectangle to include surrounding text
-        context_rect = fitz.Rect(
-            max(0, rect.x0 - context_range),
-            max(0, rect.y0 - context_range),
-            min(page.rect.width, rect.x1 + context_range),
-            min(page.rect.height, rect.y1 + context_range)
-        )
-        
-        # Get text in the expanded rectangle
-        return page.get_text("text", clip=context_rect).strip()
-    
-    def _is_likely_diagram(self, image_bytes: bytes, image_ext: str) -> bool:
-        """
-        Determine if an image is likely to be a diagram based on simple heuristics.
-        
-        Args:
-            image_bytes: Raw image data
-            image_ext: Image format extension
-            
-        Returns:
-            True if the image is likely a diagram, False otherwise
-        """
-        try:
-            # Convert image bytes to numpy array
-            image = Image.open(io.BytesIO(image_bytes))
-            img_array = np.array(image.convert('RGB'))
-            
-            # Simple heuristics for diagrams:
-            # 1. High percentage of white/light background
-            # 2. Limited color palette
-            # 3. Presence of straight lines/geometric shapes
-            
-            # Check for white/light background
-            is_light_background = np.mean(img_array) > 200
-            
-            # Check for limited color palette
-            colors = np.unique(img_array.reshape(-1, 3), axis=0)
-            limited_palette = len(colors) < 50
-            
-            return is_light_background and limited_palette
-        except Exception as e:
-            self.logger.warning(f"Diagram detection failed: {str(e)}")
-            return False
-    
-    def _classify_diagram_type(self, image_bytes: bytes, image_ext: str) -> str:
-        """
-        Classify the type of diagram if possible.
-        
-        Args:
-            image_bytes: Raw image data
-            image_ext: Image format extension
-            
-        Returns:
-            Diagram type as string
-        """
-        # If Gemini is available, use it for classification
-        if hasattr(self, 'gemini_image_processor') and self.gemini_image_processor:
-            try:
-                description, diagram_type = self._process_image_with_gemini(image_bytes)
-                if diagram_type:
-                    return diagram_type
-            except Exception as e:
-                self.logger.warning(f"Gemini diagram classification failed: {str(e)}")
-        
-        # This would ideally use a ML model for classification
-        # For now, return a default type
-        return DiagramType.UNKNOWN.value
-    
-    def _process_image_with_gemini(self, image_bytes: bytes) -> Tuple[str, str]:
-        """
-        Process an image using Gemini to get a description and classify the image type.
-        
-        Args:
-            image_bytes: Raw image data
-            
-        Returns:
-            Tuple of (description, diagram_type)
-        """
-        if not hasattr(self, 'gemini_image_processor') or self.gemini_image_processor is None:
-            self.logger.warning("Gemini image processor not initialized")
-            return "", DiagramType.UNKNOWN.value
-            
-        try:
-            import google.generativeai as genai
-            from PIL import Image
-            import time
-            
-            # Check if we should try switching back to primary API key after cooldown
-            current_time = time.time()
-            if (self.rate_limited and 
-                hasattr(self, 'last_rate_limit_time') and 
-                current_time - self.last_rate_limit_time > self.rate_limit_cooldown):
-                self.logger.info("Cooldown period elapsed, attempting to switch back to primary API key")
-                self._switch_to_primary_api()
-            
-            # Convert bytes to PIL Image
-            image = Image.open(io.BytesIO(image_bytes))
-            
-            # Prepare the prompt for image description
-            description_prompt = """
-            Describe this image in detail. If it's a diagram, chart, or technical illustration, 
-            explain what it represents and its key components. Be concise but thorough.
-            """
-            
-            # Prepare the prompt for image classification
-            classification_prompt = """
-            Classify this image into one of the following categories:
-            - chart
-            - graph
-            - scientific_diagram
-            - flowchart
-            - concept_map
-            - geometric_figure
-            - circuit_diagram
-            - chemical_structure
-            - mathematical_plot
-            - anatomical_diagram
-            - architectural_drawing
-            - historical_map
-            - unknown
-            
-            Return only the category name, nothing else.
-            """
-            
-            # Get description
-            try:
-                description_response = self.gemini_image_processor.generate_content(
-                    [description_prompt, image],
-                    generation_config=self.gemini_generation_config if hasattr(self, 'gemini_generation_config') else None
-                )
-                description = description_response.text.strip()
-            except Exception as e:
-                if "429" in str(e) or "Resource has been exhausted" in str(e):
-                    self.logger.warning(f"Rate limit hit for description generation: {str(e)}")
-                    # Try fallback
-                    if self._switch_to_fallback_api():
-                        # Retry with new API key
-                        try:
-                            description_response = self.gemini_image_processor.generate_content(
-                                [description_prompt, image],
-                                generation_config=self.gemini_generation_config
-                            )
-                            description = description_response.text.strip()
-                        except Exception as retry_e:
-                            self.logger.error(f"Fallback also failed for description: {str(retry_e)}")
-                            description = ""
-                    else:
-                        description = ""
-                else:
-                    self.logger.warning(f"Error generating description: {str(e)}")
-                    description = ""
-            
-            # Get classification
-            try:
-                classification_response = self.gemini_image_processor.generate_content(
-                    [classification_prompt, image],
-                    generation_config=self.gemini_generation_config if hasattr(self, 'gemini_generation_config') else None
-                )
-                classification = classification_response.text.strip().lower()
-            except Exception as e:
-                if "429" in str(e) or "Resource has been exhausted" in str(e):
-                    self.logger.warning(f"Rate limit hit for classification: {str(e)}")
-                    # Try fallback
-                    if self._switch_to_fallback_api():
-                        # Retry with new API key
-                        try:
-                            classification_response = self.gemini_image_processor.generate_content(
-                                [classification_prompt, image],
-                                generation_config=self.gemini_generation_config
-                            )
-                            classification = classification_response.text.strip().lower()
-                        except Exception as retry_e:
-                            self.logger.error(f"Fallback also failed for classification: {str(retry_e)}")
-                            classification = DiagramType.UNKNOWN.value
-                    else:
-                        classification = DiagramType.UNKNOWN.value
-                else:
-                    self.logger.warning(f"Error generating classification: {str(e)}")
-                    classification = DiagramType.UNKNOWN.value
-            
-            # Validate classification against DiagramType enum
-            valid_types = [t.value for t in DiagramType]
-            if classification not in valid_types:
-                classification = DiagramType.UNKNOWN.value
-                
-            return description, classification
-            
-        except Exception as e:
-            self.logger.warning(f"Image processing with Gemini failed: {str(e)}")
-            return "", DiagramType.UNKNOWN.value
-    
-    def _switch_to_fallback_api(self) -> bool:
-        """
-        Switch to the fallback API key and model when rate limited.
-        
-        Returns:
-            bool: True if successfully switched to fallback, False otherwise
-        """
-        import google.generativeai as genai
-        import time
-        
-        # If we're already using the secondary API key, no fallback available
-        if self.current_api_key == self.secondary_api_key:
-            self.logger.warning("Already using secondary API key, no further fallback available")
-            return False
-            
-        # Check if we have a secondary API key
-        if not hasattr(self, 'secondary_api_key') or not self.secondary_api_key:
-            self.logger.warning("No secondary API key available for fallback")
-            return False
-            
-        try:
-            self.logger.info("Switching to secondary API key and model due to rate limiting")
-            self.current_api_key = self.secondary_api_key
-            self.current_model_name = self.secondary_model_name
-            
-            # Configure Gemini with secondary API key
-            genai.configure(api_key=self.current_api_key)
-            
-            # Initialize new Gemini model with secondary model
-            self.gemini_image_processor = genai.GenerativeModel(self.current_model_name)
-            
-            # Update rate limit tracking
-            self.rate_limited = True
-            self.last_rate_limit_time = time.time()
-            
-            self.logger.info(f"Successfully switched to secondary model: {self.current_model_name}")
-            return True
-        except Exception as e:
-            self.logger.error(f"Failed to switch to secondary API key: {str(e)}")
-            return False
-    
-    def _switch_to_primary_api(self) -> bool:
-        """
-        Switch back to the primary API key and model after cooldown.
-        
-        Returns:
-            bool: True if successfully switched back to primary, False otherwise
-        """
-        import google.generativeai as genai
-        
-        # If we're already using the primary API key, nothing to do
-        if self.current_api_key == self.primary_api_key:
-            return True
-            
-        # Check if we have a primary API key
-        if not hasattr(self, 'primary_api_key') or not self.primary_api_key:
-            self.logger.warning("No primary API key available to switch back to")
-            return False
-            
-        try:
-            self.logger.info("Switching back to primary API key and model after cooldown")
-            self.current_api_key = self.primary_api_key
-            self.current_model_name = self.primary_model_name
-            
-            # Configure Gemini with primary API key
-            genai.configure(api_key=self.current_api_key)
-            
-            # Initialize new Gemini model with primary model
-            self.gemini_image_processor = genai.GenerativeModel(self.current_model_name)
-            
-            # Reset rate limit tracking
-            self.rate_limited = False
-            
-            self.logger.info(f"Successfully switched back to primary model: {self.current_model_name}")
-            return True
-        except Exception as e:
-            self.logger.error(f"Failed to switch back to primary API key: {str(e)}")
-            return False
 
     def _extract_pdf_metadata(self, doc: fitz.Document) -> Dict[str, Any]:
         """
@@ -2152,6 +1687,131 @@ class PDFExtractor(BaseExtractor):
             return False
             
         return True
+
+    async def _extract_layout_with_spacy(self, pdf_path: str) -> Dict[str, Any]:
+        """
+        Extract document layout using spaCy layout.
+        
+        Args:
+            pdf_path: Path to the PDF file
+            
+        Returns:
+            Dictionary containing layout information
+        """
+        if not self.has_layout_recognition or not hasattr(self.layout_recognizer, 'analyze'):
+            self.logger.warning("SpaCy layout recognition not available")
+            return {"pages": [], "tables": [], "markdown": ""}
+            
+        try:
+            # Use the SpaCyLayoutRecognizer to analyze the document
+            if asyncio.get_event_loop().is_running():
+                # We're already in an event loop, so just await the coroutine
+                layout_info = await self.layout_recognizer.analyze(
+                    document=pdf_path,
+                    extract_style=True,
+                    detect_reading_order=True,
+                    build_hierarchy=True
+                )
+            else:
+                # No event loop running, so use asyncio.run()
+                layout_info = asyncio.run(self.layout_recognizer.analyze(
+                    document=pdf_path,
+                    extract_style=True,
+                    detect_reading_order=True,
+                    build_hierarchy=True
+                ))
+            
+            # Process the layout elements
+            document_layout = {
+                "text": "",  # Will be populated from the document content
+                "pages": [],
+                "tables": [],
+                "markdown": layout_info.get("markdown", "")
+            }
+            
+            # Group elements by page
+            elements_by_page = {}
+            for elem in layout_info.get("elements", []):
+                page_num = elem.get("page", 0)
+                if page_num not in elements_by_page:
+                    elements_by_page[page_num] = []
+                elements_by_page[page_num].append(elem)
+                
+            # Create page info
+            for page_num, elements in elements_by_page.items():
+                page_info = {
+                    "page_no": page_num,
+                    "elements": []
+                }
+                
+                for elem in elements:
+                    element_info = {
+                        "type": elem["type"],
+                        "text": elem["text"],
+                        "bbox": elem["bbox"],
+                        "confidence": elem.get("confidence", 1.0)
+                    }
+                    
+                    # Add metadata if available
+                    if "metadata" in elem:
+                        element_info.update(elem["metadata"])
+                        
+                    page_info["elements"].append(element_info)
+                    
+                    # If element is a table, add to tables list
+                    if elem["type"] == "table":
+                        table_info = {
+                            "id": f"table_{page_num}_{len(document_layout['tables'])+1}",
+                            "page": page_num,
+                            "extraction_method": "spacy_layout",
+                            "confidence": elem.get("confidence", 1.0),
+                            "bbox": elem["bbox"],
+                            "text": elem["text"]
+                        }
+                        document_layout["tables"].append(table_info)
+                
+                document_layout["pages"].append(page_info)
+                
+            return document_layout
+            
+        except Exception as e:
+            self.logger.error(f"Error extracting layout with spaCy: {str(e)}")
+            return {"pages": [], "tables": [], "markdown": ""}
+
+    def _process_document_structure(self, doc: fitz.Document) -> Dict[str, Any]:
+        """Process document structure and hierarchy."""
+        structure = {
+            'hierarchy': [],
+            'page_layouts': [],
+            'content_map': {}
+        }
+        
+        # Process each page
+        for page_num, page in enumerate(doc):
+            layout = self._analyze_page_layout(page)
+            structure['page_layouts'].append(layout)
+            
+            # Build content hierarchy
+            for element in layout:
+                if element.type in ['title', 'subtitle', 'heading']:
+                    structure['hierarchy'].append({
+                        'text': element.text,
+                        'level': self._determine_heading_level(element),
+                        'page': page_num + 1
+                    })
+                    
+        return structure
+        
+    def _determine_heading_level(self, element: LayoutElement) -> int:
+        """Determine heading level based on font size and style."""
+        if element.type == 'title':
+            return 1
+        elif element.type == 'subtitle':
+            return 2
+        elif element.is_bold and element.font_size > 12:
+            return 3
+        else:
+            return 4
 
 # Test function to verify Ghostscript detection
 def test_ghostscript_detection():
