@@ -137,8 +137,15 @@ class FeedbackProcessor:
         # Load existing feedback
         self._load_existing_feedback()
 
-    def _load_config(self, config_path: Optional[Path]) -> Dict:
-        """Load feedback processing configuration."""
+    def _load_config(self, config_path: Optional[Union[Path, Dict]]) -> Dict:
+        """Load feedback processing configuration.
+        
+        Args:
+            config_path: Either a Path to a config file or a dictionary with config values
+            
+        Returns:
+            Dictionary with configuration values
+        """
         default_config = {
             "rating_weights": {
                 "relevance": 0.3,
@@ -151,10 +158,19 @@ class FeedbackProcessor:
             "alert_threshold": 0.4
         }
         
-        if config_path and config_path.exists():
-            with open(config_path, 'r') as f:
-                custom_config = json.load(f)
-                default_config.update(custom_config)
+        # If config_path is a dictionary, update default_config with it
+        if isinstance(config_path, dict):
+            default_config.update(config_path)
+            return default_config
+            
+        # If config_path is a Path, load the file
+        if config_path and isinstance(config_path, Path) and config_path.exists():
+            try:
+                with open(config_path, 'r') as f:
+                    custom_config = json.load(f)
+                    default_config.update(custom_config)
+            except Exception as e:
+                logging.warning(f"Error loading feedback config file: {str(e)}")
                 
         return default_config
 

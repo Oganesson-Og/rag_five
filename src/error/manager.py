@@ -7,6 +7,8 @@ from pathlib import Path
 import traceback
 from .models import ErrorEvent, ErrorCategory, ErrorSeverity, ErrorInfo
 from .rate_limiter import RAGRateLimiter
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 
 class ErrorManager:
     """Unified error management system."""
@@ -101,7 +103,15 @@ class ErrorManager:
         """Attempt to recover from error."""
         if handler := self.recovery_handlers.get(event.category):
             try:
-                await handler(event)
+                # Check if handler is async or sync and call accordingly
+                if asyncio.iscoroutinefunction(handler):
+                    await handler(event)
+                else:
+                    # Run synchronous handler in thread pool
+                    with ThreadPoolExecutor() as executor:
+                        await asyncio.get_event_loop().run_in_executor(
+                            executor, handler, event
+                        )
                 event.resolved = True
                 event.resolution_time = datetime.now()
             except Exception as e:

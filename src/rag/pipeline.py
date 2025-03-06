@@ -110,6 +110,7 @@ from ..document_processing.extractors.image import ImageExtractor
 from ..document_processing.extractors.pdf import PDFExtractor
 from ..document_processing.extractors.docx import DocxExtractor
 from ..document_processing.extractors.spreadsheet import ExcelExtractor, CSVExtractor
+from ..utils.async_utils import execute_function, ensure_async
 
 logger = logging.getLogger(__name__)
 
@@ -349,18 +350,72 @@ class DiagramAnalysisStage(PipelineStage):
     
     def __init__(self, config: Dict[str, Any]):
         super().__init__(config)
-        self.analyzer = DiagramAnalyzer(config)
+        # Import here to avoid circular imports
+        try:
+            from ..document_processing.processors.diagram_analyzer import DiagramAnalyzer
+            from ..utils.async_utils import ensure_async
+            
+            self.analyzer = DiagramAnalyzer(config)
+            
+            # Find the analysis method and ensure it's async-compatible
+            if hasattr(self.analyzer, 'process_diagram'):
+                self.analysis_method = ensure_async(self.analyzer.process_diagram)
+                self.method_name = 'process_diagram'
+            elif hasattr(self.analyzer, 'analyze'):
+                self.analysis_method = ensure_async(self.analyzer.analyze)
+                self.method_name = 'analyze'
+            else:
+                self.analysis_method = None
+                self.method_name = None
+                
+            self.logger = logging.getLogger(__name__)
+            self.logger.debug(f"DiagramAnalyzer initialized with method: {self.method_name}")
+        except ImportError as e:
+            self.logger.warning(f"DiagramAnalyzer import failed: {str(e)}")
+            self.analyzer = None
+            self.analysis_method = None
+            self.method_name = None
     
     async def process(self, document: Document) -> Document:
-        if document.has_diagrams:
-            with self.metrics.measure_time() as timer:
-                document.diagram_analysis = await self.analyzer.analyze(document.diagrams)
+        """Process document to analyze diagrams."""
+        try:
+            if not hasattr(document, 'has_diagrams') or not document.has_diagrams or not self.analyzer:
+                return document
+                
+            self.logger.debug(f"Starting diagram analysis for document: {document.id if hasattr(document, 'id') else 'unknown'}")
             
-            self._record_metrics(document, ProcessingMetrics(
-                processing_time=timer.elapsed,
-                diagram_count=len(document.diagrams)
-            ))
-        return document
+            with self.metrics.measure_time() as timer:
+                # Get the diagrams from the document
+                diagrams = getattr(document, 'diagrams', [])
+                if not diagrams:
+                    self.logger.debug("No diagrams found in document")
+                    return document
+                    
+                self.logger.debug(f"Processing {len(diagrams)} diagrams")
+                
+                # Process each diagram
+                analyses = []
+                for i, diagram in enumerate(diagrams):
+                    self.logger.debug(f"Processing diagram {i+1}/{len(diagrams)}")
+                    try:
+                        if self.analysis_method:
+                            analysis = await self.analysis_method(diagram)
+                            analyses.append(analysis)
+                        else:
+                            self.logger.warning("No suitable analysis method found on DiagramAnalyzer")
+                    except Exception as e:
+                        self.logger.error(f"Error analyzing diagram {i+1}: {str(e)}", exc_info=True)
+                        # Continue with other diagrams instead of stopping
+                
+                # Store results
+                document.diagram_analysis = analyses
+                self.logger.debug(f"Completed diagram analysis with {len(analyses)} results")
+            
+            return document
+        except Exception as e:
+            self.logger.error(f"Error in diagram analysis stage: {str(e)}", exc_info=True)
+            # Don't fail the pipeline for diagram analysis errors
+            return document
 
 class EducationalProcessingStage(PipelineStage):
     """Educational content processing stage."""
@@ -372,29 +427,45 @@ class EducationalProcessingStage(PipelineStage):
         self.math_processor = MathProcessor(config.get('math', {}))
         self.standards_manager = StandardsManager(config.get('standards', {}))
         self.cross_modal_processor = CrossModalProcessor(config.get('cross_modal', {}))
+        self.logger = logging.getLogger(__name__)
     
     async def process(self, document: Document) -> Document:
         """Process document with educational enhancements."""
         with self.metrics.measure_time() as timer:
-            # Process mathematical content if present
-            if self.math_processor.has_math_content(document.content):
-                document.content = await self.math_processor.process(document.content)
-            
-            # Map educational standards
-            standards_mapping = await self.standards_manager.map_content(document.content)
-            document.doc_info['standards'] = standards_mapping
-            
-            # Process cross-modal content if present
-            if document.has_multiple_modalities():
-                document = await self.cross_modal_processor.process(document)
-            
-            # Record metrics
-            self._record_metrics(document, ProcessingMetrics(
-                processing_time=timer.elapsed,
-                token_count=len(str(document.content)) if document.content else 0
-            ))
-            
-            return document
+            try:
+                # Process mathematical content if present
+                if self.math_processor.has_math_content(document.content):
+                    # Use execute_function instead of directly awaiting
+                    result = await execute_function(self.math_processor.process, document.content)
+                    document.content = result
+                
+                # Map educational standards
+                standards_mapping = await self.standards_manager.map_content(document.content)
+                document.doc_info['standards'] = standards_mapping
+                
+                # Cross-modal educational processing
+                if document.has_multiple_modalities():
+                    await self.cross_modal_processor.process(document)
+                
+                # Create ProcessingMetrics manually with the required processing_time
+                metrics = ProcessingMetrics(
+                    processing_time=timer.elapsed,
+                    token_count=len(str(document.content)) if document.content else 0
+                )
+                
+                # Record metrics using our custom metrics object
+                self._record_metrics(document, metrics)
+                
+                return document
+            except Exception as e:
+                self.logger.error(f"Error in {self.__class__.__name__}: {str(e)}", exc_info=True)
+                document.add_processing_event(ProcessingEvent(
+                    stage=self.stage,
+                    processor=self.__class__.__name__,
+                    status="error",
+                    error=str(e)
+                ))
+                raise
 
 class FeedbackProcessingStage(PipelineStage):
     """Educational feedback processing stage."""
@@ -609,50 +680,95 @@ class Pipeline:
         modality: Optional[ContentModality] = None,
         options: Optional[Dict[str, Any]] = None
     ) -> Document:
-        """Process a document through the pipeline with batching support."""
+        """
+        Process a document through the pipeline.
+        
+        Args:
+            source: Path to document, bytes, or Document object
+            modality: Content modality hint (auto-detected if None)
+            options: Processing options
+            
+        Returns:
+            Processed Document object
+        """
+        options = options or {}
+        start_time = time.time()
+        
         try:
-            # Create document if needed
+            # Convert source to Document if needed
             if not isinstance(source, Document):
-                if modality is None:
-                    if isinstance(source, bytes):
-                        modality = ContentModality.BINARY
-                    elif isinstance(source, str) and Path(source).exists():
-                        modality = self._detect_modality(source)
-                    else:
-                        modality = ContentModality.TEXT
-                document = self._create_document(source, modality, options)
+                self.logger.debug(f"Creating document from source: {type(source)}")
+                document = Document(
+                    content=source,
+                    modality=modality,
+                    metadata=options.get('metadata', {})
+                )
             else:
                 document = source
-                # Ensure document has required fields
-                if not document.content:
-                    raise ValueError("Document must have content")
-                if not document.source:
-                    document.source = "unknown"
-                if not document.modality:
-                    document.modality = modality or ContentModality.UNKNOWN
-
-            # Process through stages with batching
-            for stage_key, stage in self.stages.items():
-                # Pass batching config to extractors
-                if isinstance(stage, ExtractionStage):
-                    for extractor in stage.extractors:
-                        if hasattr(extractor, 'batch_config'):
-                            extractor.batch_config.update(self.request_config)
                 
-                document = await stage.process(document)
-                
-                # Record metrics after each stage
-                if isinstance(stage, PipelineStage):
-                    stage._record_metrics(document, stage.metrics)
-
+            self.logger.info(f"Processing document: {document.id if hasattr(document, 'id') else 'unknown'}")
+            self.logger.debug(f"Source type: {type(source)}")
+            self.logger.debug(f"Detected modality: {document.modality}")
+            
+            # Check cache first if enabled
+            if self.cache and self.config.get('cache', {}).get('enabled', False):
+                try:
+                    cache_key = f"doc:{document.content_hash}"
+                    cached_doc = self.cache.get(cache_key, 'document')
+                    if cached_doc:
+                        self.logger.info(f"Retrieved document from cache: {document.id}")
+                        return cached_doc
+                except Exception as e:
+                    # Log the error but continue without using cache
+                    self.logger.warning(f"Error accessing document cache: {str(e)}")
+            
+            # Process through each stage
+            for stage_name, stage in self.stages.items():
+                try:
+                    self.logger.debug(f"Running stage: {stage_name}")
+                    # Fix: Call stage.process directly with proper async handling
+                    if asyncio.iscoroutinefunction(stage.process):
+                        document = await stage.process(document)
+                    else:
+                        # Run sync function in thread pool
+                        with ThreadPoolExecutor() as executor:
+                            document = await asyncio.get_event_loop().run_in_executor(
+                                executor, stage.process, document
+                            )
+                    self.logger.debug(f"Completed stage: {stage_name}")
+                except Exception as e:
+                    self.logger.error(f"Error in stage {stage_name}: {str(e)}", exc_info=True)
+                    # Don't stop the pipeline for non-critical stages
+                    if stage_name in [ProcessingStage.ANALYZED, ProcessingStage.EDUCATIONAL_PROCESSED, 
+                                     ProcessingStage.FEEDBACK_PROCESSED]:
+                        self.logger.warning(f"Continuing pipeline despite error in {stage_name}")
+                    else:
+                        raise Exception(f"Document processing failed: {str(e)}")
+            
             # Cache processed document
-            await self._cache_document(document)
-
+            if self.cache and self.config.get('cache', {}).get('enabled', False):
+                try:
+                    cache_key = f"doc:{document.content_hash}"
+                    await execute_function(self.cache.set, cache_key, document, 'document')
+                    self.logger.debug(f"Document {document.id} cached successfully")
+                except Exception as e:
+                    # Log the error but continue without caching
+                    self.logger.warning(f"Error caching document: {str(e)}")
+                    # If it's a Redis connection error, disable cache for future operations
+                    if "Connection refused" in str(e):
+                        self.logger.warning("Redis connection failed. Caching will be disabled.")
+                        if hasattr(self, 'config') and isinstance(self.config, dict):
+                            if 'cache' in self.config:
+                                self.config['cache']['enabled'] = False
+                
+            # Record total processing time
+            document.processing_time = time.time() - start_time
+            
             return document
-
+                
         except Exception as e:
-            self.logger.error(f"Document processing failed: {str(e)}")
-            raise
+            self.logger.error(f"Document processing failed: {str(e)}", exc_info=True)
+            raise Exception(f"Document processing failed: {str(e)}")
 
     async def generate_response(
         self,
@@ -720,16 +836,24 @@ class Pipeline:
     
     async def _cache_document(self, document: Document):
         """Cache processed document."""
-        if self.cache:
-            await self.cache.set(
-                f"doc:{document.id}", 
-                document, 
-                modality=document.modality.value if document.modality else "unknown"
-            )
-            self.logger.debug(f"Document cached: {document.id}")
-        else:
-            self.logger.debug(f"Document not cached (cache disabled): {document.id}")
-    
+        if self.cache and self.config.get('cache', {}).get('enabled', False):
+            try:
+                await self.cache.set(
+                    f"doc:{document.id}", 
+                    document,
+                    'document'
+                )
+                self.logger.debug(f"Document {document.id} cached successfully")
+            except Exception as e:
+                # Log the error but continue without caching
+                self.logger.warning(f"Error caching document: {str(e)}")
+                # If it's a Redis connection error, disable cache for future operations
+                if "Connection refused" in str(e):
+                    self.logger.warning("Redis connection failed. Caching will be disabled.")
+                    if hasattr(self, 'config') and isinstance(self.config, dict):
+                        if 'cache' in self.config:
+                            self.config['cache']['enabled'] = False
+                
     async def _retrieve_chunks(
         self,
         query: str,
@@ -752,7 +876,7 @@ class Pipeline:
         try:
             # Check cache first
             cache_key = f"search:{hash(query)}"
-            cached_results = await self.cache.get(cache_key)
+            cached_results = self.cache.get(cache_key, 'search') if self.cache else None
             if cached_results:
                 return cached_results
 
@@ -763,7 +887,7 @@ class Pipeline:
                 query_embedding = await self._get_embedding(query)
                 
                 # Semantic search using vector store
-                semantic_results = await self.vector_cache.search(
+                semantic_results = await self.vector_store.search(
                     query_embedding,
                     k=max_chunks,
                     threshold=similarity_threshold
@@ -865,7 +989,7 @@ class Pipeline:
         try:
             # Check embedding cache
             cache_key = f"emb:{hash(text)}"
-            cached_embedding = await self.vector_cache.get(cache_key)
+            cached_embedding = await self.vector_store.get_embedding(text)
             if cached_embedding is not None:
                 return cached_embedding
 
@@ -873,7 +997,7 @@ class Pipeline:
             embedding = await self.embedding_model.embed_text(text)
             
             # Cache embedding
-            await self.vector_cache.set(cache_key, embedding)
+            await self.vector_store.set_embedding(text, embedding)
             
             return embedding
             

@@ -68,6 +68,7 @@ from pydantic import BaseModel, Field, field_validator, validator
 import numpy as np
 from uuid import uuid4
 from dataclasses import dataclass, field
+import hashlib
 
 class ProcessingStage(str, Enum):
     """Pipeline processing stages."""
@@ -154,6 +155,7 @@ class Document(BaseModel):
     created_at: datetime = Field(default_factory=datetime.now)
     processing_events: List[ProcessingEvent] = Field(default_factory=list)
     chunks: List[Chunk] = Field(default_factory=list)
+    processing_time: Optional[float] = None
     
     class Config:
         # Allow arbitrary types for content field
@@ -195,6 +197,20 @@ class Document(BaseModel):
     def processed_modalities(self) -> List[str]:
         """Get list of processed content modalities."""
         return list(set(event.processor for event in self.processing_events))
+
+    @property
+    def content_hash(self) -> str:
+        """
+        Compute a hash of the document content.
+        
+        Returns:
+            A string hash representation of the document content
+        """
+        # Convert content to bytes for hashing
+        content_bytes = self.encode()
+        
+        # Compute hash
+        return hashlib.sha256(content_bytes).hexdigest()
 
     def encode(self) -> bytes:
         """Convert content to bytes."""

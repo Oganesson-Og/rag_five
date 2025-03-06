@@ -326,15 +326,21 @@ class PDFExtractor(BaseExtractor):
     async def extract(self, document: 'Document') -> 'Document':
         """Main extraction method with batching support."""
         try:
+            # Add debug logging
+            self.logger.debug(f"Starting PDF extraction for document: {document.id if hasattr(document, 'id') else 'unknown'}")
+            
             # Initialize components if not already initialized
             if not hasattr(self, '_components_initialized') or not self._components_initialized:
+                self.logger.debug("Initializing components")
                 self._init_components()
                 self._components_initialized = True
             
             # Get the PDF content
             if isinstance(document.content, bytes):
                 pdf_bytes = document.content
+                self.logger.debug(f"Using bytes content, size: {len(pdf_bytes)}")
             elif isinstance(document.source, str) and os.path.exists(document.source):
+                self.logger.debug(f"Reading from file: {document.source}")
                 with open(document.source, 'rb') as f:
                     pdf_bytes = f.read()
             else:
@@ -344,72 +350,68 @@ class PDFExtractor(BaseExtractor):
             with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as temp_file:
                 temp_path = temp_file.name
                 temp_file.write(pdf_bytes)
+                self.logger.debug(f"Created temporary file: {temp_path}")
             
             try:
                 # Open the PDF with PyMuPDF
+                self.logger.debug("Opening PDF with PyMuPDF")
                 doc = fitz.open(temp_path)
                 
                 # Extract metadata
+                self.logger.debug("Extracting metadata")
                 metadata = self._extract_pdf_metadata(doc)
                 document.doc_info.update(metadata)
                 
                 # Check if scanned
+                self.logger.debug("Checking if PDF is scanned")
                 is_scanned = self._check_if_scanned(doc)
                 document.doc_info['is_scanned'] = is_scanned
                 
                 # Extract text content
+                self.logger.debug("Extracting text content")
                 text_content = []
                 for page_num, page in enumerate(doc):
                     text = page.get_text()
                     text_content.append(text)
                 
                 # Extract tables if present
+                self.logger.debug("Extracting tables")
                 tables = self.extract_tables(doc, temp_path)
                 if tables:
                     document.doc_info['tables'] = tables
+                    self.logger.debug(f"Found {len(tables)} tables")
                 
                 # Set the extracted content
                 document.content = "\n\n".join(text_content)
                 document.doc_info['page_count'] = len(doc)
+                self.logger.debug(f"Extracted {len(doc)} pages")
                 
                 # Add cross-references
+                self.logger.debug("Adding cross-references")
                 self._add_cross_references(document)
                 
-                # Extract layout information if available
-                if self.has_layout_recognition:
-                    # Determine which layout engine is being used
-                    layout_engine = self.config.get('layout', {}).get('engine', 'gemini').lower()
-                    
-                    if layout_engine == 'spacy':
-                        # Use spaCy layout
-                        layout_info = await self._extract_layout_with_spacy(temp_path)
-                        if layout_info:
-                            document.doc_info['layout'] = layout_info
-                            
-                            # If markdown is available, add it to the document
-                            if layout_info.get('markdown'):
-                                document.doc_info['markdown'] = layout_info['markdown']
-                                
-                            # Add tables from layout if not already extracted
-                            if layout_info.get('tables') and not document.doc_info.get('tables'):
-                                document.doc_info['tables'] = layout_info['tables']
-                    else:
-                        # Use existing layout recognition (Gemini or LayoutLMv3)
-                        # This would be implemented in a separate method if needed
-                        pass
-                
                 # Flush any remaining batched requests
-                await self._flush_batch()
+                self.logger.debug("Flushing batch requests")
+                if hasattr(self, '_flush_batch'):
+                    # Check if _flush_batch is awaitable
+                    if asyncio.iscoroutinefunction(self._flush_batch):
+                        self.logger.debug("Awaiting _flush_batch as coroutine")
+                        await self._flush_batch()
+                    else:
+                        self.logger.debug("Calling _flush_batch as regular function")
+                        self._flush_batch()
                 
+                self.logger.debug("PDF extraction completed successfully")
                 return document
                 
             finally:
                 # Clean up the temporary file
                 if os.path.exists(temp_path):
                     os.unlink(temp_path)
+                    self.logger.debug(f"Removed temporary file: {temp_path}")
             
         except Exception as e:
-            self.logger.error(f"Extraction failed: {str(e)}")
+            self.logger.error(f"Extraction failed: {str(e)}", exc_info=True)
             raise
 
     def _init_components(self):
@@ -1231,12 +1233,18 @@ class PDFExtractor(BaseExtractor):
             line_scale = self.config.get('table_extraction', {}).get('line_scale', 40)
             
             # Extract tables
-            tables = camelot.read_pdf(
-                pdf_path,
-                pages=str(page_number),
-                flavor=flavor,
-                line_scale=line_scale
-            )
+            if flavor == 'lattice':
+                tables = camelot.read_pdf(
+                    pdf_path,
+                    pages=str(page_number),
+                    flavor=flavor,
+                    line_scale=line_scale
+                )
+            else:                
+                tables = camelot.read_pdf(
+                    pdf_path,
+                    pages=str(page_number),
+                    flavor=flavor)
             
             if len(tables) == 0:
                 self.logger.info(f"No tables found on page {page_number} using Camelot with {flavor} flavor")
@@ -1451,7 +1459,7 @@ class PDFExtractor(BaseExtractor):
         
         try:
             # Sort tables by page number
-            tables.sort(key=lambda t: (t['page'], t.get('bbox', [0, 0, 0, 0])[1]))
+            tables.sort(key=lambda t: (t.get('page', 0), t.get('bbox', [0, 0, 0, 0])[1] if 'bbox' in t and len(t.get('bbox', [])) >= 2 else 0))
             
             merged_tables = []
             i = 0
@@ -1463,7 +1471,8 @@ class PDFExtractor(BaseExtractor):
                     next_table = tables[i + 1]
                     
                     # Check if tables are on consecutive pages and have similar structure
-                    if next_table['page'] == current_table['page'] + 1 and self._are_tables_related(current_table, next_table):
+                    if (next_table.get('page', 0) == current_table.get('page', 0) + 1 and 
+                        self._are_tables_related(current_table, next_table)):
                         # Merge the tables
                         merged_table = self._merge_tables(current_table, next_table)
                         merged_tables.append(merged_table)
@@ -1491,31 +1500,54 @@ class PDFExtractor(BaseExtractor):
         Returns:
             True if tables are related, False otherwise
         """
+        # Safety check for required fields
+        if not isinstance(table1, dict) or not isinstance(table2, dict):
+            return False
+            
         # Check if tables have similar structure
-        if table1.get('num_cols', 0) != table2.get('num_cols', 0):
-            return False
+        # 1. Check if they have similar column count (if available)
+        if 'data' in table1 and 'data' in table2:
+            # Both tables have data
+            data1 = table1.get('data', [])
+            data2 = table2.get('data', [])
+            
+            if not data1 or not data2:
+                return False
+                
+            # Check column count
+            col_count1 = len(data1[0]) if data1 and isinstance(data1, list) and len(data1) > 0 and isinstance(data1[0], list) else 0
+            col_count2 = len(data2[0]) if data2 and isinstance(data2, list) and len(data2) > 0 and isinstance(data2[0], list) else 0
+            
+            if col_count1 != col_count2 or col_count1 == 0:
+                return False
+                
+            # 2. Check if headers are similar (if available)
+            if col_count1 > 0 and len(data1) > 0 and len(data2) > 0:
+                headers1 = data1[0] if isinstance(data1[0], list) else []
+                headers2 = data2[0] if isinstance(data2[0], list) else []
+                
+                if headers1 and headers2 and not self._are_headers_similar(headers1, headers2):
+                    return False
         
-        # Check if headers are similar
-        headers1 = table1.get('headers', [])
-        headers2 = table2.get('headers', [])
+        # 3. Check if tables have similar width (if bbox available)
+        if ('bbox' in table1 and 'bbox' in table2 and 
+            isinstance(table1['bbox'], (list, tuple)) and isinstance(table2['bbox'], (list, tuple)) and
+            len(table1['bbox']) >= 4 and len(table2['bbox']) >= 4):
+            
+            width1 = table1['bbox'][2] - table1['bbox'][0]
+            width2 = table2['bbox'][2] - table2['bbox'][0]
+            
+            # If widths differ by more than 20%, tables are probably not related
+            max_width = max(width1, width2)
+            if max_width > 0 and abs(width1 - width2) / max_width > 0.2:
+                return False
         
-        # If both have headers and they're different, tables are likely not related
-        if headers1 and headers2 and not self._are_headers_similar(headers1, headers2):
-            return False
-        
-        # Check context for continuity indicators
-        context1 = table1.get('context', '').lower()
-        context2 = table2.get('context', '').lower()
-        
-        continuity_indicators = ['continued', 'continuation', 'cont.', 'cont\'d', 'continued from previous page']
-        if any(indicator in context2 for indicator in continuity_indicators):
-            return True
-        
-        return True  # Default to assuming they're related if structure matches
+        # If we passed all checks, tables might be related
+        return True
 
     def _are_headers_similar(self, headers1: List[str], headers2: List[str]) -> bool:
         """
-        Check if two sets of headers are similar.
+        Check if two sets of table headers are similar.
         
         Args:
             headers1: First set of headers
@@ -1524,16 +1556,30 @@ class PDFExtractor(BaseExtractor):
         Returns:
             True if headers are similar, False otherwise
         """
-        if len(headers1) != len(headers2):
+        # Safety checks
+        if not headers1 or not headers2:
             return False
+            
+        if not isinstance(headers1, list) or not isinstance(headers2, list):
+            return False
+            
+        # Convert all headers to strings for comparison
+        str_headers1 = [str(h).strip().lower() for h in headers1]
+        str_headers2 = [str(h).strip().lower() for h in headers2]
         
+        # If lengths are different, headers are not similar
+        if len(str_headers1) != len(str_headers2):
+            return False
+            
+        # Calculate similarity score
         similarity_count = 0
-        for h1, h2 in zip(headers1, headers2):
-            if h1 == h2 or self._string_similarity(h1, h2) > 0.8:
+        for h1, h2 in zip(str_headers1, str_headers2):
+            if self._string_similarity(h1, h2) > 0.8:
                 similarity_count += 1
-        
-        # Consider headers similar if at least 70% match
-        return (similarity_count / len(headers1) >= 0.7) if headers1 else False
+                
+        # If more than 70% of headers are similar, consider them similar
+        similarity_ratio = similarity_count / len(str_headers1) if str_headers1 else 0
+        return similarity_ratio > 0.7
 
     def _string_similarity(self, s1: str, s2: str) -> float:
         """
@@ -1546,35 +1592,52 @@ class PDFExtractor(BaseExtractor):
         Returns:
             Similarity score between 0 and 1
         """
-        # Simple implementation of Levenshtein distance
-        if not isinstance(s1, str) or not isinstance(s2, str):
-            s1 = str(s1) if s1 is not None else ""
-            s2 = str(s2) if s2 is not None else ""
+        try:
+            # Convert inputs to strings if they aren't already
+            if not isinstance(s1, str) or not isinstance(s2, str):
+                s1 = str(s1) if s1 is not None else ""
+                s2 = str(s2) if s2 is not None else ""
+                
+            # Normalize strings
+            s1 = s1.lower().strip()
+            s2 = s2.lower().strip()
             
-        if len(s1) < len(s2):
-            return self._string_similarity(s2, s1)
+            # If either string is empty, return 0 similarity
+            if not s1 or not s2:
+                return 0.0
+                
+            # If strings are identical, return 1.0
+            if s1 == s2:
+                return 1.0
+                
+            # For efficiency, swap strings if s1 is longer than s2
+            if len(s1) < len(s2):
+                return self._string_similarity(s2, s1)
+                
+            # Simple implementation of Levenshtein distance
+            previous_row = list(range(len(s2) + 1))
+            for i, c1 in enumerate(s1):
+                current_row = [i + 1]
+                for j, c2 in enumerate(s2):
+                    insertions = previous_row[j + 1] + 1
+                    deletions = current_row[j] + 1
+                    substitutions = previous_row[j] + (c1 != c2)
+                    current_row.append(min(insertions, deletions, substitutions))
+                previous_row = current_row
+                
+            # Convert distance to similarity score
+            max_len = max(len(s1), len(s2))
+            distance = previous_row[-1]
+            return 1.0 - (distance / max_len) if max_len > 0 else 1.0
             
-        if len(s2) == 0:
-            return 0.0
-            
-        previous_row = range(len(s2) + 1)
-        for i, c1 in enumerate(s1):
-            current_row = [i + 1]
-            for j, c2 in enumerate(s2):
-                insertions = previous_row[j + 1] + 1
-                deletions = current_row[j] + 1
-                substitutions = previous_row[j] + (c1 != c2)
-                current_row.append(min(insertions, deletions, substitutions))
-            previous_row = current_row
-            
-        # Convert distance to similarity score
-        max_len = max(len(s1), len(s2))
-        distance = previous_row[-1]
-        return 1.0 - (distance / max_len) if max_len > 0 else 1.0
+        except Exception as e:
+            self.logger.warning(f"Error calculating string similarity: {str(e)}")
+            # Fallback to a simpler comparison
+            return 1.0 if s1 == s2 else 0.0
 
     def _merge_tables(self, table1: Dict[str, Any], table2: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Merge two related tables into one.
+        Merge two tables that are parts of the same cross-page table.
         
         Args:
             table1: First table
@@ -1583,20 +1646,35 @@ class PDFExtractor(BaseExtractor):
         Returns:
             Merged table
         """
-        # Create a new table with merged data
-        merged_table = {
-            'data': table1['data'] + table2['data'],
-            'headers': table1['headers'],  # Keep headers from first table
-            'page': table1['page'],  # Keep page from first table
-            'bbox': table1['bbox'],  # Keep bbox from first table
-            'confidence': (table1.get('confidence', 0.5) + table2.get('confidence', 0.5)) / 2,  # Average confidence
-            'extraction_method': table1.get('extraction_method', 'merged'),
-            'is_merged': True,
-            'merged_from': [table1.get('page', 0), table2.get('page', 0)]
-        }
+        # Create a new table with combined data
+        merged_table = table1.copy()
+        
+        # Merge data if available
+        if 'data' in table1 and 'data' in table2:
+            data1 = table1.get('data', [])
+            data2 = table2.get('data', [])
+            
+            if isinstance(data1, list) and isinstance(data2, list):
+                # Skip header row in the second table if it matches the first table's header
+                start_idx = 1 if (len(data1) > 0 and len(data2) > 0 and 
+                                 self._are_headers_similar(data1[0], data2[0])) else 0
+                
+                merged_table['data'] = data1 + data2[start_idx:]
+        
+        # Merge text content
+        merged_table['text'] = table1.get('text', '') + '\n' + table2.get('text', '')
+        
+        # Update page range
+        merged_table['page_range'] = [table1.get('page', 0), table2.get('page', 0)]
+        
+        # Update extraction method
+        merged_table['extraction_method'] = f"{table1.get('extraction_method', 'unknown')}_cross_page"
+        
+        # Mark as cross-page table
+        merged_table['is_cross_page'] = True
         
         return merged_table
-        
+
     def _refine_table_structure(self, table: Dict[str, Any]) -> Dict[str, Any]:
         """
         Refine the structure of an extracted table.
@@ -1704,22 +1782,17 @@ class PDFExtractor(BaseExtractor):
             
         try:
             # Use the SpaCyLayoutRecognizer to analyze the document
-            if asyncio.get_event_loop().is_running():
-                # We're already in an event loop, so just await the coroutine
-                layout_info = await self.layout_recognizer.analyze(
-                    document=pdf_path,
-                    extract_style=True,
-                    detect_reading_order=True,
-                    build_hierarchy=True
-                )
-            else:
-                # No event loop running, so use asyncio.run()
-                layout_info = asyncio.run(self.layout_recognizer.analyze(
-                    document=pdf_path,
-                    extract_style=True,
-                    detect_reading_order=True,
-                    build_hierarchy=True
-                ))
+            layout_info = await self.layout_recognizer.analyze(
+                document=pdf_path,
+                extract_style=True,
+                detect_reading_order=True,
+                build_hierarchy=True
+            )
+            
+            # Ensure layout_info is a dictionary
+            if not isinstance(layout_info, dict):
+                self.logger.warning(f"SpaCy layout analysis returned non-dictionary result: {type(layout_info)}")
+                return {"pages": [], "tables": [], "markdown": ""}
             
             # Process the layout elements
             document_layout = {
@@ -1732,6 +1805,8 @@ class PDFExtractor(BaseExtractor):
             # Group elements by page
             elements_by_page = {}
             for elem in layout_info.get("elements", []):
+                if not isinstance(elem, dict):
+                    continue
                 page_num = elem.get("page", 0)
                 if page_num not in elements_by_page:
                     elements_by_page[page_num] = []
@@ -1812,6 +1887,166 @@ class PDFExtractor(BaseExtractor):
             return 3
         else:
             return 4
+
+    def _analyze_page_layout(self, page: fitz.Page) -> List[LayoutElement]:
+        """Analyze page layout with enhanced recognition."""
+        elements = []
+        
+        # Get raw layout information
+        layout = page.get_text("dict")
+        base_font_size = self._get_base_font_size(layout)
+        
+        for block in layout['blocks']:
+            if block.get('type') == 0:  # Text block
+                element = self._process_text_block(block, base_font_size)
+                if element:
+                    elements.append(element)
+                    
+        # Merge related elements
+        elements = self._merge_related_elements(elements)
+        
+        return elements
+
+    def _process_text_block(
+        self,
+        block: Dict[str, Any],
+        base_font_size: float
+    ) -> Optional[LayoutElement]:
+        """Process text block with layout analysis."""
+        try:
+            # Extract text properties
+            text = ' '.join(span['text'] for span in block['spans'])
+            font_info = block['spans'][0]  # Use first span for font info
+            
+            # Calculate properties
+            font_size = font_info.get('size', 0)
+            is_bold = 'bold' in font_info.get('font', '').lower()
+            
+            # Determine element type
+            element_type = self._determine_element_type(
+                font_size,
+                base_font_size,
+                is_bold,
+                block['bbox']
+            )
+            
+            return LayoutElement(
+                type=element_type,
+                text=text,
+                bbox=block['bbox'],
+                font_size=font_size,
+                font_name=font_info.get('font', ''),
+                is_bold=is_bold
+            )
+            
+        except Exception as e:
+            self.logger.warning(f"Error processing text block: {str(e)}")
+            return None
+
+    def _determine_element_type(
+        self,
+        font_size: float,
+        base_font_size: float,
+        is_bold: bool,
+        bbox: Tuple[float, float, float, float]
+    ) -> str:
+        """Determine element type based on properties."""
+        # Title detection
+        if font_size >= base_font_size * 1.5:
+            return 'title'
+            
+        # Subtitle detection
+        if font_size >= base_font_size * 1.2 or (
+            font_size >= base_font_size * 1.1 and is_bold
+        ):
+            return 'subtitle'
+            
+        # Heading detection
+        if is_bold or font_size > base_font_size:
+            return 'heading'
+            
+        return 'text'
+
+    def _merge_related_elements(
+        self,
+        elements: List[LayoutElement]
+    ) -> List[LayoutElement]:
+        """Merge related elements based on layout."""
+        merged = []
+        current = None
+        
+        for element in elements:
+            if not current:
+                current = element
+                continue
+                
+            # Check if elements should be merged
+            if self._should_merge_elements(current, element):
+                current = self._merge_elements(current, element)
+            else:
+                merged.append(current)
+                current = element
+                
+        if current:
+            merged.append(current)
+            
+        return merged
+
+    def _should_merge_elements(
+        self,
+        elem1: LayoutElement,
+        elem2: LayoutElement
+    ) -> bool:
+        """Determine if elements should be merged."""
+        # Check vertical distance
+        vertical_gap = elem2.bbox[1] - elem1.bbox[3]
+        
+        # Check horizontal overlap
+        horizontal_overlap = (
+            min(elem1.bbox[2], elem2.bbox[2]) -
+            max(elem1.bbox[0], elem2.bbox[0])
+        )
+        
+        return (
+            elem1.type == elem2.type and
+            vertical_gap <= self.config.get('merge_tolerance', 0.5) and
+            horizontal_overlap > 0
+        )
+        
+    def _merge_elements(
+        self,
+        elem1: LayoutElement,
+        elem2: LayoutElement
+    ) -> LayoutElement:
+        """Merge two layout elements."""
+        return LayoutElement(
+            type=elem1.type,
+            text=f"{elem1.text} {elem2.text}",
+            bbox=(
+                min(elem1.bbox[0], elem2.bbox[0]),
+                min(elem1.bbox[1], elem2.bbox[1]),
+                max(elem1.bbox[2], elem2.bbox[2]),
+                max(elem1.bbox[3], elem2.bbox[3])
+            ),
+            font_size=elem1.font_size,
+            font_name=elem1.font_name,
+            is_bold=elem1.is_bold
+        )
+        
+    def _get_base_font_size(self, layout: Dict[str, Any]) -> float:
+        """Determine base font size for the page."""
+        font_sizes = []
+        
+        for block in layout['blocks']:
+            if block.get('type') == 0:  # Text block
+                for span in block.get('spans', []):
+                    if size := span.get('size'):
+                        font_sizes.append(size)
+        
+        if font_sizes:
+            return statistics.median(font_sizes)
+        else:
+            return 12.0
 
 # Test function to verify Ghostscript detection
 def test_ghostscript_detection():

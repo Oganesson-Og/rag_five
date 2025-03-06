@@ -31,7 +31,7 @@ Pillow>=9.5.0
 
 # Natural Language Processing
 spacy==3.8.3
-spacy-layout==0.1.0
+spacy-layout==0.0.11
 nltk==3.9.1
 gensim==4.3.3
 tokenizers==0.21.0
@@ -94,6 +94,15 @@ plotly==6.0.0
 SQLAlchemy==2.0.38
 psycopg2-binary==2.9.10
 redis==5.2.1
+
+# Debugging & Tracing (New)
+aiomonitor==0.6.0
+line-profiler==4.1.2
+memory-profiler==0.61.0
+snakeviz==2.2.0
+viztracer==0.15.6
+aiostream==0.5.2
+aiodebug==1.1.3
 
 # Additional Libraries
 aiohappyeyeballs==2.4.6

@@ -101,7 +101,7 @@ class AudioExtractor(BaseExtractor):
             
             # Check cache first
             cache_key = self._generate_cache_key(document)
-            if cached_doc := await self.cache.get(cache_key):
+            if cached_doc := self.cache.get(cache_key, 'audio') if self.cache else None:
                 logger.info(f"Cache hit for {cache_key}")
                 return cached_doc
             

@@ -1155,6 +1155,7 @@ class PDFExtractor(BaseExtractor):
             max(0, y0 - 200),
             min(page.rect.width, x1 + 200),
             min(page.rect.height, y1 + 200)
+        )
         
         context['surrounding_text'] = page.get_text("text", clip=surrounding_region).strip()
         

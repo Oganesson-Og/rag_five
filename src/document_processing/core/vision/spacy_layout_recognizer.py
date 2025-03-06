@@ -99,6 +99,10 @@ class SpaCyLayoutRecognizer(Recognizer):
         Returns:
             Dict containing layout analysis results
         """
+        import asyncio
+        # Ensure this is a true coroutine by adding a small sleep
+        await asyncio.sleep(0)
+        
         if not self.model_loaded:
             logger.warning("SpaCy layout model not loaded, returning empty analysis")
             return {"elements": [], "reading_order": [], "hierarchy": {}}
