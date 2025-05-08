@@ -1,0 +1,96 @@
+# Summary of the ZIMSEC AI Tutor Agent System
+
+This document provides an overview of the multi-agent AI tutoring system built using Autogen and integrated with the existing RAG pipeline.
+
+## 1. System Location
+
+The new agentic system is located in:
+`knowledge_bank/Form 4/mathematics/mathematics/pipeline_test/temp_test/zimsec_tutor_agent_system/`
+
+This directory contains:
+- `main.py`: The main script to run the agent chat.
+- `rag_integration.py`: Handles the connection and calls to the underlying RAG pipeline.
+- `agents/`: A subdirectory containing the definitions for each agent:
+    - `orchestrator_agent.py`
+    - `curriculum_alignment_agent.py`
+    - `concept_tutor_agent.py`
+    - (UserProxyAgent is instantiated directly in `main.py`)
+
+## 2. How to Run
+
+1.  Navigate to the agent system's directory:
+    ```bash
+    cd "knowledge_bank/Form 4/mathematics/mathematics/pipeline_test/temp_test/zimsec_tutor_agent_system/"
+    ```
+2.  Run the main script:
+    ```bash
+    python main.py
+    ```
+    The script currently runs with a hardcoded query (e.g., "Tell me about the median from a grouped frequency table.") and terminates after the interaction.
+
+## 3. Prerequisites & Dependencies
+
+Before running the system, ensure the following are set up:
+
+### a. Python Dependencies:
+   Install all required packages. The primary ones for the agent system are `pyautogen` (specifically `autogen[ollama]>=0.9.1`) and `prompt_toolkit`. These, along with dependencies for the RAG pipeline, should be in:
+   `knowledge_bank/Form 4/mathematics/mathematics/pipeline_test/temp_test/requirements.txt`
+   
+   It's recommended to use a virtual environment:
+   ```bash
+   python -m venv .venv
+   source .venv/bin/activate  # or .venv\Scripts\activate on Windows
+   pip install -r path/to/your/requirements.txt 
+   ```
+   (Adjust the path to `requirements.txt` as needed from your CWD when installing).
+
+### b. Ollama LLM:
+   - An Ollama server must be running.
+   - A compatible LLM needs to be pulled and available (e.g., `phi4:latest`, which is configured in `main.py`). You can pull models using `ollama pull <model_name>`.
+
+### c. RAG Pipeline (`rag_oo_pipeline`):
+   The agent system relies on the pre-existing RAG pipeline located at:
+   `knowledge_bank/Form 4/mathematics/mathematics/pipeline_test/temp_test/rag_oo_pipeline/`
+
+   This RAG pipeline has its own prerequisites:
+   - **Qdrant Database**: A Qdrant vector database must be set up and populated with:
+     - Syllabus data (collection name: `math_syllabus`)
+     - Content data (collection name: `math_content_combined`)
+     The database files are expected at `knowledge_bank/Form 4/mathematics/mathematics/pipeline_test/temp_test/rag_oo_pipeline/qdrant_db_combined/`.
+     The `rag_oo_pipeline` likely has setup scripts to create and populate these collections.
+   - **Knowledge Bank JSON**: The file `math_knowledge_bank.json` must be present in the `knowledge_bank/Form 4/mathematics/mathematics/pipeline_test/temp_test/rag_oo_pipeline/` directory.
+   - **Embedding Models**: The embedding models used by the RAG pipeline (e.g., `nomic-embed-text` via Ollama or `all-MiniLM-L6-v2` via HuggingFace, as configured in `rag_oo_pipeline/config.py`) must be accessible.
+
+## 4. System Overview
+
+- **Framework**: Built with Microsoft Autogen.
+- **Core Agents**:
+    - `UserProxyAgent`: Represents the learner, initiates the chat. Currently set to `TERMINATE` mode.
+    - `OrchestratorAgent`: Central coordinator. Receives user query, routes to other agents.
+    - `CurriculumAlignmentAgent`: Ensures queries and content align with the syllabus. Uses the RAG pipeline (`SyllabusProcessor`) for this. *The Orchestrator always consults this agent first.*
+    - `ConceptTutorAgent`: Provides explanations for concepts. Uses the RAG pipeline (`KnowledgeBaseRetriever` and LLM calls) to generate detailed responses.
+- **Workflow**:
+    1. UserProxy sends query to Orchestrator.
+    2. Orchestrator sends query to CurriculumAlignmentAgent.
+    3. CurriculumAlignmentAgent uses RAG to check syllabus, returns alignment data (JSON).
+    4. Orchestrator receives alignment. If aligned for tutoring:
+        a. Sends query + alignment data to ConceptTutorAgent.
+        b. ConceptTutorAgent uses RAG to retrieve knowledge content.
+        c. ConceptTutorAgent uses its LLM to generate an explanation based on the query, alignment, and retrieved knowledge.
+        d. ConceptTutorAgent returns explanation to Orchestrator.
+    5. Orchestrator relays the final response to the UserProxy.
+- **Current State**:
+    - Successfully demonstrates the above flow for a math query ("Tell me about the median from a grouped frequency table.").
+    - Integration with the actual `rag_oo_pipeline` components for syllabus alignment and knowledge retrieval is complete (replacing previous mock logic).
+    - Pathing issues for `KNOWLEDGE_BANK_PATH` and `QDRANT_PATH` (used by `rag_oo_pipeline`) have been addressed in `rag_integration.py` to work correctly when the agent system is run.
+
+## 5. To Get Started / Test
+
+1.  Ensure all prerequisites in section 3 are met (Python environment, Ollama, RAG pipeline setup including Qdrant & JSON knowledge bank).
+2.  Navigate to `knowledge_bank/Form 4/mathematics/mathematics/pipeline_test/temp_test/zimsec_tutor_agent_system/`.
+3.  Run `python main.py`.
+4.  Observe the console output to see the agent interactions and the final response.
+    - The `main.py` currently has a hardcoded query. You can change the `initial_query` variable in `main.py` to test other questions.
+    - Debug prints in `rag_integration.py` will show the resolved paths for Qdrant and the knowledge bank.
+
+This system forms a foundational layer for a more complex AI tutoring application. Future work could involve enabling more interactive chat, implementing other agent roles (Assessment, Project Mentor, etc.), and refining the RAG retrieval and LLM prompting strategies. 
