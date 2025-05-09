@@ -37,7 +37,15 @@ class CurriculumAlignmentAgent(autogen.ConversableAgent):
             self._generate_alignment_reply
         )
 
-    async def _generate_alignment_reply(self, messages, sender, config):
+    async def _generate_alignment_reply(self, *args, **kwargs):
+        # ARGS will contain the agent instance itself if Autogen passes it positionally.
+        # KWARGS will contain messages, sender, config.
+        messages = kwargs.get('messages')
+        
+        if not messages:
+            print("CurriculumAlignmentAgent: CRITICAL - 'messages' not found in kwargs!")
+            return True, {"role": "assistant", "content": json.dumps({"error": "Internal: Messages not found in call"})}
+
         last_message = messages[-1]
         try:
             # Parse the incoming JSON message from Orchestrator
@@ -45,10 +53,12 @@ class CurriculumAlignmentAgent(autogen.ConversableAgent):
             user_query = data.get("user_query", "")
             learner_context = data.get("learner_context", {})
             subject_hint = learner_context.get("current_subject_hint", "Mathematics") # Default to Math
-            print(f"\n MOCK SYLLABUS CHECK for query: '{user_query}' with hint: '{subject_hint}'")
+            form_level_hint = learner_context.get("current_form_level_hint", "Form 4") # Extract form_level, default if needed
+            
+            print(f"\nCurriculumAlignmentAgent: Received query: '{user_query}', Subject Hint: '{subject_hint}', Form Hint: '{form_level_hint}'")
 
-            # Call the actual RAG function instead of the mock
-            alignment_result_json = get_syllabus_alignment_from_rag(user_query, subject_hint)
+            # Call the actual RAG function, now passing form_level_hint
+            alignment_result_json = get_syllabus_alignment_from_rag(user_query, subject_hint, form_level_hint)
             
             # Ensure the result is a JSON string for sending back
             response_content = json.dumps(alignment_result_json)

@@ -13,7 +13,7 @@ import json
 import asyncio # Added for async operations in reply and testing
 
 class OrchestratorAgent(autogen.AssistantAgent):
-    def __init__(self, name, llm_config, curriculum_alignment_agent, concept_tutor_agent, **kwargs):
+    def __init__(self, name, llm_config, curriculum_alignment_agent, concept_tutor_agent, diagnostic_agent, assessment_agent, projects_mentor_agent, content_generation_agent, analytics_progress_agent, **kwargs):
         system_message = (
             "You are the Orchestrator Agent in a multi-agent AI tutoring system for ZIMSEC O-Level students.\n"
             "Your primary roles are:\n"
@@ -35,11 +35,21 @@ class OrchestratorAgent(autogen.AssistantAgent):
             "- When concluding your turn based on current logic (e.g., after alignment check), end your message with \"exit\" to signal termination to the UserProxy in test mode."
             "Key responsibilities update:\n"
             "- If query is aligned with current context: Route the query and alignment details to the ConceptTutorAgent.\n"
-            "- Your final reply to the UserProxy should be the response received from the ConceptTutorAgent."
+            "- If query seems like a request for practice: Route to AssessmentRevisionAgent.\n"
+            "- If query seems like a request to check an answer: Route to DiagnosticRemediationAgent.\n"
+            "- If query relates to CALA projects: Route to ProjectsMentorAgent.\n"
+            "- If query asks to generate content (notes, diagrams): Route to ContentGenerationAgent.\n"
+            "- If query asks about progress/scores: Route to AnalyticsProgressAgent.\n"
+            "- Your final reply to the UserProxy should be the response received from the specialist agent."
         )
         super().__init__(name, system_message=system_message, llm_config=llm_config, **kwargs)
         self.curriculum_alignment_agent = curriculum_alignment_agent
         self.concept_tutor_agent = concept_tutor_agent # Store the concept tutor agent
+        self.diagnostic_agent = diagnostic_agent       # Store the diagnostic agent
+        self.assessment_agent = assessment_agent     # Store the assessment agent
+        self.projects_mentor_agent = projects_mentor_agent # Store the projects mentor
+        self.content_generation_agent = content_generation_agent # Store the content generator
+        self.analytics_progress_agent = analytics_progress_agent # Store the analytics agent
         # self._conversation_state = {} # State management removed for simpler simulation
         
         # Register the main reply generation function
@@ -54,20 +64,55 @@ class OrchestratorAgent(autogen.AssistantAgent):
         It processes the user query, consults curriculum alignment, and decides next steps.
         """
         last_message = messages[-1]
-        user_input = last_message.get("content", "")
-        # conversation_id = messages[0].get("id") # State management removed for simulation
+        user_input_raw = last_message.get("content", "") # Renamed to avoid confusion
 
-        print(f"\nOrchestrator: Received input: '{user_input}' from {sender.name}")
+        print(f"\nOrchestrator: Received input content: '{user_input_raw}' from {sender.name}")
+
+        user_query = user_input_raw # Default
+        form_level = "Form 4"      # Default
+        current_subject = "Mathematics" # Default
+
+        # Check if this is the first message in the list AND from UserProxy
+        # Assumes initial chat starts with UserProxy sending to Orchestrator.
+        # `messages` here is the history specific to this interaction with `sender`.
+        # If Orchestrator is initiating a chat, `messages` could be its own initial message.
+        # The crucial check is if `sender` is `UserProxy` and it's the effective start of *this specific sub-interaction*.
+        # A robust check for "the very first query of the whole session" might need more state.
+        # For now, if UserProxy sends something, and it's the only message in *this* history, assume it's initial.
+        is_initial_user_interaction = (sender.name == "UserProxy" and len(messages) == 1)
+
+        if is_initial_user_interaction:
+            try:
+                initial_payload = json.loads(user_input_raw)
+                user_query = initial_payload.get("user_query", user_input_raw)
+                form_level = initial_payload.get("form_level", form_level)
+                print(f"Orchestrator: Parsed initial message. Query: '{user_query}', Form: '{form_level}'")
+            except json.JSONDecodeError:
+                # If first message isn't JSON, use raw content as query, defaults for form/subject
+                print(f"Orchestrator: Initial message from UserProxy not JSON, using raw content as query: '{user_query}'")
+                pass # user_query already holds user_input_raw
+        else:
+            # For subsequent messages (e.g. Orchestrator receiving from another agent after initiating a chat with them)
+            # or if UserProxy sends a non-initial message.
+            user_query = user_input_raw
+            # Form level and subject would ideally be managed via conversation state here.
+            # For now, they'll use defaults if this isn't the initial user interaction.
+            print(f"Orchestrator: Processing non-initial or agent message. Query: '{user_query}'")
+
 
         # Handle empty input gracefully if it somehow gets through
-        if not user_input.strip():
-             print("\nOrchestrator: Received empty input. Ending turn.")
+        if not user_query.strip():
+             print("\nOrchestrator: Received empty query. Ending turn.")
              return True, "Looks like there was no question. Ask me something else! exit"
 
-        print(f"\nOrchestrator: Handling as initial query: '{user_input}'")
-        learner_context = {"current_subject_hint": "Mathematics"} # Default context
+        # Use the determined user_query, form_level, and current_subject
+        print(f"\nOrchestrator: Effective query for alignment: '{user_query}', Form: '{form_level}', Subject: '{current_subject}'")
+        learner_context = {
+            "current_subject_hint": current_subject,
+            "current_form_level_hint": form_level # Add form_level to learner_context
+        }
         message_for_alignment_agent = json.dumps({
-            "user_query": user_input,
+            "user_query": user_query,
             "learner_context": learner_context
         })
         
@@ -94,15 +139,19 @@ class OrchestratorAgent(autogen.AssistantAgent):
 
         reply_to_user = ""
         terminate_signal = " exit" # Add space for clarity before keyword
+        next_agent = None # Determine which specialist agent to call
+        message_for_next_agent = "" # JSON message for the specialist
 
         if alignment_data is None:
              reply_to_user = "I couldn't get syllabus alignment information. Please try again."
         elif alignment_data.get("error") == "out_of_scope" or not alignment_data.get("is_in_syllabus"):
+            # --- Query Out of Scope or Not Found --- 
             reply_to_user = "It seems your question might be outside the scope of the ZIMSEC O-Level syllabus I cover."
             if alignment_data.get("notes_for_orchestrator"):
                  reply_to_user += f" ({alignment_data.get('notes_for_orchestrator')})"
             reply_to_user += " Do you have a question related to ZIMSEC Mathematics or Combined Science?"
         elif alignment_data.get("identified_subject") and alignment_data.get("identified_subject") != learner_context.get("current_subject_hint"):
+            # --- Query Aligned but to DIFFERENT Subject --- 
             identified_subject = alignment_data.get('identified_subject')
             topic_info = f"{alignment_data.get('identified_topic', 'N/A')} / {alignment_data.get('identified_subtopic', 'N/A')}"
             question_to_user = (
@@ -118,7 +167,7 @@ class OrchestratorAgent(autogen.AssistantAgent):
             # This is where the logic from the other branch of the original stateful reply handler goes:
             if simulated_user_reply.lower() in ["yes", "ok", "sure", "yep", "please do", "switch"]:
                 # CONCEPTUAL NEXT STEP: Update context, re-align, then route to Concept Tutor for the *original* query
-                reply_to_user = f"Great! Switching context to **{identified_subject}**...\n(Next: Routing to ConceptTutorAgent for '{user_input[:30]}...')"
+                reply_to_user = f"Great! Switching context to **{identified_subject}**...\n(Next: Routing to ConceptTutorAgent for '{user_query[:30]}...')"
                 # In a real implementation: update context, re-align, route.
             else:
                  # This part of simulation won't be reached if we simulate "yes"
@@ -129,36 +178,99 @@ class OrchestratorAgent(autogen.AssistantAgent):
             # --- Query IS Aligned with Current Context --- 
             subject = alignment_data.get('identified_subject', 'the syllabus')
             topic_info = f"{alignment_data.get('identified_topic', 'N/A')} / {alignment_data.get('identified_subtopic', 'N/A')}"
-            print(f"\nOrchestrator: Query aligned with {subject} - Topic: {topic_info}. Routing to ConceptTutorAgent.")
+            print(f"\nOrchestrator: Query aligned with {subject} - Topic: {topic_info}. Determining intent...")
 
-            # Prepare message for ConceptTutorAgent
-            message_for_tutor = json.dumps({
-                "original_user_query": user_input,
-                "alignment_data": alignment_data
-            })
-
-            # Initiate chat with ConceptTutorAgent
-            # The Orchestrator initiates this chat and waits for the reply.
-            tutor_chat_results = await self.a_initiate_chat(
-                recipient=self.concept_tutor_agent,
-                message=message_for_tutor,
-                max_turns=1, # Expect one reply from the tutor for now
-                summary_method="last_msg",
-                silent=False # Let's see the tutor's reply
-            )
-            reply_from_tutor = tutor_chat_results.summary
-            
-            # The tutor's reply becomes the reply to the user
-            if reply_from_tutor:
-                reply_to_user = reply_from_tutor
-                terminate_signal = "" # Let the tutor control termination if needed later, remove orchestrator's exit
+            # --- Intent Detection (Simple Keyword Based) --- 
+            query_lower = user_query.lower()
+            if any(kw in query_lower for kw in ["practice", "quiz"]): # "question" is too broad, might overlap with tutor
+                next_agent = self.assessment_agent
+                message_for_next_agent = json.dumps({
+                    "task": "generate_questions",
+                    "topic": alignment_data.get('identified_topic', 'mixed'),
+                    "subtopic": alignment_data.get('identified_subtopic'),
+                    "form": form_level,
+                    "difficulty": "medium", 
+                    "n": 3
+                })
+                print(f"Orchestrator: Intent detected: Practice/Assess. Routing to {next_agent.name}.")
+            elif any(kw in query_lower for kw in ["check my answer", "grade my work", "diagnose this"]):
+                next_agent = self.diagnostic_agent
+                message_for_next_agent = json.dumps({
+                    "task": "diagnose_answer",
+                    "question": f"Regarding {topic_info}", # Placeholder, needs context
+                    "learner_answer": user_query, # Simplistic, assumes query is the answer
+                    "marking_rubric": {} # Placeholder
+                })
+                print(f"Orchestrator: Intent detected: Diagnose/Check Answer. Routing to {next_agent.name}.")
+            elif any(kw in query_lower for kw in ["project", "cala", "milestone", "research"]):
+                next_agent = self.projects_mentor_agent
+                # For CALA, we might need more context about current milestone/draft from user
+                # For now, send a generic request or assume it's in the query_lower
+                message_for_next_agent = json.dumps({
+                    "task": "project_guidance",
+                    "milestone": "plan", # Default/placeholder
+                    "draft_snippet": user_query # Assume query contains snippet
+                })
+                print(f"Orchestrator: Intent detected: Project/CALA. Routing to {next_agent.name}.")
+            elif any(kw in query_lower for kw in ["generate notes", "create worksheet", "make diagram"]):
+                next_agent = self.content_generation_agent
+                asset_type = "notes" # default
+                if "worksheet" in query_lower: asset_type = "worksheet"
+                if "diagram" in query_lower: asset_type = "diagram"
+                message_for_next_agent = json.dumps({
+                    "task": "generate_asset",
+                    "asset_type": asset_type,
+                    "topic": alignment_data.get('identified_topic', 'Unknown'),
+                    "subtopic": alignment_data.get('identified_subtopic'),
+                    "grade": form_level,
+                    "format": "svg" if asset_type == "diagram" else "markdown",
+                    "style_hint": "default"
+                })
+                print(f"Orchestrator: Intent detected: Content Generation. Routing to {next_agent.name}.")
+            elif any(kw in query_lower for kw in ["progress", "my scores", "dashboard"]):
+                next_agent = self.analytics_progress_agent
+                message_for_next_agent = json.dumps({
+                    "task": "serve_dashboard",
+                    "student_id": "student_001", # Placeholder student_id
+                    "invoked_by": "agent" # or "human" if triggered by direct command later
+                })
+                print(f"Orchestrator: Intent detected: Analytics/Progress. Routing to {next_agent.name}.")
             else:
-                # Handle cases where the tutor fails to reply
-                print("\nOrchestrator: ConceptTutorAgent did not provide a reply.")
-                reply_to_user = "I understand the topic is aligned, but I had trouble getting an explanation ready. Please try asking again."
-                terminate_signal = " exit" # Terminate if tutor failed
+                # Default to Concept Tutor Agent
+                next_agent = self.concept_tutor_agent
+                message_for_next_agent = json.dumps({
+                    "original_user_query": user_query,
+                    "alignment_data": alignment_data
+                })
+                print(f"Orchestrator: Intent detected: Explain/Tutor. Routing to {next_agent.name}.")
 
-        # Append termination signal ONLY if we didn't get a reply from the tutor
+            # --- Initiate chat with the selected specialist agent --- 
+            if next_agent and message_for_next_agent:
+                # Increased max_turns to allow for tool use by specialist agents
+                # A tool call cycle: LLM suggests tool -> Agent executes -> Agent sends result to LLM -> LLM replies
+                # This needs more than 1 turn.
+                agent_chat_results = await self.a_initiate_chat(
+                    recipient=next_agent,
+                    message=message_for_next_agent,
+                    max_turns=3, # Increased from potential default of 1
+                    summary_method="last_msg",
+                    silent=False # Keep sub-chat visible for debugging
+                )
+                specialist_reply = agent_chat_results.summary
+                print(f"\nOrchestrator: Received from {next_agent.name}: {specialist_reply}")
+                
+                # The Orchestrator's final reply to the UserProxy should be the specialist's reply
+                reply_to_user = specialist_reply
+                
+                if not specialist_reply: # Handle case where specialist provides no summary/reply
+                    reply_to_user = f"The {next_agent.name} did not provide a reply. Please try again."
+                    print(f"Orchestrator: {next_agent.name} did not provide a reply.")
+
+            else:
+                # This case should ideally not be reached if alignment and intent detection work
+                reply_to_user = "I have the syllabus alignment but I'm not sure how to proceed with that specific intent."
+
+        # Append termination signal ONLY if we didn't get a reply from the specialist or other error occurred
         final_reply = reply_to_user + terminate_signal 
         print(f"\nOrchestrator responding to UserProxy: {final_reply}")
         return True, final_reply
@@ -190,7 +302,12 @@ if __name__ == '__main__':
         name="OrchestratorIsolatedTest",
         llm_config={"config_list": config_list_test},
         curriculum_alignment_agent=curriculum_agent_for_test,
-        concept_tutor_agent=curriculum_agent_for_test
+        concept_tutor_agent=curriculum_agent_for_test,
+        diagnostic_agent=curriculum_agent_for_test,
+        assessment_agent=curriculum_agent_for_test,
+        projects_mentor_agent=curriculum_agent_for_test,
+        content_generation_agent=curriculum_agent_for_test,
+        analytics_progress_agent=curriculum_agent_for_test
     )
 
     # To test _generate_orchestrator_reply, we need an event loop and to simulate an incoming message.

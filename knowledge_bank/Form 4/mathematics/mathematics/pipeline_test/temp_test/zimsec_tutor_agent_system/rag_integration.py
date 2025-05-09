@@ -112,10 +112,14 @@ def _initialize_rag_components():
 _initialize_rag_components() # Initialize on first import
 
 
-def get_syllabus_alignment_from_rag(query: str, user_form_hint: str) -> Dict[str, Any]:
+def get_syllabus_alignment_from_rag(query: str, subject_hint: str, form_level: str) -> Dict[str, Any]:
     """
     Uses the SyllabusProcessor from rag_oo_pipeline to classify the query
     and returns a structured dictionary for the CurriculumAlignmentAgent.
+    Args:
+        query: The user's query string.
+        subject_hint: The current subject context (e.g., "Mathematics").
+        form_level: The specific form level (e.g., "Form 4") to filter syllabus by.
     """
     if not syllabus_processor_instance:
         return {
@@ -126,9 +130,10 @@ def get_syllabus_alignment_from_rag(query: str, user_form_hint: str) -> Dict[str
 
     try:
         # Use COLLECTIONS["syllabus"] for the collection name (SyllabusProcessor does this internally)
+        print(f"SyllabusProcessor classifying question against syllabus (Form Filter: {form_level}).") # Added print
         classified_docs: List[Document] = syllabus_processor_instance.classify_question(
             question=query, 
-            user_form=user_form_hint,
+            user_form=form_level, # Use the passed form_level here
             k=1 # Get top 1 match
         )
 
@@ -146,7 +151,8 @@ def get_syllabus_alignment_from_rag(query: str, user_form_hint: str) -> Dict[str
         # These might need adjustment based on actual keys in your syllabus Qdrant metadata.
         identified_topic = metadata.get("topic", "Unknown Topic")
         identified_subtopic = metadata.get("subtopic", "Unknown Subtopic")
-        identified_form = metadata.get("form", user_form_hint) # Fallback to user hint
+        # identified_form should now reliably come from the matched document due to filtering
+        identified_form = metadata.get("form", form_level) # Fallback to input form_level
         score = metadata.get("retrieval_score", metadata.get("score", 0.0)) # 'score' or 'retrieval_score'
         
         # Placeholder for outcomes and terms - these need to be in Qdrant metadata
@@ -194,7 +200,7 @@ def get_syllabus_alignment_from_rag(query: str, user_form_hint: str) -> Dict[str
             "matched_outcomes": matched_outcomes,
             "mandatory_terms": mandatory_terms,
             "syllabus_references": syllabus_references, # e.g., [{"doc_id": "math_syllabus.pdf", "page": 10, "section": "2.3"}]
-            "identified_subject": "Mathematics", # Assuming fixed for now, or derive from form/topic
+            "identified_subject": subject_hint, # Use the provided subject_hint
             "identified_topic": identified_topic,
             "identified_subtopic": identified_subtopic,
             "identified_form": identified_form, # Add the identified form
@@ -258,7 +264,7 @@ if __name__ == "__main__":
         # Example: "Form 4", "Form 3", etc.
         test_query = "median from grouped data"
         test_form_hint = "Form 4" 
-        alignment = get_syllabus_alignment_from_rag(test_query, test_form_hint)
+        alignment = get_syllabus_alignment_from_rag(test_query, "Mathematics", test_form_hint)
         print(f"Alignment for '{test_query}' (Form Hint: {test_form_hint}):")
         print(json.dumps(alignment, indent=2))
 

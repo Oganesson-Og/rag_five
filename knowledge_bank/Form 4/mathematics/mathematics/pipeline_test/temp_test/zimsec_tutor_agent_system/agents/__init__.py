@@ -3,4 +3,21 @@
 
 from .curriculum_alignment_agent import CurriculumAlignmentAgent
 from .orchestrator_agent import OrchestratorAgent
-from .concept_tutor_agent import ConceptTutorAgent 
+from .concept_tutor_agent import ConceptTutorAgent
+from .diagnostic_remediation_agent import DiagnosticRemediationAgent
+from .assessment_revision_agent import AssessmentRevisionAgent
+# Import new agents
+from .projects_mentor_agent import ProjectsMentorAgent
+from .content_generation_agent import ContentGenerationAgent
+from .analytics_progress_agent import AnalyticsProgressAgent
+
+__all__ = [
+    "CurriculumAlignmentAgent",
+    "OrchestratorAgent",
+    "ConceptTutorAgent",
+    "DiagnosticRemediationAgent",
+    "AssessmentRevisionAgent",
+    "ProjectsMentorAgent",
+    "ContentGenerationAgent",
+    "AnalyticsProgressAgent",
+] 

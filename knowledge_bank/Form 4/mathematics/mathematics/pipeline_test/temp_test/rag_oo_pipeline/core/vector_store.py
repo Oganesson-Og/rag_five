@@ -19,7 +19,7 @@ from qdrant_client import QdrantClient
 from qdrant_client.models import Filter, FieldCondition, MatchValue, PointStruct # SearchRequest might not be needed if not used
 from rich.console import Console
 
-from ..config import QDRANT_PATH, COLLECTIONS
+from .. import config as dynamic_rag_config
 from .embeddings import EmbeddingModelFactory # To get the embedding model
 
 console = Console()
@@ -51,20 +51,23 @@ class QdrantService:
         """Initializes and returns the Qdrant client (singleton for the service)."""
         if QdrantService._client_instance is None:
             try:
-                os.makedirs(QDRANT_PATH, exist_ok=True)
-                console.print(f"[dim]Initializing Qdrant client at path: {QDRANT_PATH}...[/dim]")
-                client = QdrantClient(path=QDRANT_PATH)
+                # Explicitly use the QDRANT_PATH from the config module that might have been patched
+                current_qdrant_path = dynamic_rag_config.QDRANT_PATH
+
+                os.makedirs(current_qdrant_path, exist_ok=True)
+                console.print(f"[dim]Initializing Qdrant client at path: {current_qdrant_path}...[/dim]")
+                client = QdrantClient(path=current_qdrant_path)
                 # Verify collections exist (optional, good for early failure detection)
-                for collection_name in COLLECTIONS.values():
+                for collection_name in dynamic_rag_config.COLLECTIONS.values(): # Also use dynamic_rag_config here
                     try:
                         client.get_collection(collection_name=collection_name)
                     except Exception as e:
                         console.print(f"[bold yellow]Warning: Collection '{collection_name}' not found or Qdrant issue: {e}. Ensure setup script was run.[/bold yellow]")
                         # Depending on strictness, you might sys.exit(1) here
                 QdrantService._client_instance = client
-                console.print(f"[dim]Qdrant client initialized. Connected to: {QDRANT_PATH}[/dim]")
+                console.print(f"[dim]Qdrant client initialized. Connected to: {current_qdrant_path}[/dim]")
             except Exception as e:
-                console.print(f"[bold red]Fatal Error connecting to Qdrant at '{QDRANT_PATH}': {e}[/bold red]")
+                console.print(f"[bold red]Fatal Error connecting to Qdrant at '{current_qdrant_path}': {e}[/bold red]")
                 console.print(f"[bold yellow]Ensure Qdrant database exists (run setup script) and path is correct.[/bold yellow]")
                 sys.exit(1)
         return QdrantService._client_instance
@@ -79,7 +82,8 @@ class QdrantService:
         filter_subtopic: Optional[str] = None
     ) -> List[Document]:
         """Search Qdrant directly, with optional metadata filtering."""
-        if collection_name not in COLLECTIONS.values():
+        # Ensure collection_name is valid by checking against dynamically loaded COLLECTIONS
+        if collection_name not in dynamic_rag_config.COLLECTIONS.values():
             console.print(f"[bold red]Error: Collection '{collection_name}' is not defined in configuration.[/bold red]")
             return []
         
@@ -146,7 +150,7 @@ if __name__ == '__main__':
         print(f"\nSearching syllabus for: '{test_query_syllabus}'")
         syllabus_docs = qdrant_service.search(
             query=test_query_syllabus, 
-            collection_name=COLLECTIONS["syllabus"],
+            collection_name=dynamic_rag_config.COLLECTIONS["syllabus"],
             form="Form 3", # Example filter
             k=2
         )
