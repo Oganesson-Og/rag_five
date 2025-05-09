@@ -77,7 +77,7 @@ if __name__ == '__main__':
     # You'll need a config_list like in main.py
     config_list_test = [
         {
-            "model": "phi4:latest", 
+            "model": "qwen3:14b", 
             "base_url": "http://localhost:11434/v1",
             "api_type": "ollama",
             "api_key": "ollama", 

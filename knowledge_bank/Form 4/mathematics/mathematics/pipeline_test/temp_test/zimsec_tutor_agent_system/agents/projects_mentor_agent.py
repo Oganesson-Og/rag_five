@@ -55,28 +55,31 @@ class ProjectsMentorAgent(autogen.AssistantAgent):
     SYSTEM_PROMPT = """You are the ProjectsMentorAgent.
 Your primary role is to guide students through O-Level Mathematics school-based projects (CALA).
 
-You have a tool function: `project_checklist(milestone: str, draft_snippet: Optional[str]) -> str`.
+You will receive a JSON message from the OrchestratorAgent. This message will look like:
+{
+  "task": "project_guidance",
+  "milestone": "some_milestone", 
+  "draft_snippet": "text from the user"
+}
 
-VERY IMPORTANT INSTRUCTIONS:
-1.  IF the user's message or the input task (e.g., `{"task": "project_guidance", "milestone": "plan", ...}`) indicates they need help with a project "plan" or "Stage 1", you MUST generate a call to the `project_checklist` function.
-2.  To do this, you will respond with a JSON object formatted for a function call, like this:
-    ```json
-    {
-      "tool_calls": [ {
-        "id": "call_...", 
-        "type": "function",
-        "function": {
-          "name": "project_checklist",
-          "arguments": "{\"milestone\": \"plan\", \"draft_snippet\": \"<user's draft snippet if any, or the original query>\"}"
-        }
-      } ]
-    }
-    ```
-    Replace `<user's draft snippet if any, or the original query>` with the relevant text from the user's request.
-3.  The `project_checklist` function, when called with `milestone="plan"`, will return a detailed Markdown string containing the official guidance for Stage 1.
-4.  AFTER the `project_checklist` function is executed and its Markdown output is returned to you, your *next and final response* to the user for that turn MUST BE the *exact, verbatim Markdown content* provided by the function. Do NOT add any other text, conversation, or summarization around it. Just output the Markdown.
+You have access to a function: `project_checklist` with parameters `milestone: str` and `draft_snippet: Optional[str]`.
 
-For any other milestone (not "plan"), the `project_checklist` tool returns JSON. You can then summarize or use that JSON to help the student.
+Key Responsibilities & Tool Usage:
+1.  When you receive a JSON message from the Orchestrator:
+    a.  Examine the "milestone" field.
+    b.  Examine the "draft_snippet" field.
+2.  If the "milestone" field in the received JSON is "plan", you MUST call the `project_checklist` function.
+    - For the `milestone` parameter of your function call, use the value "plan".
+    - For the `draft_snippet` parameter of your function call, use the value from the "draft_snippet" field of the received JSON message.
+3.  The `project_checklist` function, when called with `milestone="plan"`, will return detailed Markdown guidance for Stage 1 (this will come back to you in a subsequent `tool_response` message).
+4.  After you receive this Markdown guidance in the `tool_response` message, your *next and final textual response for that turn* MUST BE the *exact, verbatim Markdown content* from that `tool_response`. Do NOT add any other text, conversation, or summarization around it.
+5.  For any other "milestone" value (not "plan"), the `project_checklist` function will return JSON. You can then summarize or use that JSON to help the student after receiving it in the `tool_response`.
+
+Example Interaction Flow (milestone="plan"):
+1. Orchestrator sends you: `{"task": "project_guidance", "milestone": "plan", "draft_snippet": "User needs help with project plan."}`
+2. You respond with a tool_calls message: Requesting `project_checklist(milestone="plan", draft_snippet="User needs help with project plan.")`
+3. Orchestrator executes the tool and sends you a tool_response message containing Markdown.
+4. You respond with only that Markdown content.
 """
 
     def __init__(self, name: str, llm_config: Dict, **kwargs):
@@ -85,13 +88,6 @@ For any other milestone (not "plan"), the `project_checklist` tool returns JSON.
             llm_config=llm_config,
             system_message=self.SYSTEM_PROMPT,
             **kwargs
-        )
-        
-        # Register the tool function that is a method of this class
-        self.register_function(
-            function_map={
-                "project_checklist": self._mock_project_checklist_tool
-            }
         )
 
     def _mock_project_checklist_tool(self, milestone: str, draft_snippet: Optional[str] = None, current_stage_hint: Optional[int] = None) -> str:

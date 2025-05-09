@@ -42,7 +42,11 @@ class OrchestratorAgent(autogen.AssistantAgent):
             "- If query asks about progress/scores: Route to AnalyticsProgressAgent.\n"
             "- Your final reply to the UserProxy should be the response received from the specialist agent."
         )
-        super().__init__(name, system_message=system_message, llm_config=llm_config, **kwargs)
+        super().__init__(name, 
+                         system_message=system_message, 
+                         llm_config=llm_config,
+                         code_execution_config={"last_n_messages": 3, "use_docker": False},
+                         **kwargs)
         self.curriculum_alignment_agent = curriculum_alignment_agent
         self.concept_tutor_agent = concept_tutor_agent # Store the concept tutor agent
         self.diagnostic_agent = diagnostic_agent       # Store the diagnostic agent
@@ -246,29 +250,41 @@ class OrchestratorAgent(autogen.AssistantAgent):
 
             # --- Initiate chat with the selected specialist agent --- 
             if next_agent and message_for_next_agent:
-                # Increased max_turns to allow for tool use by specialist agents
                 # A tool call cycle: LLM suggests tool -> Agent executes -> Agent sends result to LLM -> LLM replies
-                # This needs more than 1 turn.
-                agent_chat_results = await self.a_initiate_chat(
+                # max_turns=3 should be sufficient for one tool call cycle by the specialist.
+                # Turn 1 from specialist: LLM decides to call tool, emits tool_calls message.
+                # (Tool execution happens here, initiated by the Orchestrator as the chat caller)
+                # Turn 2 from specialist: LLM receives tool_response, formulates final textual reply.
+                # (Actually, Autogen might count these differently. Let's stick with 3 for now as a common value for one tool cycle)
+                
+                function_map_for_sub_chat = None
+                if next_agent == self.projects_mentor_agent:
+                    # Ensure the ProjectsMentorAgent has registered its tool with a callable method.
+                    # The method must be bound to the instance for Orchestrator to call it.
+                    if hasattr(self.projects_mentor_agent, "_mock_project_checklist_tool"):
+                        function_map_for_sub_chat = {
+                            "project_checklist": self.projects_mentor_agent._mock_project_checklist_tool
+                        }
+                        print(f"Orchestrator: Providing function 'project_checklist' for sub-chat with {self.projects_mentor_agent.name}")
+                    else:
+                        print(f"Orchestrator: WARNING - {self.projects_mentor_agent.name} does not have '_mock_project_checklist_tool' method.")
+                
+                print(f"\nOrchestrator: Initiating chat with {next_agent.name} with message: {message_for_next_agent}")
+                specialist_chat_results = await self.a_initiate_chat(
                     recipient=next_agent,
                     message=message_for_next_agent,
-                    max_turns=3, # Increased from potential default of 1
+                    max_turns=3, 
                     summary_method="last_msg",
-                    silent=False # Keep sub-chat visible for debugging
+                    silent=False,
+                    function_map=function_map_for_sub_chat # Pass the function map for the sub-chat
                 )
-                specialist_reply = agent_chat_results.summary
-                print(f"\nOrchestrator: Received from {next_agent.name}: {specialist_reply}")
-                
-                # The Orchestrator's final reply to the UserProxy should be the specialist's reply
-                reply_to_user = specialist_reply
-                
-                if not specialist_reply: # Handle case where specialist provides no summary/reply
-                    reply_to_user = f"The {next_agent.name} did not provide a reply. Please try again."
-                    print(f"Orchestrator: {next_agent.name} did not provide a reply.")
-
+                reply_to_user = specialist_chat_results.summary
+                print(f"\nOrchestrator: Received summary from {next_agent.name}: {reply_to_user}")
             else:
-                # This case should ideally not be reached if alignment and intent detection work
-                reply_to_user = "I have the syllabus alignment but I'm not sure how to proceed with that specific intent."
+                # If no specific agent was determined (e.g., after context switch simulation without further routing)
+                # This path should ideally not be hit if alignment always leads to a specialist or out-of-scope.
+                if not reply_to_user: # Check if reply_to_user was set by other logic paths
+                    reply_to_user = "I've processed the alignment. What would you like to do next with this information?"
 
         # Append termination signal ONLY if we didn't get a reply from the specialist or other error occurred
         final_reply = reply_to_user + terminate_signal 

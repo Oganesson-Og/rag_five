@@ -1,96 +1,187 @@
-# Summary of the ZIMSEC AI Tutor Agent System
+# Summary of the ZIMSEC AI Tutor Agent System (ZIMSEC-ATS)
 
-This document provides an overview of the multi-agent AI tutoring system built using Autogen and integrated with the existing RAG pipeline.
+**Last Updated:** 2024-05-09
 
-## 1. System Location
+This document provides an overview of the multi-agent AI tutoring system built using Autogen, integrated with an existing RAG pipeline, and the current state of development.
 
-The new agentic system is located in:
+## 1. System Goal
+
+To create a sophisticated, multi-agent AI tutoring system for ZIMSEC O-Level Mathematics students, capable of curriculum alignment, concept explanation, project mentorship, diagnostics, assessment, content generation, and progress analytics.
+
+## 2. System Location
+
+The agent system code is located in:
 `knowledge_bank/Form 4/mathematics/mathematics/pipeline_test/temp_test/zimsec_tutor_agent_system/`
 
-This directory contains:
-- `main.py`: The main script to run the agent chat.
-- `rag_integration.py`: Handles the connection and calls to the underlying RAG pipeline.
-- `agents/`: A subdirectory containing the definitions for each agent:
-    - `orchestrator_agent.py`
-    - `curriculum_alignment_agent.py`
-    - `concept_tutor_agent.py`
-    - (UserProxyAgent is instantiated directly in `main.py`)
+Key files and directories:
+- `main.py`: Main script to initialize and run the agent chat.
+- `rag_integration.py`: Module to connect and call the existing RAG pipeline.
+- `agents/`: Subdirectory containing individual agent definitions:
+    - `__init__.py`: Makes agent classes easily importable.
+    - `orchestrator_agent.py`: Central coordinator.
+    - `curriculum_alignment_agent.py`: Handles syllabus checks.
+    - `concept_tutor_agent.py`: Explains concepts.
+    - `projects_mentor_agent.py`: Guides CALA projects (tool-enabled).
+    - `diagnostic_remediation_agent.py`: (Skeleton) For evaluating answers.
+    - `assessment_revision_agent.py`: (Skeleton) For generating practice.
+    - `content_generation_agent.py`: (Skeleton) For creating assets.
+    - `analytics_progress_agent.py`: (Skeleton) For learner profiles.
+- `requirements.txt`: Python dependencies for the agent system (lives one level up in `temp_test/`).
 
-## 2. How to Run
+## 3. How to Run the System
 
-1.  Navigate to the agent system's directory:
+1.  **Ensure Prerequisites (Section 4) are met.**
+2.  Navigate to the agent system's directory:
     ```bash
     cd "knowledge_bank/Form 4/mathematics/mathematics/pipeline_test/temp_test/zimsec_tutor_agent_system/"
     ```
-2.  Run the main script:
+3.  Run the main script:
     ```bash
     python main.py
     ```
-    The script currently runs with a hardcoded query (e.g., "Tell me about the median from a grouped frequency table.") and terminates after the interaction.
+    The script currently runs with a hardcoded query in `main.py` (e.g., "I need help with my CALA project plan for mathematics."). It is set to `TERMINATE` mode for controlled testing.
 
-## 3. Prerequisites & Dependencies
+## 4. Prerequisites & Dependencies
 
-Before running the system, ensure the following are set up:
-
-### a. Python Dependencies:
-   Install all required packages. The primary ones for the agent system are `pyautogen` (specifically `autogen[ollama]>=0.9.1`) and `prompt_toolkit`. These, along with dependencies for the RAG pipeline, should be in:
-   `knowledge_bank/Form 4/mathematics/mathematics/pipeline_test/temp_test/requirements.txt`
-   
-   It's recommended to use a virtual environment:
+### a. Python Environment:
+   - It's highly recommended to use a virtual environment.
+   - Install dependencies from:
+     `knowledge_bank/Form 4/mathematics/mathematics/pipeline_test/temp_test/requirements.txt`
+     This includes:
+     - `pyautogen[openai,ollama]==0.9.0` (Note: `openai` extra is included for robust tool calling with Ollama models via OpenAI-compatible endpoint)
+     - `prompt_toolkit`
+     - Dependencies for the `rag_oo_pipeline` (e.g., `langchain`, `qdrant-client`).
    ```bash
-   python -m venv .venv
-   source .venv/bin/activate  # or .venv\Scripts\activate on Windows
-   pip install -r path/to/your/requirements.txt 
+   # From the 'temp_test' directory:
+   python -m venv .venv 
+   # Activate: .venv/bin/activate (Linux/macOS) or .venv\Scripts\activate (Windows)
+   pip install -r requirements.txt
    ```
-   (Adjust the path to `requirements.txt` as needed from your CWD when installing).
 
-### b. Ollama LLM:
-   - An Ollama server must be running.
-   - A compatible LLM needs to be pulled and available (e.g., `phi4:latest`, which is configured in `main.py`). You can pull models using `ollama pull <model_name>`.
+### b. Ollama LLM Server:
+   - An Ollama server must be running locally (default: `http://localhost:11434`).
+   - The model `qwen3:14b` must be pulled and available (`ollama pull qwen3:14b`). This model is configured in `main.py` as it supports tool calling better than `phi3` for current Autogen versions.
 
-### c. RAG Pipeline (`rag_oo_pipeline`):
-   The agent system relies on the pre-existing RAG pipeline located at:
+### c. Existing RAG Pipeline (`rag_oo_pipeline`):
+   The agent system leverages the pre-existing RAG pipeline located at:
    `knowledge_bank/Form 4/mathematics/mathematics/pipeline_test/temp_test/rag_oo_pipeline/`
 
-   This RAG pipeline has its own prerequisites:
-   - **Qdrant Database**: A Qdrant vector database must be set up and populated with:
-     - Syllabus data (collection name: `math_syllabus`)
-     - Content data (collection name: `math_content_combined`)
-     The database files are expected at `knowledge_bank/Form 4/mathematics/mathematics/pipeline_test/temp_test/rag_oo_pipeline/qdrant_db_combined/`.
-     The `rag_oo_pipeline` likely has setup scripts to create and populate these collections.
-   - **Knowledge Bank JSON**: The file `math_knowledge_bank.json` must be present in the `knowledge_bank/Form 4/mathematics/mathematics/pipeline_test/temp_test/rag_oo_pipeline/` directory.
-   - **Embedding Models**: The embedding models used by the RAG pipeline (e.g., `nomic-embed-text` via Ollama or `all-MiniLM-L6-v2` via HuggingFace, as configured in `rag_oo_pipeline/config.py`) must be accessible.
+   This RAG pipeline requires:
+   - **Qdrant Vector Database**:
+     - Must be set up and populated.
+     - Collections: `math_syllabus` and `math_content_combined`.
+     - Expected DB path: `knowledge_bank/Form 4/mathematics/mathematics/pipeline_test/temp_test/rag_oo_pipeline/qdrant_db_combined/`.
+     - The `rag_oo_pipeline` should have its own scripts/documentation for this setup.
+   - **Knowledge Bank JSON**:
+     - `math_knowledge_bank.json` must be present in `knowledge_bank/Form 4/mathematics/mathematics/pipeline_test/temp_test/rag_oo_pipeline/`.
+   - **Embedding Models**:
+     - As configured in `rag_oo_pipeline/config.py` (e.g., `nomic-embed-text` via Ollama). Ensure these are accessible.
 
-## 4. System Overview
+## 5. Current System Status & Functionality
 
-- **Framework**: Built with Microsoft Autogen.
-- **Core Agents**:
-    - `UserProxyAgent`: Represents the learner, initiates the chat. Currently set to `TERMINATE` mode.
-    - `OrchestratorAgent`: Central coordinator. Receives user query, routes to other agents.
-    - `CurriculumAlignmentAgent`: Ensures queries and content align with the syllabus. Uses the RAG pipeline (`SyllabusProcessor`) for this. *The Orchestrator always consults this agent first.*
-    - `ConceptTutorAgent`: Provides explanations for concepts. Uses the RAG pipeline (`KnowledgeBaseRetriever` and LLM calls) to generate detailed responses.
-- **Workflow**:
-    1. UserProxy sends query to Orchestrator.
-    2. Orchestrator sends query to CurriculumAlignmentAgent.
-    3. CurriculumAlignmentAgent uses RAG to check syllabus, returns alignment data (JSON).
-    4. Orchestrator receives alignment. If aligned for tutoring:
-        a. Sends query + alignment data to ConceptTutorAgent.
-        b. ConceptTutorAgent uses RAG to retrieve knowledge content.
-        c. ConceptTutorAgent uses its LLM to generate an explanation based on the query, alignment, and retrieved knowledge.
-        d. ConceptTutorAgent returns explanation to Orchestrator.
-    5. Orchestrator relays the final response to the UserProxy.
-- **Current State**:
-    - Successfully demonstrates the above flow for a math query ("Tell me about the median from a grouped frequency table.").
-    - Integration with the actual `rag_oo_pipeline` components for syllabus alignment and knowledge retrieval is complete (replacing previous mock logic).
-    - Pathing issues for `KNOWLEDGE_BANK_PATH` and `QDRANT_PATH` (used by `rag_oo_pipeline`) have been addressed in `rag_integration.py` to work correctly when the agent system is run.
+### a. Implemented Agents & Core Workflow:
+    - **UserProxyAgent**: Initiates chat with a structured JSON query (see `main.py`). `TERMINATE` mode.
+    - **OrchestratorAgent**:
+        - Receives query.
+        - **Always** calls `CurriculumAlignmentAgent` first.
+        - Parses alignment.
+        - Routes to the appropriate specialist agent based on simple intent detection (keywords).
+        - Equipped with `code_execution_config` to run tools requested by specialist agents.
+        - Relays specialist's final response to `UserProxy`.
+    - **CurriculumAlignmentAgent**:
+        - Receives query and context from Orchestrator.
+        - Uses `rag_integration.py` to call `SyllabusProcessor` from the `rag_oo_pipeline`.
+        - Returns structured JSON alignment data.
+    - **ConceptTutorAgent**:
+        - Receives query and alignment data.
+        - Uses `rag_integration.py` to call `KnowledgeBaseRetriever` from `rag_oo_pipeline`.
+        - Uses its LLM to generate an explanation.
+    - **ProjectsMentorAgent**:
+        - Intended to guide CALA projects.
+        - Has a mock tool `_mock_project_checklist_tool` to provide Stage 1 guidance.
+        - Its LLM is configured with the tool schema (`PROJECT_CHECKLIST_TOOL_SCHEMA` in `main.py`).
+        - The `OrchestratorAgent` passes its `_mock_project_checklist_tool` method in the `function_map` during sub-chats.
+        - **Current Focus of Debugging**: Ensuring this agent correctly requests the tool and the Orchestrator executes it.
 
-## 5. To Get Started / Test
+### b. RAG Integration:
+    - `rag_integration.py` successfully bridges the agent system with `rag_oo_pipeline`.
+    - Handles path resolution for `KNOWLEDGE_BANK_PATH` and `QDRANT_PATH` for the RAG components.
 
-1.  Ensure all prerequisites in section 3 are met (Python environment, Ollama, RAG pipeline setup including Qdrant & JSON knowledge bank).
-2.  Navigate to `knowledge_bank/Form 4/mathematics/mathematics/pipeline_test/temp_test/zimsec_tutor_agent_system/`.
-3.  Run `python main.py`.
-4.  Observe the console output to see the agent interactions and the final response.
-    - The `main.py` currently has a hardcoded query. You can change the `initial_query` variable in `main.py` to test other questions.
-    - Debug prints in `rag_integration.py` will show the resolved paths for Qdrant and the knowledge bank.
+### c. Skeleton Agents:
+    - `DiagnosticRemediationAgent`
+    - `AssessmentRevisionAgent`
+    - `ContentGenerationAgent`
+    - `AnalyticsProgressAgent`
+    These are instantiated in `main.py` but have minimal placeholder logic. Their system prompts and core functionalities need to be developed.
 
-This system forms a foundational layer for a more complex AI tutoring application. Future work could involve enabling more interactive chat, implementing other agent roles (Assessment, Project Mentor, etc.), and refining the RAG retrieval and LLM prompting strategies. 
+### d. Tool Calling:
+    - The immediate focus has been on making `ProjectsMentorAgent` use its `project_checklist` tool correctly.
+    - **Key setup**:
+        1. `ProjectsMentorAgent` has the tool schema in its `llm_config` (`main.py`).
+        2. `ProjectsMentorAgent` does *not* register the function itself via `self.register_function()`.
+        3. `OrchestratorAgent` has `code_execution_config={"last_n_messages": 3, "use_docker": False}`.
+        4. When `OrchestratorAgent` calls `ProjectsMentorAgent`, it passes `function_map={"project_checklist": self.projects_mentor_agent._mock_project_checklist_tool}`.
+    - This setup is intended to make `ProjectsMentorAgent` emit a `tool_calls` message, which `OrchestratorAgent` then executes.
+
+## 6. What Has Been Done Recently (Key Developments)
+
+- **Full Agent Suite Instantiation**: All 7 specialist agents + Orchestrator + UserProxy are now defined and instantiated in `main.py`.
+- **RAG Integration**: Successfully connected `CurriculumAlignmentAgent` and `ConceptTutorAgent` to the actual `rag_oo_pipeline` components.
+- **Import Refactoring**: Changed all internal imports (`agents` and `rag_integration`) to be absolute based on `sys.path` modification in `main.py`, resolving previous relative import issues.
+- **Dependency Management**: Cleaned up `requirements.txt` and resolved issues with `pyautogen` and `openai` dependencies, settling on `pyautogen[openai,ollama]==0.9.0`.
+- **Tool Calling Refinement (Ongoing)**:
+    - Iteratively refined the system prompts and configurations for `OrchestratorAgent` and `ProjectsMentorAgent` to achieve correct tool invocation and execution.
+    - Adjusted `max_turns` in sub-chats.
+    - Ensured `ProjectsMentorAgent`'s system prompt is very specific about how it should handle incoming JSON and request tools.
+
+## 7. Next Steps & Where to Contribute
+
+### a. Verify `ProjectsMentorAgent` Tool Call:
+    - **Immediate Task**: Run `python main.py` (with the query for CALA project plan) and meticulously check the console logs.
+    - **Expected Correct Behavior**:
+        1. `Orchestrator` routes to `ProjectsMentorAgent`.
+        2. `ProjectsMentorAgent` receives the JSON, its LLM decides to use the tool, and it sends a message containing `tool_calls` (NOT `Suggested tool call`).
+        3. `Orchestrator` executes `_mock_project_checklist_tool` (look for the `[Tool Method - _mock_project_checklist_tool]` log).
+        4. `Orchestrator` sends a `tool_response` (the Markdown) back to `ProjectsMentorAgent`.
+        5. `ProjectsMentorAgent` replies with *only* the Markdown content.
+        6. `Orchestrator` relays this to `UserProxy`, and the chat terminates cleanly.
+    - If this flow isn't happening, the interaction between `ProjectsMentorAgent`'s prompt, its `llm_config` (with the tool schema), and the `OrchestratorAgent`'s `function_map` execution needs further debugging.
+
+### b. Develop Skeleton Agents:
+    - **`DiagnosticRemediationAgent`**:
+        - Define system prompt for evaluating answers, identifying errors, and suggesting remediation.
+        - Implement mock (or RAG-based) functions for `_diagnose_answer`, `_suggest_remediation_steps`.
+        - Integrate tool schemas and `Orchestrator` routing.
+    - **`AssessmentRevisionAgent`**:
+        - System prompt for generating practice questions, quizzes, and tracking mastery.
+        - Mock/RAG functions for `_generate_assessment_items`, `_grade_submission`.
+        - Integrate.
+    - **`ContentGenerationAgent`**:
+        - System prompt for creating notes, examples, diagrams.
+        - Mock/RAG/LLM functions for `_generate_learning_material`.
+        - Integrate.
+    - **`AnalyticsProgressAgent`**:
+        - System prompt for managing learner profiles, visualizing progress.
+        - Mock functions for `_update_learner_profile`, `_get_progress_summary`.
+        - Integrate.
+
+### c. Refine Orchestrator Routing & State Management:
+    - The current intent detection in `OrchestratorAgent` is basic (keyword-based). Improve this using more sophisticated NLP or LLM-based intent classification.
+    - Implement robust conversation state management if chats need to become multi-turn and remember context beyond the immediate query (currently simulated for context-switching).
+    - Ensure the Orchestrator can handle responses from all new agents appropriately.
+
+### d. Enhance RAG Capabilities:
+    - Review and potentially refine the `SyllabusProcessor` and `KnowledgeBaseRetriever` in the `rag_oo_pipeline` for better accuracy and relevance.
+    - Expand the knowledge base.
+
+### e. Testing & Evaluation:
+    - Develop a suite of test queries to cover various scenarios and agent interactions.
+    - Evaluate the quality of responses and the accuracy of tool usage.
+
+## 8. Long-Term Vision
+- Fully interactive, multi-turn conversations.
+- Dynamic learning paths based on student performance.
+- Integration with a user interface.
+- Expansion to other ZIMSEC subjects.
+
+This summary should provide your colleague with a solid understanding of the project's current state and where they can contribute most effectively. 

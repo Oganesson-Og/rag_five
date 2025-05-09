@@ -10,14 +10,16 @@ import os # Add this
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 # Now use absolute imports based on the new sys.path
-from zimsec_tutor_agent_system.agents.curriculum_alignment_agent import CurriculumAlignmentAgent
-from zimsec_tutor_agent_system.agents.orchestrator_agent import OrchestratorAgent
-from zimsec_tutor_agent_system.agents.concept_tutor_agent import ConceptTutorAgent
-from zimsec_tutor_agent_system.agents.diagnostic_remediation_agent import DiagnosticRemediationAgent
-from zimsec_tutor_agent_system.agents.assessment_revision_agent import AssessmentRevisionAgent
-from zimsec_tutor_agent_system.agents.projects_mentor_agent import ProjectsMentorAgent
-from zimsec_tutor_agent_system.agents.content_generation_agent import ContentGenerationAgent
-from zimsec_tutor_agent_system.agents.analytics_progress_agent import AnalyticsProgressAgent
+from zimsec_tutor_agent_system.agents import (
+    CurriculumAlignmentAgent,
+    OrchestratorAgent,
+    ConceptTutorAgent,
+    DiagnosticRemediationAgent,
+    AssessmentRevisionAgent,
+    ProjectsMentorAgent,
+    ContentGenerationAgent,
+    AnalyticsProgressAgent
+)
 
 # Shared config_list for Ollama models accessed via OpenAI API type
 # Using qwen3:14b as per user's last selection. Removed timeout for now to pass Pydantic.
@@ -39,6 +41,16 @@ config_list_openai_ollama = [
 # 'api_key': 'NULL' # Required by autogen but not used by local ollama
 # }
 # ]
+
+# Configuration for LLM
+config_list_phi = [
+    {
+        "model": "phi3:latest", # Using phi3, ensure your Ollama server has this model
+        "base_url": "http://localhost:11434/v1",
+        "api_type": "openai",
+        "api_key": "ollama" # Placeholder, not strictly needed for local Ollama
+    }
+]
 
 # Define the schema for the project_checklist tool
 PROJECT_CHECKLIST_TOOL_SCHEMA = {
@@ -76,7 +88,7 @@ concept_tutor = ConceptTutorAgent(
     llm_config={"config_list": config_list_openai_ollama}
 )
 
-# Instantiate the new agents
+# Instantiate all other specialist agents
 diagnostic_agent = DiagnosticRemediationAgent(
     name="DiagnosticRemediationAgent",
     llm_config={"config_list": config_list_openai_ollama}
@@ -87,7 +99,6 @@ assessment_agent = AssessmentRevisionAgent(
     llm_config={"config_list": config_list_openai_ollama}
 )
 
-# Instantiate the remaining agents
 projects_mentor_agent = ProjectsMentorAgent(
     name="ProjectsMentorAgent",
     llm_config={
@@ -108,7 +119,7 @@ analytics_progress_agent = AnalyticsProgressAgent(
 )
 
 # 2. Instantiate OrchestratorAgent
-# It needs the curriculum_agent to delegate alignment checks to.
+# It needs all specialist agents to delegate tasks to.
 orchestrator_agent = OrchestratorAgent(
     name="OrchestratorAgent",
     llm_config={"config_list": config_list_openai_ollama},
@@ -135,11 +146,11 @@ async def main_chat():
     print("(Orchestrator will route to specialists as needed)")
 
     # initial_query = "Tell me about the median from a grouped frequency table."
-    # initial_query = "Give me some practice questions on Statistics"
-    # initial_query = "Check my answer for the statistics problem: I think the median is 45.3"
-    initial_query = "Help me with my CALA project plan." # Changed for testing Projects Mentor Agent
-    initial_form_level = "Form 4" # Define the form level
+    initial_query = "I need help with my CALA project plan for mathematics."
     # initial_query = "What is the difference between speed and velocity?"
+    # initial_query = "What is the capital of France?"
+
+    initial_form_level = "Form 4" # Define the form level
 
     # Structure the initial message as a JSON string
     initial_message_structured = json.dumps({
