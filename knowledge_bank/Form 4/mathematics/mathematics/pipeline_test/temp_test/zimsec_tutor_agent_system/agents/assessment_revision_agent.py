@@ -3,10 +3,14 @@ import json
 import random
 import time
 from typing import List, Dict, Any, Optional, Tuple, Union
+import logging
+
+# Setup logger for this module
+logger = logging.getLogger(__name__)
 
 # Mock tool implementations
 def generate_questions(topic: Optional[str], difficulty: str, n: int) -> List[Dict]:
-    print(f"[Tool Mock - generate_questions] Generating {n} questions. Topic: '{topic}', Difficulty: {difficulty}")
+    logger.debug(f"[Tool Mock - generate_questions] Generating {n} questions. Topic: '{topic}', Difficulty: {difficulty}")
     questions = []
     for i in range(n):
         q_text = f"Mock Question {i+1} on '{topic or 'mixed topics'}' (Difficulty: {difficulty})"
@@ -16,11 +20,11 @@ def generate_questions(topic: Optional[str], difficulty: str, n: int) -> List[Di
             "text": q_text,
             "answer": ans
         })
-    print(f"[Tool Mock - generate_questions] Generated: {questions}")
+    logger.debug(f"[Tool Mock - generate_questions] Generated: {questions}")
     return questions
 
 def grade_answers(batch_json: List[Dict]) -> List[Dict]:
-    print(f"[Tool Mock - grade_answers] Grading batch: {batch_json}")
+    logger.debug(f"[Tool Mock - grade_answers] Grading batch: {batch_json}")
     results = []
     for item in batch_json:
         # Simulate grading (e.g., simple correct/incorrect)
@@ -32,11 +36,11 @@ def grade_answers(batch_json: List[Dict]) -> List[Dict]:
             "is_correct": is_correct,
             "feedback": feedback
         })
-    print(f"[Tool Mock - grade_answers] Results: {results}")
+    logger.debug(f"[Tool Mock - grade_answers] Results: {results}")
     return results
 
 def update_scorecard(student_id: str, topic: str, score: float, timestamp: str):
-    print(f"[Tool Mock - update_scorecard] Updating for student: {student_id}, Topic: {topic}, Score: {score}, Time: {timestamp}")
+    logger.debug(f"[Tool Mock - update_scorecard] Updating for student: {student_id}, Topic: {topic}, Score: {score}, Time: {timestamp}")
     # In reality, this would interact with a database or learner profile store
     pass
 
@@ -75,7 +79,7 @@ class AssessmentRevisionAgent(autogen.AssistantAgent):
         """Handles requests for question generation or grading."""
         last_message = messages[-1]
         content = last_message.get("content", "{}")
-        print(f"\nAssessmentAgent: Received content: {content}")
+        logger.debug(f"\nAssessmentAgent: Received content: {content}")
         
         try:
             # Assume input is JSON specifying the task
@@ -86,7 +90,7 @@ class AssessmentRevisionAgent(autogen.AssistantAgent):
                 topic = data.get("topic", "mixed")
                 difficulty = data.get("difficulty", "medium")
                 n = data.get("n", 3)
-                print(f"AssessmentAgent: Generating {n} questions for topic '{topic}', difficulty '{difficulty}'")
+                logger.info(f"AssessmentAgent: Generating {n} questions for topic '{topic}', difficulty '{difficulty}'")
                 questions = generate_questions(topic, difficulty, n)
                 
                 # Format as Markdown list with details tags
@@ -95,7 +99,7 @@ class AssessmentRevisionAgent(autogen.AssistantAgent):
                     markdown_output += f"{i+1}. {q['text']}\n"
                     markdown_output += f"<details><summary>Answer</summary>{q['answer']}</details>\n\n"
                 
-                print(f"AssessmentAgent: Sending questions:\n{markdown_output}")
+                logger.info(f"AssessmentAgent: Sending questions:\n{markdown_output}")
                 return True, markdown_output
 
             elif task_type == "grade_answers":
@@ -103,7 +107,7 @@ class AssessmentRevisionAgent(autogen.AssistantAgent):
                 if not answers_batch or not isinstance(answers_batch, list):
                     raise ValueError("Missing or invalid 'answers_batch' list in input.")
                 
-                print(f"AssessmentAgent: Grading batch of {len(answers_batch)} answers...")
+                logger.info(f"AssessmentAgent: Grading batch of {len(answers_batch)} answers...")
                 grading_results = grade_answers(answers_batch)
                 
                 # Format as Markdown table
@@ -126,12 +130,12 @@ class AssessmentRevisionAgent(autogen.AssistantAgent):
                 topic_graded = data.get("topic", "unknown_topic")
                 update_scorecard(student_id, topic_graded, overall_score / 100.0, time.strftime("%Y-%m-%dT%H:%M:%SZ"))
 
-                print(f"AssessmentAgent: Sending grading results:\n{final_output}")
+                logger.info(f"AssessmentAgent: Sending grading results:\n{final_output}")
                 return True, final_output
 
             else:
                  raise ValueError(f"Unknown task type: {task_type}")
 
         except (json.JSONDecodeError, ValueError) as e:
-            print(f"AssessmentAgent: Error processing input - {e}")
+            logger.error(f"AssessmentAgent: Error processing input - {e}")
             return True, json.dumps({"error": f"Invalid input format or task: {e}"}) 

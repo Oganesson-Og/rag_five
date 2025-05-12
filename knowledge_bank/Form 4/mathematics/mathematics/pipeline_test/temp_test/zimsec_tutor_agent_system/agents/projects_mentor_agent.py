@@ -4,7 +4,7 @@ import json
 # import time # No longer needed for the new tool logic
 from typing import List, Dict, Any, Optional, Tuple, Union
 
-# Example project topics (can be expanded or loaded from a file)
+# Constants for the _mock_project_checklist_tool
 EXAMPLE_PROJECT_TOPICS = [
     "1. Using Statistics to Analyze Daily Water Usage in Households: Investigate how much water is used per day and propose ways to reduce waste.",
     "2. Comparing Prices of Basic Goods in Local Markets Using Averages and Graphs: Analyze market price trends and determine where savings can be made.",
@@ -12,8 +12,6 @@ EXAMPLE_PROJECT_TOPICS = [
     "4. Measuring the Impact of Load Shedding on Study Time Using Data Charts: Collect and present data on electricity availability vs. student performance.",
     "5. Estimating Monthly Mobile Data Usage and Cost Efficiency Among Students: Use ratios, percentages, and graphs to analyze data plan usage."
 ]
-
-# Key aspects of Stage 1: Problem Identification (from marking guide)
 STAGE_1_GUIDELINES = {
     "title": "Stage 1: Problem Identification (5 marks)",
     "criteria": [
@@ -23,33 +21,8 @@ STAGE_1_GUIDELINES = {
     ]
 }
 
-# # Mock tool implementations # This global function is no longer the primary one being called
-# def project_checklist(milestone: str, draft_snippet: str) -> Dict:
-#     print(f"[Tool Mock - project_checklist] Checking milestone: {milestone}, Snippet: '{draft_snippet[:50]}...'")
-#     # Simulate checking against criteria
-#     status_options = ["on-track", "needs-improvement", "blocked"]
-#     action_items_options = [
-#         [],
-#         ["Refine research question clarity", "Add citation for source X"],
-#         ["Expand literature review section", "Check statistical analysis assumptions"],
-#         ["Ensure methodology details are sufficient"]
-#     ]
-#     status = random.choice(status_options)
-#     action_items = []
-#     if status == "needs-improvement":
-#         action_items = random.choice(action_items_options)
-        
-#     # Simulate a next deadline
-#     next_deadline = time.strftime("%Y-%m-%d", time.localtime(time.time() + 7*24*60*60)) # 1 week from now
-    
-#     result = {
-#         "milestone": milestone,
-#         "status": status,
-#         "action_items": action_items,
-#         "next_deadline": next_deadline
-#     }
-#     print(f"[Tool Mock - project_checklist] Result: {result}")
-#     return result
+# Example project topics and Stage 1 guidelines are not needed here anymore
+# as the tool logic will move to the Orchestrator.
 
 class ProjectsMentorAgent(autogen.AssistantAgent):
     SYSTEM_PROMPT = """You are the ProjectsMentorAgent.
@@ -89,7 +62,14 @@ Example Interaction Flow (milestone="plan"):
             system_message=self.SYSTEM_PROMPT,
             **kwargs
         )
+        # Register the mock tool
+        self.register_function(
+            function_map={
+                "project_checklist": self._mock_project_checklist_tool
+            }
+        )
 
+    # Tool method restored here
     def _mock_project_checklist_tool(self, milestone: str, draft_snippet: Optional[str] = None, current_stage_hint: Optional[int] = None) -> str:
         """
         MOCK TOOL: Provides a checklist or guidance for a given project milestone.
@@ -102,7 +82,7 @@ Example Interaction Flow (milestone="plan"):
         Returns:
             str: Markdown text for "plan" milestone; otherwise, a JSON string for other milestones.
         """
-        print(f"[Tool Method - _mock_project_checklist_tool] Called with milestone: {milestone}, Snippet: '{draft_snippet[:70] if draft_snippet else 'N/A'}...'") # Log more snippet
+        print(f"[ProjectsMentorAgent Tool Method - _mock_project_checklist_tool] Called with milestone: {milestone}, Snippet: '{draft_snippet[:70] if draft_snippet else 'N/A'}...'")
 
         if milestone.lower() == "plan":
             guidance_parts = [
@@ -135,7 +115,7 @@ Example Interaction Flow (milestone="plan"):
                 "Remember, your project plan (focused on Stage 1) is the foundation. Once you have a draft of your problem identification, statement of intent, and specifications, I can help you review it!"
             ])
             markdown_output = "\n".join(guidance_parts)
-            print(f"[Tool Method - _mock_project_checklist_tool] Returning Markdown for 'plan':\n{markdown_output[:400]}...") # Log even more of the output
+            print(f"[ProjectsMentorAgent Tool Method - _mock_project_checklist_tool] Returning Markdown for 'plan':\n{markdown_output[:400]}...")
             return markdown_output
 
         # Fallback for other milestones
@@ -153,7 +133,9 @@ Example Interaction Flow (milestone="plan"):
             result["notes_on_snippet"] = "Snippet acknowledged. Detailed feedback requires specific stage context for milestones other than 'plan'."
         
         json_output = json.dumps(result)
-        print(f"[Tool Method - _mock_project_checklist_tool] Returning JSON for other milestones: {json_output}")
+        print(f"[ProjectsMentorAgent Tool Method - _mock_project_checklist_tool] Returning JSON for other milestones: {json_output}")
         return json_output
 
 # Removed the overridden generate_reply method to use the base class's implementation 
+# Removed _mock_project_checklist_tool method from here.
+# Removed EXAMPLE_PROJECT_TOPICS and STAGE_1_GUIDELINES as they are tied to the tool method. 

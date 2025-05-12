@@ -1,10 +1,21 @@
 import autogen
 import json
 import asyncio
+import os
+from typing import List, Dict, Any, Optional, Tuple, Union
+import logging
+
+# Setup logger for this module
+logger = logging.getLogger(__name__)
 
 # Import the RAG integration function using absolute path
 # from ..rag_integration import get_syllabus_alignment_from_rag # OLD
 from zimsec_tutor_agent_system.rag_integration import get_syllabus_alignment_from_rag # NEW
+
+# Load syllabus JSON once at module level
+SYLLABUS_PATH = os.path.join(os.path.dirname(__file__), '../../mathematics_syllabus_chunked.json')
+with open(SYLLABUS_PATH, 'r') as f:
+    SYLLABUS_DATA = json.load(f)
 
 class CurriculumAlignmentAgent(autogen.ConversableAgent):
     def __init__(self, name, llm_config, **kwargs):
@@ -43,7 +54,7 @@ class CurriculumAlignmentAgent(autogen.ConversableAgent):
         messages = kwargs.get('messages')
         
         if not messages:
-            print("CurriculumAlignmentAgent: CRITICAL - 'messages' not found in kwargs!")
+            logger.critical("CurriculumAlignmentAgent: CRITICAL - 'messages' not found in kwargs!")
             return True, {"role": "assistant", "content": json.dumps({"error": "Internal: Messages not found in call"})}
 
         last_message = messages[-1]
@@ -55,7 +66,7 @@ class CurriculumAlignmentAgent(autogen.ConversableAgent):
             subject_hint = learner_context.get("current_subject_hint", "Mathematics") # Default to Math
             form_level_hint = learner_context.get("current_form_level_hint", "Form 4") # Extract form_level, default if needed
             
-            print(f"\nCurriculumAlignmentAgent: Received query: '{user_query}', Subject Hint: '{subject_hint}', Form Hint: '{form_level_hint}'")
+            logger.info(f"\nCurriculumAlignmentAgent: Received query: '{user_query}', Subject Hint: '{subject_hint}', Form Hint: '{form_level_hint}'")
 
             # Call the actual RAG function, now passing form_level_hint
             alignment_result_json = get_syllabus_alignment_from_rag(user_query, subject_hint, form_level_hint)
@@ -64,10 +75,10 @@ class CurriculumAlignmentAgent(autogen.ConversableAgent):
             response_content = json.dumps(alignment_result_json)
             
         except json.JSONDecodeError as e:
-            print(f"CurriculumAlignmentAgent: Error decoding JSON from Orchestrator: {e}")
+            logger.error(f"CurriculumAlignmentAgent: Error decoding JSON from Orchestrator: {e}")
             response_content = json.dumps({"error": "Invalid JSON format from Orchestrator", "is_in_syllabus": False})
         except Exception as e:
-            print(f"CurriculumAlignmentAgent: Error processing message: {e}")
+            logger.error(f"CurriculumAlignmentAgent: Error processing message: {e}")
             response_content = json.dumps({"error": f"Internal error: {str(e)}", "is_in_syllabus": False})
         
         return True, {"role": "assistant", "content": response_content}
@@ -77,10 +88,8 @@ if __name__ == '__main__':
     # You'll need a config_list like in main.py
     config_list_test = [
         {
-            "model": "qwen3:14b", 
-            "base_url": "http://localhost:11434/v1",
-            "api_type": "ollama",
-            "api_key": "ollama", 
+            "model": "gpt-4.1-nano",
+            "api_key": os.environ.get("OPENAI_API_KEY")
         }
     ]
     
@@ -113,17 +122,17 @@ if __name__ == '__main__':
 
     # Simulate receiving a message
     # In Autogen, message content is typically a string. So we dump the JSON to a string.
-    print("--- Testing Physics Query ---")
+    logger.info("--- Testing Physics Query ---")
     reply_physics = alignment_agent.generate_reply(messages=[{"content": json.dumps(mock_orchestrator_message_physics)}], sender=None)
-    print(reply_physics[1]) # The reply content
+    logger.info(f"Reply: {reply_physics[1]}") # The reply content
 
-    print("\n--- Testing Math Query ---")
+    logger.info("\n--- Testing Math Query ---")
     reply_math = alignment_agent.generate_reply(messages=[{"content": json.dumps(mock_orchestrator_message_math)}], sender=None)
-    print(reply_math[1])
+    logger.info(f"Reply: {reply_math[1]}")
 
-    print("\n--- Testing Out of Scope Query ---")
+    logger.info("\n--- Testing Out of Scope Query ---")
     reply_out_of_scope = alignment_agent.generate_reply(messages=[{"content": json.dumps(mock_orchestrator_message_out_of_scope)}], sender=None)
-    print(reply_out_of_scope[1])
+    logger.info(f"Reply: {reply_out_of_scope[1]}")
 
     # Test with the actual RAG function (requires RAG setup to be working)
     # Note: This test might be more involved now as it depends on live RAG components
@@ -134,11 +143,11 @@ if __name__ == '__main__':
     ))
     # The reply is now a tuple (success, reply_dict), so access content from reply_dict
     if test_result_json_str and test_result_json_str[0]: # if success is True
-        print("\n--- Test Result from CurriculumAlignmentAgent (using RAG) ---")
+        logger.info("\n--- Test Result from CurriculumAlignmentAgent (using RAG) ---")
         # test_result_json_str[1] is the reply dictionary, its 'content' key has the JSON string
         parsed_result = json.loads(test_result_json_str[1]["content"])
-        print(json.dumps(parsed_result, indent=2))
+        logger.info(json.dumps(parsed_result, indent=2))
     else:
-        print("\n--- Test failed or no reply from CurriculumAlignmentAgent (using RAG) ---")
+        logger.info("\n--- Test failed or no reply from CurriculumAlignmentAgent (using RAG) ---")
 
-    print("Curriculum Alignment Agent test finished.") 
+    logger.info("Curriculum Alignment Agent test finished.") 

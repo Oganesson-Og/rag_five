@@ -10,6 +10,7 @@ from .assessment_revision_agent import AssessmentRevisionAgent
 from .projects_mentor_agent import ProjectsMentorAgent
 from .content_generation_agent import ContentGenerationAgent
 from .analytics_progress_agent import AnalyticsProgressAgent
+from .student_interface_agent import StudentInterfaceAgent
 
 __all__ = [
     "CurriculumAlignmentAgent",
@@ -20,4 +21,5 @@ __all__ = [
     "ProjectsMentorAgent",
     "ContentGenerationAgent",
     "AnalyticsProgressAgent",
+    "StudentInterfaceAgent",
 ] 

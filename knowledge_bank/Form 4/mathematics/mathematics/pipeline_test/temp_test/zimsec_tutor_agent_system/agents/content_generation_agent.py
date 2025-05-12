@@ -1,15 +1,19 @@
 import autogen
 import json
 from typing import List, Dict, Any, Optional, Tuple, Union
+import logging
+
+# Setup logger for this module
+logger = logging.getLogger(__name__)
 
 # Mock tool implementations
 def render_markdown(markdown_content: str) -> str:
-    print("[Tool Mock - render_markdown] Rendering Markdown...")
+    logger.debug("[Tool Mock - render_markdown] Rendering Markdown...")
     # In reality, this might convert to HTML, PDF, or just validate
     return f"Rendered: {markdown_content[:100]}..."
 
 def render_svg(svg_content: str) -> str:
-    print("[Tool Mock - render_svg] Rendering SVG...")
+    logger.debug("[Tool Mock - render_svg] Rendering SVG...")
     # In reality, this might save to file, display, or validate
     return f"Rendered SVG: {svg_content[:100]}..."
 
@@ -42,7 +46,7 @@ class ContentGenerationAgent(autogen.AssistantAgent):
         """Handles requests to generate learning assets."""
         last_message = messages[-1]
         content = last_message.get("content", "{}")
-        print(f"\nContentGenerationAgent: Received content: {content}")
+        logger.debug(f"Received content: {content}")
         
         try:
             data = json.loads(content)
@@ -52,7 +56,7 @@ class ContentGenerationAgent(autogen.AssistantAgent):
             format_type = data.get("format", "markdown") # e.g., markdown, svg
             style_hint = data.get("style_hint", "default")
 
-            print(f"ContentGenerationAgent: Task: Generate {asset_type} for topic '{topic}' ({grade}), format: {format_type}, style: {style_hint}")
+            logger.debug(f"ContentGenerationAgent: Task: Generate {asset_type} for topic '{topic}' ({grade}), format: {format_type}, style: {style_hint}")
 
             # --- Simulation: Generate mock content --- 
             generated_content = f"## Mock {asset_type.capitalize()} for {topic} ({grade})\n"
@@ -66,17 +70,17 @@ class ContentGenerationAgent(autogen.AssistantAgent):
             # --- Simulation: Use mock rendering tools --- 
             final_output = generated_content
             if format_type == "markdown":
-                print("ContentGenerationAgent: Simulating rendering Markdown...")
+                logger.debug("Simulating rendering Markdown...")
                 render_result = render_markdown(generated_content)
                 final_output = f"{generated_content}\n\n<!-- Render Result: {render_result} -->"
             elif format_type == "svg":
-                print("ContentGenerationAgent: Simulating rendering SVG...")
+                logger.debug("Simulating rendering SVG...")
                 render_result = render_svg(generated_content)
                 final_output = f"{generated_content}\n\n<!-- Render Result: {render_result} -->"
 
-            print(f"ContentGenerationAgent: Sending generated content (type: {asset_type}).")
+            logger.info(f"Sending generated content (type: {asset_type}).")
             return True, final_output
 
         except (json.JSONDecodeError, ValueError) as e:
-            print(f"ContentGenerationAgent: Error processing input - {e}")
+            logger.error(f"Error processing input - {e}")
             return True, json.dumps({"error": f"Invalid input format: {e}"}) 

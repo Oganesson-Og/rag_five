@@ -3,6 +3,11 @@
 import autogen
 import json
 import asyncio # Added for async function
+import os
+import logging # <--- Add this import
+
+# Setup logger for this module
+logger = logging.getLogger(__name__) # <--- Add this line
 
 # Import the RAG integration function using absolute path
 # from ..rag_integration import get_knowledge_content_from_rag # OLD
@@ -21,8 +26,9 @@ class ConceptTutorAgent(autogen.AssistantAgent):
             "4. Start with a simple definition or the first key step.\n"
             "5. Consider asking a brief Socratic question to engage the learner if appropriate (e.g., 'Before we use the formula, what does cumulative frequency tell us?').\n"
             "6. Present information clearly using Markdown formatting (bold terms, lists, code blocks for math if needed).\n"
-            "7. Keep the explanation focused on the specific query and syllabus outcomes."
-            "8. Ensure you use the key `mandatory_terms` from the alignment data in your explanation."
+            "7. Keep the explanation focused on the specific query and syllabus outcomes.\n"
+            "8. Ensure you use the key `mandatory_terms` from the alignment data in your explanation.\n"
+            "9. If the user's query is a direct request to 'calculate', 'find the value of', 'compute', or similar, and all necessary numerical inputs are provided or are simple to deduce from the context and retrieved knowledge, perform the calculation. Clearly show the method, the steps involved, and provide the final numerical answer as part of your response."
         )
         super().__init__(name, system_message=system_message, llm_config=llm_config, **kwargs)
         
@@ -44,9 +50,9 @@ class ConceptTutorAgent(autogen.AssistantAgent):
             orchestrator_data = json.loads(message_content)
             user_query = orchestrator_data.get("original_user_query", "")
             alignment_data = orchestrator_data.get("alignment_data", {})
-            print(f"\n ConceptTutor: Received data from Orchestrator for query '{user_query}'")
+            logger.debug(f"\n ConceptTutor: Received data from Orchestrator for query '{user_query}'")
         except (json.JSONDecodeError, TypeError) as e:
-            print(f"\n ConceptTutor: Error decoding JSON from Orchestrator: {e}")
+            logger.error(f"\n ConceptTutor: Error decoding JSON from Orchestrator: {e}")
             return True, "I received the request, but had trouble understanding the details... TERMINATE"
 
         topic = alignment_data.get("identified_topic", "Unknown Topic")
@@ -57,8 +63,15 @@ class ConceptTutorAgent(autogen.AssistantAgent):
         mandatory_terms = alignment_data.get("mandatory_terms", [])
 
         # Retrieve knowledge content using actual RAG function
-        print(f"\n ConceptTutor: Retrieving knowledge using RAG for Topic='{topic}', Subtopic='{subtopic}', Form='{form}'")
-        knowledge_content = get_knowledge_content_from_rag(topic, subtopic, form)
+        logger.debug(f"\n ConceptTutor: Retrieving knowledge using RAG for Topic='{topic}', Subtopic='{subtopic}', Form='{form}'")
+        retrieved_content_str = get_knowledge_content_from_rag(topic, subtopic, form)
+
+        # This is crucial: if RAG fails or returns no content, we should still inform the LLM.
+        if not retrieved_content_str: # Check if the string is empty or None
+            retrieved_content_str = "No specific knowledge content was retrieved for this topic. Please answer based on general knowledge if possible, or indicate that you cannot provide a specific explanation without more information."
+            logger.warning(f"No RAG content retrieved for Topic='{topic}', Subtopic='{subtopic}', Form='{form}'")
+        else:
+            logger.debug(f"RAG content prepared for LLM. Snippet: {retrieved_content_str[:200]}...")
 
         # Construct a new prompt for the LLM containing all context
         # Note: This message history is internal to this agent's LLM call
@@ -66,20 +79,22 @@ class ConceptTutorAgent(autogen.AssistantAgent):
             {"role": "system", "content": self.system_message}, # Remind LLM of its persona/goal
             {
                 "role": "user", 
-                "content": f"Okay, I need to explain the following user query: '{user_query}'.\n\n" \
-                           f"The syllabus context is:\n" \
-                           f"- Topic: {topic}\n" \
-                           f"- Subtopic: {subtopic}\n" \
-                           f"- Relevant Outcomes: {', '.join(outcomes) if outcomes else 'N/A'}\n" \
-                           f"- Key Mandatory Terms to use: {', '.join(mandatory_terms) if mandatory_terms else 'N/A'}\n\n" \
-                           f"Here is relevant knowledge content I retrieved:\n---\n{knowledge_content}\n---\n\n" \
-                           f"Please generate the initial part of the explanation for the user, following the steps outlined in your system prompt (acknowledge topic, maybe ask Socratic question, use retrieved content and mandatory terms, use Markdown)."
+                "content": f"Okay, I need to explain the following user query: '{user_query}'.\\n\\n" \
+                           f"The syllabus context is:\\n" \
+                           f"- Topic: {topic}\\n" \
+                           f"- Subtopic: {subtopic}\\n" \
+                           f"- Relevant Outcomes: {', '.join(outcomes) if outcomes else 'N/A'}\\n" \
+                           f"- Key Mandatory Terms to use: {', '.join(mandatory_terms) if mandatory_terms else 'N/A'}\\n\\n" \
+                           f"Here is relevant knowledge content I retrieved:\\n---\\n{retrieved_content_str}\\n---\\n\\n" \
+                           f"Considering the user's query: '{user_query}' and your system prompt instructions (especially step 9 if it's a calculation request with given values), " \
+                           f"please generate a comprehensive response. If it's a calculation, explain the method, show the steps, and provide the final numerical answer. " \
+                           f"Otherwise, provide a clear explanation of the concept. Use Markdown for formatting."
             }
         ]
         
         # Generate the reply using the AssistantAgent's standard method
         # This uses the llm_config passed during initialization
-        print(f"\n ConceptTutor: Generating LLM reply based on context...")
+        logger.debug(f"\n ConceptTutor: Generating LLM reply based on context...")
         # Use the agent's inherited method to generate reply based on internal messages
         # This requires access to the client, often done via self.client
         success, reply_obj = await self.a_generate_oai_reply(internal_messages)
@@ -91,21 +106,34 @@ class ConceptTutorAgent(autogen.AssistantAgent):
             elif isinstance(reply_obj, dict):
                 # Extract content if it's a dict (common structure)
                 reply_content_str = reply_obj.get("content")
-                print(f"\n ConceptTutor: Extracted content from structured reply.")
+                logger.debug(f"Extracted content from structured reply.")
             else:
-                 print(f"\n ConceptTutor: Received unexpected reply format: {type(reply_obj)}")
+                 logger.warning(f"Received unexpected reply format: {type(reply_obj)}. Reply: {reply_obj}")
 
         if reply_content_str:
-            print(f"\n ConceptTutor: Generated Explanation Snippet: {reply_content_str}")
-            return True, reply_content_str
+            logger.debug(f"Generated Explanation Snippet: {reply_content_str[:200]}...")
+            # Package the answer and the RAG context used
+            final_payload = {
+                "answer": reply_content_str,
+                "retrieved_rag_context": retrieved_content_str # This is the context from get_knowledge_content_from_rag
+            }
+            return True, json.dumps(final_payload)
         else:
-            print(f"\n ConceptTutor: Failed to generate LLM reply or extract content. Success={success}, Reply Obj={reply_obj}")
-            return True, "I understand the request, but I'm having trouble formulating an explanation right now. TERMINATE"
+            logger.error(f"Failed to generate LLM reply or extract content. Success={success}, Reply Obj={reply_obj}")
+            # Even on failure, attempt to return the structure if some RAG context was retrieved
+            error_payload = {
+                "answer": "I understand the request, but I'm having trouble formulating an explanation right now. TERMINATE",
+                "retrieved_rag_context": retrieved_content_str if retrieved_content_str else "No RAG context available due to error."
+            }
+            return True, json.dumps(error_payload)
 
 if __name__ == '__main__':
     # Example for testing the agent in isolation
     config_list_test = [
-        {"model": "phi4:latest", "api_key": "ollama", "base_url": "http://localhost:11434/v1", "api_type": "ollama"}
+        {
+            "model": "gpt-4.1-nano",
+            "api_key": os.environ.get("OPENAI_API_KEY")
+        }
     ]
 
     concept_tutor = ConceptTutorAgent(
@@ -124,21 +152,32 @@ if __name__ == '__main__':
             "identified_subject": "Mathematics",
             "identified_topic": "Statistics",
             "identified_subtopic": "Measures of Central Tendency (Grouped Data)",
+            "identified_form": "Form 4" # Ensure form is part of alignment_data for RAG
         }
     }
 
     # Simulate receiving message (content should be structured)
     # We might need the LLM to process this structured input based on the system prompt
-    print("--- Testing Concept Tutor Agent (LLM Reply) ---")
+    logger.debug("--- Testing Concept Tutor Agent (LLM Reply) ---")
     # Use a dummy sender for the test
     dummy_sender = autogen.Agent(name="DummyOrchestrator")
     
     # Autogen works best with string messages, so pass JSON as string
-    concept_tutor.generate_reply(
-        messages=[{"role": "user", "content": json.dumps(mock_orchestrator_message)}],
-        sender=dummy_sender
-    )
-    # Note: generate_reply doesn't automatically print; it returns the reply.
-    # To see the reply in this test, you might need to integrate with a UserProxyAgent or capture the output.
-    # For now, we confirm the file is created. Real test happens via main.py integration.
-    print("Concept Tutor agent created. Test execution in isolation needs refinement or run via main.py.") 
+    # This is an async function, so we need to run it in an event loop for testing
+    async def run_concept_tutor_test():
+        success_test, reply_test = await concept_tutor._generate_tutor_reply(
+            messages=[{"role": "user", "content": json.dumps(mock_orchestrator_message)}],
+            sender=dummy_sender,
+            config=None
+        )
+        if success_test:
+            logger.info(f"Concept Tutor Test Reply:\n{reply_test}")
+        else:
+            logger.error("Concept Tutor Test Failed.")
+
+    if os.environ.get("OPENAI_API_KEY"):
+         asyncio.run(run_concept_tutor_test())
+    else:
+        logger.warning("OPENAI_API_KEY not set. Skipping ConceptTutorAgent __main__ test.")
+    
+    logger.debug("Concept Tutor agent created. Test execution in isolation needs refinement or run via main.py.") 

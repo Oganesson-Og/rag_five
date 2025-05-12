@@ -2,15 +2,21 @@ import autogen
 import json
 import time
 from typing import List, Dict, Any, Optional, Tuple, Union
+import logging
+
+# Setup logger for this module
+logger = logging.getLogger(__name__)
 
 # Mock tool implementations
 def update_learner_model(student_id: str, topic: str, raw_score: float):
-    print(f"[Tool Mock - update_learner_model] Updating model for student: {student_id}, Topic: {topic}, Score: {raw_score:.2f}")
+    #print(f"[Tool Mock - update_learner_model] Updating model for student: {student_id}, Topic: {topic}, Score: {raw_score:.2f}")
+    logger.debug(f"[Tool Mock - update_learner_model] Updating model for student: {student_id}, Topic: {topic}, Score: {raw_score:.2f}")
     # In reality, update database/profile store
     return {"status": "success", "student_id": student_id, "topic": topic}
 
 def serve_dashboard(student_id: Optional[str] = None, cohort_id: Optional[str] = None) -> Dict:
-    print(f"[Tool Mock - serve_dashboard] Generating dashboard data for student: {student_id}, cohort: {cohort_id}")
+    #print(f"[Tool Mock - serve_dashboard] Generating dashboard data for student: {student_id}, cohort: {cohort_id}")
+    logger.debug(f"[Tool Mock - serve_dashboard] Generating dashboard data for student: {student_id}, cohort: {cohort_id}")
     # Simulate generating dashboard data
     dashboard_data = {
         "widgets": [
@@ -19,7 +25,8 @@ def serve_dashboard(student_id: Optional[str] = None, cohort_id: Optional[str] =
             {"type": "table", "title": "Areas for Focus", "headers": ["Topic", "Score"], "rows": [["Topic B", "55%"], ["Topic C", "62%"]]}
         ]
     }
-    print(f"[Tool Mock - serve_dashboard] Generated data: {dashboard_data}")
+    #print(f"[Tool Mock - serve_dashboard] Generated data: {dashboard_data}")
+    logger.debug(f"[Tool Mock - serve_dashboard] Generated data: {dashboard_data}")
     return dashboard_data
 
 class AnalyticsProgressAgent(autogen.AssistantAgent):
@@ -55,7 +62,7 @@ class AnalyticsProgressAgent(autogen.AssistantAgent):
         """Handles requests to update learner models or serve dashboards."""
         last_message = messages[-1]
         content = last_message.get("content", "{}")
-        print(f"\nAnalyticsAgent: Received content: {content}")
+        logger.debug(f"Received content: {content}")
 
         try:
             data = json.loads(content)
@@ -69,14 +76,14 @@ class AnalyticsProgressAgent(autogen.AssistantAgent):
                 if student_id is None or topic is None or raw_score is None:
                     raise ValueError("Missing student_id, topic, or raw_score for update_learner_model task.")
                 
-                print(f"AnalyticsAgent: Updating learner model for {student_id}, topic {topic}, score {raw_score}")
+                logger.debug(f"Updating learner model for {student_id}, topic {topic}, score {raw_score}")
                 result = update_learner_model(student_id, topic, float(raw_score))
                 return True, json.dumps(result) # Return JSON status to agent caller
 
             elif task_type == "serve_dashboard":
                 student_id = data.get("student_id")
                 cohort_id = data.get("cohort_id")
-                print(f"AnalyticsAgent: Serving dashboard for student: {student_id}, cohort: {cohort_id}")
+                logger.info(f"Serving dashboard for student: {student_id}, cohort: {cohort_id}")
                 dashboard_data = serve_dashboard(student_id, cohort_id)
                 
                 if invoked_by_human:
@@ -96,15 +103,15 @@ class AnalyticsProgressAgent(autogen.AssistantAgent):
                                 md_output += f"|{':--|' * len(headers)}\n"
                             for row in rows:
                                 md_output += f"| {' | '.join(map(str, row))} |\n"
-                    print("AnalyticsAgent: Sending Markdown dashboard.")
+                    logger.info("Sending Markdown dashboard.")
                     return True, md_output
                 else:
                     # Return pure JSON for agent caller
-                    print("AnalyticsAgent: Sending JSON dashboard data.")
+                    logger.info("Sending JSON dashboard data.")
                     return True, json.dumps(dashboard_data)
             else:
                  raise ValueError(f"Unknown task type: {task_type}")
 
         except (json.JSONDecodeError, ValueError, TypeError) as e:
-            print(f"AnalyticsAgent: Error processing input - {e}")
+            logger.error(f"Error processing input - {e}")
             return True, json.dumps({"error": f"Invalid input format or task: {e}"}) 
