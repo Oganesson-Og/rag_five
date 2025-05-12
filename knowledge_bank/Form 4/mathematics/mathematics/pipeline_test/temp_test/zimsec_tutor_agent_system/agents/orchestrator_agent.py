@@ -15,6 +15,7 @@ from typing import List, Dict, Any, Optional, Tuple, Union # Still needed for ot
 import os
 import time
 import logging
+import re
 
 # Configure logging
 logging.basicConfig(level=logging.DEBUG)
@@ -219,43 +220,19 @@ class OrchestratorAgent(autogen.AssistantAgent):
         should_call_curriculum_alignment = True # Default to calling
 
         if effective_previous_alignment_details:
-            # Heuristic 1: Very short query
-            very_short_query_threshold = 4 # words (e.g., "tell me more", "go on please")
-            if len(normalized_current_query.split()) <= very_short_query_threshold: # Changed to <=
-                logger.info(f"VERY SHORT query ('{normalized_current_query}') detected with previous alignment. Reusing previous alignment details definitively.")
+            # Topic overlap check: compare new query words against page_content + chat history
+            topic_page_content = effective_previous_alignment_details.get("raw_metadata_preview", {}).get("page_content", "")
+            history_text = user_query_for_specialist.lower()
+            topic_and_history = topic_page_content.lower() + " " + history_text
+            topic_words = set(re.findall(r"\w+", topic_and_history))
+            query_words = set(re.findall(r"\w+", user_query_for_alignment.lower()))
+            overlap = topic_words.intersection(query_words)
+            min_overlap = 3  # require at least 3 overlapping words for reuse
+            if len(overlap) >= min_overlap:
+                logger.info(f"Topic overlap check passed ({len(overlap)} overlapping words). Reusing previous alignment details.")
                 alignment_data = effective_previous_alignment_details
                 called_curriculum_alignment_this_turn = False
                 should_call_curriculum_alignment = False
-            
-            # Heuristic 2 (if Heuristic 1 didn't trigger and should_call_curriculum_alignment is still true):
-            # More nuanced continuation check. This replaces the previous SIMPLE_CONTINUATION_PHRASES logic.
-            if should_call_curriculum_alignment: 
-                CONTINUATION_KEYWORDS = [
-                    "explain", "further", "more", "detail", "details", "continue", "next", 
-                    "tell", "elaborate", "expand", "what else", "anything",
-                    "this", "that", "it", 
-                    "section", "topic", "part", "point", "aspect", "previous", "last"
-                ]
-                query_words_set = set(normalized_current_query.lower().split())
-                
-                matched_keywords = query_words_set.intersection(CONTINUATION_KEYWORDS)
-                
-                min_keyword_matches = 2 
-                min_keyword_ratio = 0.35 
-                max_total_words_for_heuristic = 12 
-
-                num_query_words = len(query_words_set)
-
-                if num_query_words > 0 and num_query_words <= max_total_words_for_heuristic and \
-                   len(matched_keywords) >= min_keyword_matches and \
-                   (len(matched_keywords) / num_query_words) >= min_keyword_ratio:
-                    
-                    logger.info(f"Continuation-like query ('{normalized_current_query}') detected by keyword heuristic. Matched keywords: {matched_keywords}. Query words: {num_query_words}. Reusing previous alignment details.")
-                    alignment_data = effective_previous_alignment_details
-                    called_curriculum_alignment_this_turn = False
-                    should_call_curriculum_alignment = False
-                # else:
-                #    logger.info(f"Query ('{normalized_current_query}') did not meet keyword heuristic for reuse. num_query_words: {num_query_words}, matched_keywords: {len(matched_keywords)}, ratio: {len(matched_keywords) / num_query_words if num_query_words > 0 else 0}.")
 
         if should_call_curriculum_alignment:
             # This block will be entered if:
