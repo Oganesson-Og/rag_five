@@ -16,12 +16,27 @@ import os
 import time
 import logging
 import re
+from .utils import ( # Assuming utils.py is in the same directory
+    is_short_conversational_follow_up,
+    did_system_invite_follow_up,
+    is_conversation_stale,
+    # estimate_tokens # Not used directly in this snippet anymore
+)
+from autogen_core.models import SystemMessage, UserMessage # Added
+# from autogen_ext.models.openai import OpenAIChatCompletionClient # No longer directly instantiating this here
 
 # Configure logging
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Removed constants EXAMPLE_PROJECT_TOPICS, STAGE_1_GUIDELINES from here
+# Conversation constants
+STALE_THRESHOLD_SECONDS = 3600 # 1 hour
+
+# Removed SHORT_CONVERSATIONAL_PHRASES and the following function definitions 
+# as they are now imported from .utils:
+# - is_short_conversational_follow_up
+# - did_system_invite_follow_up
+# - is_conversation_stale
 
 # Helper function to estimate tokens (rough approximation)
 def estimate_tokens(text: str) -> int:
@@ -37,12 +52,13 @@ class OrchestratorAgent(autogen.AssistantAgent):
     "You are the Orchestrator Agent in a multi-agent AI tutoring system for ZIMSEC O-Level students.\n"
     "Your primary roles are:\n"
     "1. Receive the initial user query from the UserProxy.\n"
-    "2. ALWAYS first consult the CurriculumAlignmentAgent. You will send it a JSON message like: {\"user_query\": \"<actual_user_query>\", \"learner_context\": {\"current_subject_hint\": \"<current_subject_or_default>\"}}.\n"
-    "3. Receive and parse the JSON response from the CurriculumAlignmentAgent.\n"
-    "4. Based on the alignment details, decide the next step and formulate a response or action.\n"
+    "2. Determine if the query is a direct follow-up to a recent interaction. If so, and the context is clear and recent, reuse existing alignment. \n"
+    "3. If the query is not a clear follow-up, or if the context is stale, consult the CurriculumAlignmentAgent. You will send it a JSON message like: {\"user_query\": \"<actual_user_query>\", \"learner_context\": {\"current_subject_hint\": \"<current_subject_or_default>\"}}.\n"
+    "4. Receive and parse the JSON response from the CurriculumAlignmentAgent.\n"
+    "5. Based on the alignment details, decide the next step and formulate a response or action.\n"
     "    - If out_of_scope, inform the user politely.\n"
     "    - If relevant to a different subject, clarify with the user.\n"
-    "    - If aligned, (for now) state this and that you would next determine intent and route to a specialist.\n"
+    "    - If aligned, determine intent (e.g., conceptual help, practice, diagnosis) and route to a specialist agent.\n"
     "Communication Guidelines with CurriculumAlignmentAgent:\n"
     "- Your message TO the CurriculumAlignmentAgent MUST be a JSON string.\n"
     "- You will receive a JSON string as a response FROM the CurriculumAlignmentAgent.\n"
@@ -75,8 +91,9 @@ class OrchestratorAgent(autogen.AssistantAgent):
         self.content_generation_agent = content_generation_agent
         self.analytics_progress_agent = analytics_progress_agent
         
-        self.current_session_alignment = None # Added to store alignment within a session
+        self.current_session_alignment = None # This will now store a dict like {'data': alignment_data, 'timestamp': float, 'last_system_response': str, 'last_user_query': str}
         self._active_sub_chat_partner_name = None # Initialize new instance variable
+        self.stale_threshold_seconds = STALE_THRESHOLD_SECONDS # Configurable staleness threshold
         
         # Register the main reply generation function
         self.register_reply(
@@ -87,12 +104,111 @@ class OrchestratorAgent(autogen.AssistantAgent):
         # Removed registration of project_checklist tool from Orchestrator
 
         self.stage_timings = {}
-        self.token_counts = {
-            'input': 0,
-            'output': 0,
-            'total': 0
-        }
+        self.token_counts = {'input': 0, 'output': 0, 'total': 0}
         self.first_token_time = None
+        # self._intent_classifier_client is no longer needed as we use self.client
+
+    async def _classify_intent_with_llm(self, current_query: str, last_system_response: Optional[str], last_user_query: Optional[str], full_history: Optional[List[Dict[str, str]]]) -> Dict[str, Any]:
+        """
+        Uses the agent's configured LLM client to classify the intent of the current user query.
+        Returns a dictionary like: {'intent': 'AFFIRMATIVE_FOLLOW_UP|CLARIFICATION|NEW_TOPIC|UNKNOWN', 'confidence': float, 'raw_response': str}
+        """
+        # Check if the agent's client is available. 
+        # self.client is initialized by ConversableAgent based on llm_config.
+        if not hasattr(self, 'client') or self.client is None:
+            logger.warning("Agent's LLM client (self.client) not available for intent classification.")
+            return {"intent": "UNKNOWN", "confidence": 0.0, "raw_response": "Agent client missing"}
+
+        conversation_context = ""
+        if last_user_query:
+            conversation_context += f"Previous User Query: {last_user_query}\n"
+        if last_system_response:
+            conversation_context += f"Previous System Response: {last_system_response}\n"
+        conversation_context += f"Current User Query: {current_query}\n"
+
+        # Simplified history for the prompt
+        if full_history and len(full_history) > 1:
+            recent_history_str = "\nRecent conversation turn(s):\n"
+            # Take last 3 messages before the current one
+            for msg in full_history[-4:-1]: 
+                role = msg.get("role", "user") if msg.get("name") != self.name else "assistant"
+                content = msg.get("content", "")
+                if isinstance(content, str):
+                    try: 
+                        parsed_c = json.loads(content)
+                        if isinstance(parsed_c, dict) and "user_query" in parsed_c:
+                            content = parsed_c.get("original_user_query", parsed_c.get("user_query"))
+                        elif isinstance(parsed_c, dict) and "answer" in parsed_c:
+                            content = parsed_c.get("answer")
+                    except json.JSONDecodeError:
+                        pass 
+                recent_history_str += f"{role}: {str(content)[:150]}\n" 
+            conversation_context = recent_history_str + "\n---\n" + conversation_context
+
+        system_prompt_content = (
+            "You are an expert in classifying user intent in a tutoring conversation. "
+            "Based on the provided context (previous queries and responses, and current query), "
+            "classify the 'Current User Query' into one of these categories: "
+            "1. AFFIRMATIVE_FOLLOW_UP: User is saying yes, okay, sure, etc., directly to a question or suggestion from the system. "
+            "2. NEGATIVE_FOLLOW_UP: User is saying no, nope, etc., directly to a question or suggestion from the system. "
+            "3. CLARIFICATION_ON_TOPIC: User is asking for more details, examples, or explanation about the *immediately preceding* topic. "
+            "4. NEW_TOPIC_UNRELATED: User is asking a question that seems unrelated to the immediate prior discussion. "
+            "5. AMBIGUOUS_CONTEXTUAL: User query is short (e.g. 'why', 'how') and context is needed to understand if it relates to prior topic or is new. Assume CLARIFICATION if contextually relevant. "
+            "Respond with ONLY the classification label and nothing else. If unsure, use UNKNOWN."
+        )
+        
+        prompt_message_objects = [
+            SystemMessage(content=system_prompt_content),
+            UserMessage(content=conversation_context, source="user")
+        ]
+
+        logger.debug(f"LLM Intent Classification Prompt Context:\n{conversation_context}")
+
+        # Convert Pydantic message objects to a list of dicts for the API
+        formatted_messages_for_api = []
+        for msg_obj in prompt_message_objects:
+            role = "system" if isinstance(msg_obj, SystemMessage) else "user" # Determine role
+            formatted_messages_for_api.append({"role": role, "content": msg_obj.content})
+
+        try:
+            # Use the agent's existing client (self.client)
+            # Wrap the client call in asyncio.to_thread to handle cases where self.client.create might be synchronous
+            response = await asyncio.to_thread(
+                self.client.create,
+                messages=formatted_messages_for_api, # Pass the list of dicts
+                cache=getattr(self, 'client_cache', None), # Use agent's cache if available
+                temperature=0.1, 
+                max_tokens=20 
+            )
+            
+            raw_intent_label = ""
+            # ModelClientResponseProtocol often has choices[0].message.content
+            # or a direct text field depending on the client implementation used by ModelClient.
+            if response.choices and len(response.choices) > 0 and response.choices[0].message and response.choices[0].message.content:
+                raw_intent_label = response.choices[0].message.content.strip().upper()
+            elif hasattr(response, 'text') and isinstance(response.text, str): # Fallback for some client responses
+                 raw_intent_label = response.text.strip().upper()
+            else:
+                logger.warning(f"Could not extract content reliably from LLM response for intent. Response object: {response}")
+                # Attempt to get any string part of the response if primary paths fail
+                content_list = getattr(response, 'content', None)
+                if isinstance(content_list, list) and content_list and isinstance(content_list[0], str):
+                    raw_intent_label = content_list[0].strip().upper()
+                elif isinstance(response.choices[0].message.tool_calls, list): # Handle cases where it tries to make a tool call like the main agent
+                    logger.warning(f"LLM intent classifier attempted a tool call: {response.choices[0].message.tool_calls}")
+                    raw_intent_label = "UNKNOWN_TOOL_CALL_ATTEMPT"
+
+            logger.info(f"LLM Intent Classification Raw Label: {raw_intent_label}")
+
+            confidence = 0.8 if raw_intent_label in ["AFFIRMATIVE_FOLLOW_UP", "NEGATIVE_FOLLOW_UP", "CLARIFICATION_ON_TOPIC", "NEW_TOPIC_UNRELATED", "AMBIGUOUS_CONTEXTUAL"] else 0.3
+            
+            if raw_intent_label == "AMBIGUOUS_CONTEXTUAL":
+                logger.info("LLM classified as AMBIGUOUS_CONTEXTUAL, treating as CLARIFICATION_ON_TOPIC for reuse check.")
+
+            return {"intent": raw_intent_label, "confidence": confidence, "raw_response": raw_intent_label if raw_intent_label else str(response)}
+        except Exception as e:
+            logger.error(f"Error during LLM intent classification: {e}", exc_info=True)
+            return {"intent": "UNKNOWN", "confidence": 0.0, "raw_response": str(e)}
 
     async def _generate_orchestrator_reply(self, messages, sender, config):
         """
@@ -114,6 +230,9 @@ class OrchestratorAgent(autogen.AssistantAgent):
             logger.debug(f"Orchestrator: Message from self ({sender.name}), content: '{messages[-1].get('content', '')[:100]}...'. Declining to reply to prevent loop.")
             return True, None
 
+        # Get the full history for potential LLM intent classification
+        full_message_history_for_llm_intent = messages 
+
         last_message = messages[-1]
         user_input_raw = last_message.get("content", "")
         input_tokens = estimate_tokens(user_input_raw)
@@ -128,18 +247,24 @@ class OrchestratorAgent(autogen.AssistantAgent):
         user_query_for_specialist = user_input_raw
         form_level = "Form 4"
         current_subject = "Mathematics"
+        original_user_query_from_payload = user_input_raw # To store the actual query if payload wraps it
 
         _previous_alignment_details_from_payload = None
         _context_was_reset_from_payload = False
+        _last_system_response_from_payload = None # For context
+        _last_user_query_from_payload = None # For context
 
         # Try to parse as JSON (standard for inter-agent comms in this system)
         try:
             payload = json.loads(user_input_raw)
             if isinstance(payload, dict):
-                user_query_for_specialist = payload.get("user_query", user_input_raw) 
+                original_user_query_from_payload = payload.get("original_user_query", user_input_raw)
+                user_query_for_specialist = payload.get("user_query", original_user_query_from_payload) 
                 form_level = payload.get("form_level", form_level) 
                 _previous_alignment_details_from_payload = payload.get("previous_alignment_details")
                 _context_was_reset_from_payload = payload.get("context_was_reset", False) # Check for reset flag
+                _last_system_response_from_payload = payload.get("last_system_response")
+                _last_user_query_from_payload = payload.get("last_user_query")
                 
                 current_question_marker = "Student's Current Question:"
                 if current_question_marker in user_query_for_specialist:
@@ -169,80 +294,157 @@ class OrchestratorAgent(autogen.AssistantAgent):
             logger.info("Context_was_reset flag is true. Clearing Orchestrator's current_session_alignment.")
             self.current_session_alignment = None
         
-        effective_previous_alignment_details = None
+        effective_previous_alignment_data = None
+        last_interaction_timestamp = None
+        previous_system_response_for_heuristic = _last_system_response_from_payload
+        previous_user_query_for_heuristic = _last_user_query_from_payload
+
         if _previous_alignment_details_from_payload:
             logger.info("Using previous_alignment_details from incoming payload.")
-            effective_previous_alignment_details = _previous_alignment_details_from_payload
-            self.current_session_alignment = _previous_alignment_details_from_payload # Sync agent state
-        elif self.current_session_alignment:
+            # Assuming payload structure for previous_alignment_details is now {'data': ..., 'timestamp': ..., 'last_system_response': ...}
+            if isinstance(_previous_alignment_details_from_payload, dict):
+                effective_previous_alignment_data = _previous_alignment_details_from_payload.get('data')
+                last_interaction_timestamp = _previous_alignment_details_from_payload.get('timestamp')
+                # Use system response from payload if available, otherwise it might be None
+                previous_system_response_for_heuristic = _previous_alignment_details_from_payload.get('last_system_response', _last_system_response_from_payload)
+                previous_user_query_for_heuristic = _previous_alignment_details_from_payload.get('last_user_query', _last_user_query_from_payload)
+
+                # Sync agent state with the payload's full structure
+                self.current_session_alignment = _previous_alignment_details_from_payload 
+            else: # Old format, just the data
+                effective_previous_alignment_data = _previous_alignment_details_from_payload
+                # last_interaction_timestamp remains None, will be treated as stale or new
+                self.current_session_alignment = {'data': effective_previous_alignment_data, 'timestamp': time.time(), 'last_system_response': None, 'last_user_query': None} # Upgrade old format
+                logger.warning("Upgraded old format of previous_alignment_details. Timestamp set to now.")
+
+        elif self.current_session_alignment and isinstance(self.current_session_alignment, dict):
             logger.info("Using Orchestrator's stored current_session_alignment as no previous_alignment_details in payload.")
-            effective_previous_alignment_details = self.current_session_alignment
+            effective_previous_alignment_data = self.current_session_alignment.get('data')
+            last_interaction_timestamp = self.current_session_alignment.get('timestamp')
+            previous_system_response_for_heuristic = self.current_session_alignment.get('last_system_response', _last_system_response_from_payload)
+            previous_user_query_for_heuristic = self.current_session_alignment.get('last_user_query', _last_user_query_from_payload)
+
         else:
             logger.info("No previous alignment details available (neither in payload nor in agent state).")
 
-
-        # Ensure user_query_for_alignment is not empty after potential extraction
-        if not user_query_for_alignment.strip():
-            # This might happen if "Student's Current Question:" is present but empty.
-            logger.warning("Extracted query for alignment is empty. Falling back to user_query_for_specialist.")
-            user_query_for_alignment = user_query_for_specialist # Fallback to the full query to avoid sending empty to alignment.
-            # It might be better to just respond with an error or ask for clarification if the current question is truly empty.
-            # For now, this fallback prevents an error with the alignment agent.
-            if not user_query_for_alignment.strip(): # Double check if specialist query is also empty
-                 logger.debug("Received empty query (no content and no tool_calls). Ending turn.")
-                 return True, "Looks like there was no question. Ask me something else! exit"
-
-
-        tool_calls_from_message = last_message.get("tool_calls")
-        # Check if the query intended for alignment is just whitespace AND there are no tool calls
-        if not user_query_for_alignment.strip() and not tool_calls_from_message:
-            logger.debug("Effective query for alignment is empty (no content and no tool_calls). Ending turn.")
-            return True, "Looks like there was no question. Ask me something else! exit"
-
-        # --- Logic for reusing previous alignment for generic follow-ups ---
-        # GENERIC_FOLLOW_UP_PHRASES = [
-        #     "teach me more", "explain further", "more details", "go on", "continue",
-        #     "next section", "this section", "tell me more", "more about this",
-        #     "elaborate", "expand on that", "what else", "anything more",
-        #     "can you teach me more", "can you explain further", "tell me more about this",
-        #     "what about this section", "more from this section", "teach me more from this section",
-        #     "explain more from this section", "can you elaborate", "can you expand on that",
-        #     "show me more", "give me more details", "let's continue", "proceed",
-        #     "more on this topic", "more about that topic", "continue with this topic"
-        # ]
         # The system message now provides stronger guidance on reusing previous_alignment_details.
         # We will rely on the LLM's interpretation of the system message and the context (presence of previous_alignment_details).
         
         normalized_current_query = user_query_for_alignment.lower().strip().rstrip(".?!")
 
-        alignment_data = None
+        alignment_data = None # This will store the actual alignment dictionary (the 'data' part)
         called_curriculum_alignment_this_turn = False
         should_call_curriculum_alignment = True # Default to calling
+        reason_for_reuse_or_new_call = "Default: New query"
 
-        if effective_previous_alignment_details:
+        # --- Layered Follow-up Logic ---
+        is_stale = is_conversation_stale(last_interaction_timestamp, self.stale_threshold_seconds)
+
+        if is_stale:
+            logger.info(f"Conversation is stale (last interaction timestamp: {last_interaction_timestamp}). Leaning towards new alignment or LLM check.")
+            # If stale, we might bypass simple heuristics or require LLM confirmation even for short follow-ups.
+            # For now, staleness primarily means we won't trust simple "yes" as much without more checks.
+        
+        # Layer 1: Heuristic Check (for non-stale, clear follow-ups)
+        if effective_previous_alignment_data and not is_stale:
+            is_short_follow_up = is_short_conversational_follow_up(normalized_current_query)
+            system_invited = did_system_invite_follow_up(previous_system_response_for_heuristic)
+            
+            if is_short_follow_up and system_invited:
+                logger.info(f"Heuristic Layer 1: Short follow-up ('{normalized_current_query}') to system invitation. Reusing previous alignment data.")
+                alignment_data = effective_previous_alignment_data # Use the 'data' part
+                should_call_curriculum_alignment = False
+                called_curriculum_alignment_this_turn = False
+                reason_for_reuse_or_new_call = "Heuristic: Short follow-up to system invite"
+                # Update timestamp as context is actively used
+                if self.current_session_alignment and isinstance(self.current_session_alignment, dict):
+                    self.current_session_alignment['timestamp'] = time.time()
+                    self.current_session_alignment['last_user_query'] = user_query_for_alignment # Update with the current "yes" etc.
+                    # System response will be updated after specialist agent.
+                
+        # Layer 2: LLM Intent Classification (Placeholder) - if Layer 1 didn't apply or if stale and requires confirmation
+        if should_call_curriculum_alignment: # Only if heuristic didn't catch it
+            llm_intent_needed = False
+            if is_stale and is_short_conversational_follow_up(normalized_current_query):
+                logger.info("Query is a short follow-up but context is stale. LLM intent check is needed.")
+                llm_intent_needed = True
+            elif not is_short_conversational_follow_up(normalized_current_query): # Also consider for non-trivial queries not caught by simple heuristics
+                # Potentially always call LLM if heuristic 1 fails, to be more robust, or add other conditions.
+                # For now, let's trigger it if heuristic 1 failed and it's not a very short query (those might go to topic overlap).
+                logger.info("Heuristic 1 failed for non-trivial query. Considering LLM intent check.")
+                llm_intent_needed = True # Let's try LLM for more cases.
+            
+            if llm_intent_needed:
+                logger.info("Calling LLM for intent classification...")
+                intent_result = await self._classify_intent_with_llm(
+                    user_query_for_alignment, 
+                    previous_system_response_for_heuristic, 
+                    previous_user_query_for_heuristic,
+                    full_message_history_for_llm_intent # Pass more history
+                ) 
+                
+                classified_intent = intent_result.get('intent')
+                intent_confidence = intent_result.get('confidence', 0)
+                reason_for_reuse_or_new_call = f"LLM Intent: {classified_intent} (Conf: {intent_confidence:.2f})"
+
+                if classified_intent in ["AFFIRMATIVE_FOLLOW_UP", "NEGATIVE_FOLLOW_UP", "CLARIFICATION_ON_TOPIC", "AMBIGUOUS_CONTEXTUAL"] and intent_confidence > 0.6:
+                    if effective_previous_alignment_data:
+                        logger.info(f"LLM Intent: Classified as '{classified_intent}'. Reusing previous alignment data.")
+                        alignment_data = effective_previous_alignment_data
+                        should_call_curriculum_alignment = False
+                        called_curriculum_alignment_this_turn = False
+                        # Update timestamp as context is actively used by LLM decision
+                        if self.current_session_alignment and isinstance(self.current_session_alignment, dict):
+                            self.current_session_alignment['timestamp'] = time.time()
+                            self.current_session_alignment['last_user_query'] = user_query_for_alignment 
+                    else:
+                        logger.warning("LLM suggested reuse based on intent, but no effective_previous_alignment_data found. Proceeding to new alignment.")
+                        reason_for_reuse_or_new_call += "; No prev_alignment for reuse."
+                        should_call_curriculum_alignment = True # Ensure it flips back if no data to reuse
+                elif classified_intent == "NEW_TOPIC_UNRELATED" and intent_confidence > 0.6:
+                    logger.info(f"LLM Intent: Classified as NEW_TOPIC_UNRELATED. Proceeding to new alignment.")
+                    should_call_curriculum_alignment = True
+                else:
+                    logger.info(f"LLM Intent: Classified as '{classified_intent}' or low confidence. Fallback to topic overlap / new alignment.")
+                    # should_call_curriculum_alignment remains true or as per previous logic if LLM is unsure.
+            
+
+        # Fallback/Existing Logic: Topic Overlap Check (if still needing to decide on new call)
+        if should_call_curriculum_alignment and effective_previous_alignment_data:
             # Topic overlap check: compare new query words against page_content + chat history
-            topic_page_content = effective_previous_alignment_details.get("raw_metadata_preview", {}).get("page_content", "")
-            history_text = user_query_for_specialist.lower()
+            topic_page_content = effective_previous_alignment_data.get("raw_metadata_preview", {}).get("page_content", "")
+            # Use user_query_for_specialist for history as it contains the fuller context from payload
+            history_text = user_query_for_specialist.lower() if isinstance(user_query_for_specialist, str) else ""
+            
             topic_and_history = topic_page_content.lower() + " " + history_text
             topic_words = set(re.findall(r"\w+", topic_and_history))
             query_words = set(re.findall(r"\w+", user_query_for_alignment.lower()))
             overlap = topic_words.intersection(query_words)
-            min_overlap = 3  # require at least 3 overlapping words for reuse
-            if len(overlap) >= min_overlap:
-                logger.info(f"Topic overlap check passed ({len(overlap)} overlapping words). Reusing previous alignment details.")
-                alignment_data = effective_previous_alignment_details
+            min_overlap = 3  # require at least 3 overlapping words for reuse (or make this configurable)
+            
+            # Be more conservative if the query is very short and not caught by Layer 1
+            is_very_short_query = len(user_query_for_alignment.split()) <= 2
+
+            if len(overlap) >= min_overlap and not is_very_short_query : # Avoid reusing for very short queries like "yes" if they slipped through Layer 1
+                logger.info(f"Topic overlap check passed ({len(overlap)} overlapping words). Reusing previous alignment data.")
+                alignment_data = effective_previous_alignment_data
                 called_curriculum_alignment_this_turn = False
                 should_call_curriculum_alignment = False
+                reason_for_reuse_or_new_call = f"Heuristic: Topic overlap ({len(overlap)} words)"
+                if self.current_session_alignment and isinstance(self.current_session_alignment, dict): # Update timestamp
+                     self.current_session_alignment['timestamp'] = time.time()
+                     self.current_session_alignment['last_user_query'] = user_query_for_alignment
+            elif is_very_short_query and len(overlap) >= min_overlap:
+                 logger.info(f"Topic overlap passed ({len(overlap)} words) but query ('{user_query_for_alignment}') is very short. Preferring new alignment or LLM check if stale.")
+                 reason_for_reuse_or_new_call = "Heuristic: Topic overlap but query too short, considering new alignment."
+                 # should_call_curriculum_alignment remains true
+
 
         if should_call_curriculum_alignment:
-            # This block will be entered if:
-            # 1. No previous_alignment_details exist.
-            # OR
-            # 2. previous_alignment_details exist, but the query did not meet the heuristic conditions for reuse.
-            if effective_previous_alignment_details: # Changed from previous_alignment_details
-                 logger.info(f"Previous alignment details exist, but query ('{normalized_current_query}') did not meet heuristic conditions for reuse. Proceeding with new curriculum alignment call.")
-            else: # No previous_alignment_details
-                 logger.info(f"No previous alignment details. Proceeding with new curriculum alignment for: '{normalized_current_query}'")
+            if effective_previous_alignment_data:
+                 logger.info(f"Reason for new alignment: {reason_for_reuse_or_new_call}. Original query for alignment: '{normalized_current_query}'")
+            else: 
+                 logger.info(f"No effective previous alignment. Reason for new alignment: New session/context. Original query: '{normalized_current_query}'")
 
             logger.debug(f"Calling CurriculumAlignmentAgent for: '{user_query_for_alignment}'")
             message_for_alignment_agent = json.dumps({
@@ -276,42 +478,34 @@ class OrchestratorAgent(autogen.AssistantAgent):
             try:
                 alignment_data = json.loads(alignment_json_str)
                 logger.debug(f"Parsed new alignment data: {json.dumps(alignment_data, indent=2)}")
+                # Update current_session_alignment with new data and timestamp
+                self.current_session_alignment = {
+                    'data': alignment_data, 
+                    'timestamp': time.time(),
+                    'last_system_response': None, # Will be set after specialist replies
+                    'last_user_query': user_query_for_alignment
+                }
             except (json.JSONDecodeError, TypeError) as e:
                 logger.error(f"Error decoding JSON from CurriculumAlignmentAgent: {e}. Received: {alignment_json_str}")
-                # Populate with a default error structure for alignment_data to prevent downstream NoneErrors
-                alignment_data = {"error": "alignment_failed", "is_in_syllabus": False, "notes_for_orchestrator": "Syllabus check failed."}
-                # return True, "I had a little trouble checking the syllabus right now. Could you try asking again? exit"
         
         # Ensure alignment_data is not None before proceeding AND before storing it in agent state
         if alignment_data: # Check if alignment_data is not None (could be from reuse or new call)
             if not alignment_data.get("error"): # Only store if it's not an error alignment
-                logger.debug(f"Updating Orchestrator's current_session_alignment with current turn's alignment_data: {str(alignment_data)[:200]}...")
-                self.current_session_alignment = alignment_data
+                # current_session_alignment is updated either during reuse or after successful new call
+                pass # logger.debug(f"Orchestrator's current_session_alignment is up-to-date.")
             else:
-                logger.warning(f"Current turn's alignment_data indicates an error: {alignment_data.get('error')}. Not updating current_session_alignment with this error state.")
-        else: # alignment_data is None at this point
-             logger.warning("alignment_data is None for this turn (either new call failed/skipped or reuse was not applicable). Not updating current_session_alignment.")
-             # Fallback if alignment_data is still None after all attempts
-             if should_call_curriculum_alignment and called_curriculum_alignment_this_turn: # A call was made but resulted in None
-                logger.error("Critical: alignment_data is None after a new alignment call. This should not happen.")
-                alignment_data = {"error": "internal_orchestrator_error_post_call", "is_in_syllabus": False, "notes_for_orchestrator": "Internal error processing alignment after new call."}
-             elif not should_call_curriculum_alignment and not alignment_data : # Reuse was intended but effective_previous_alignment_details was itself problematic or None
-                logger.error("Critical: alignment_data is None after intending to reuse. This implies effective_previous_alignment_details was problematic.")
-                alignment_data = {"error": "internal_orchestrator_error_post_reuse_attempt", "is_in_syllabus": False, "notes_for_orchestrator": "Internal error: failed to reuse alignment."}
-             # If no call was made and no reuse was intended (e.g. empty query handled earlier), alignment_data might correctly be None if that path led here.
-             # However, the logic above should have set it or it should be handled by empty query checks.
-             # Adding a final safety net if it's still None for unexpected reasons:
-             if alignment_data is None:
-                  alignment_data = {"error": "internal_orchestrator_error_final_fallback", "is_in_syllabus": False, "notes_for_orchestrator": "Internal error: alignment data unexpectedly None."}
-
+                logger.warning(f"Current turn's alignment_data indicates an error: {alignment_data.get('error')}. Not updating current_session_alignment with this error state, or it was already an error from reuse.")
+        else: # alignment_data is None at this point - this should be rare now.
+             logger.warning("alignment_data is None for this turn (either new call failed/skipped or reuse was not applicable).")
 
         reply_to_user = ""
         terminate_signal = " exit" 
         next_agent = None 
-        message_for_next_agent = "" 
+        message_for_next_agent = ""
+        final_system_response_for_session_log = None # To store the reply that will become 'last_system_response'
 
-        if alignment_data is None:
-             reply_to_user = "I couldn't get syllabus alignment information. Please try again."
+        if alignment_data is None: # This should be handled by fallbacks, but as a safety.
+            reply_to_user = "I couldn't get syllabus alignment information. Please try again."
         elif alignment_data.get("error") == "out_of_scope" or not alignment_data.get("is_in_syllabus"):
             reply_to_user = "It seems your question might be outside the scope of the ZIMSEC O-Level syllabus I cover."
             if alignment_data.get("notes_for_orchestrator"):
@@ -343,9 +537,13 @@ class OrchestratorAgent(autogen.AssistantAgent):
                 next_agent = self.concept_tutor_agent
                 message_for_next_agent = json.dumps({
                     "original_user_query": user_query_for_specialist, # Full query with history
-                    "alignment_data": alignment_data # Alignment for the NEW subject/topic
+                    "alignment_data": alignment_data, # Alignment for the NEW subject/topic
+                    "previous_system_response": previous_system_response_for_heuristic, # Pass context
+                    "user_follow_up_query": user_query_for_alignment, # The query that triggered this path
+                    "updated_orchestrator_session_alignment_for_next_turn": self.current_session_alignment # Full context for NEXT turn
                 })
                 logger.debug(f"Context switched. Routing to ConceptTutorAgent with new alignment for: '{user_query_for_specialist[:100]}...'")
+                final_system_response_for_session_log = reply_to_user # Store for next turn's context
 
             else: # User declined to switch context
                  reply_to_user = "Okay, we'll stick to the current context. Do you have another question related to {current_subject}?"
@@ -420,7 +618,9 @@ class OrchestratorAgent(autogen.AssistantAgent):
                 next_agent = self.concept_tutor_agent
                 message_for_next_agent = json.dumps({
                     "original_user_query": user_query_for_specialist, # Pass the full query (potentially augmented)
-                    "alignment_data": alignment_data # Based on the current question's alignment
+                    "alignment_data": alignment_data, # Based on the current question's alignment
+                    "previous_system_response": previous_system_response_for_heuristic if not called_curriculum_alignment_this_turn else None,
+                    "user_follow_up_query": user_query_for_alignment if not called_curriculum_alignment_this_turn else None
                 })
                 logger.debug(f"Defaulting to ConceptTutorAgent. Routing to {next_agent.name}.")
             
@@ -456,24 +656,29 @@ class OrchestratorAgent(autogen.AssistantAgent):
                         if isinstance(parsed_specialist_response, dict):
                             reply_to_user = parsed_specialist_response.get("answer", specialist_response_summary)
                             retrieved_rag_context_for_final_reply = parsed_specialist_response.get("retrieved_rag_context")
+                            final_system_response_for_session_log = reply_to_user # Store for next turn's context
                             logger.debug("Successfully parsed structured response from specialist.")
                         else:
                             # Specialist returned JSON, but not the expected dict structure
                             reply_to_user = specialist_response_summary
+                            final_system_response_for_session_log = reply_to_user
                             # RAG context from specialist is not in the expected format
                             logger.warning("Specialist returned JSON but not in expected answer/context format.")
                     except json.JSONDecodeError:
                         # Specialist returned a plain string, not JSON
                         reply_to_user = specialist_response_summary
+                        final_system_response_for_session_log = reply_to_user
                         # RAG context from specialist is not available if it wasn't JSON
                         logger.debug("Specialist returned a plain string response.")
                 else:
                     reply_to_user = f"I consulted with the {next_agent.name}, but didn't get a conclusive answer. Could you rephrase?"
+                    final_system_response_for_session_log = reply_to_user
                     # No RAG context from specialist if no summary
                     logger.warning(f"No summary received from {next_agent.name}.")
             else:
                 # This case should ideally not be reached if ConceptTutor is the default
                 reply_to_user = "I've analyzed your query with the syllabus, but I'm not sure how to proceed. Can you clarify?"
+                final_system_response_for_session_log = reply_to_user
                 logger.warning("No specialist agent was selected after alignment.")
 
         self.first_token_time = time.time() # Rough approximation for TTFT from Orchestrator's final processing
@@ -489,13 +694,24 @@ class OrchestratorAgent(autogen.AssistantAgent):
         self.stage_timings['total_orchestrator_processing'] = total_processing_time
         logger.debug(f"Total Orchestrator processing time: {total_processing_time:.2f} seconds. Stage timings: {self.stage_timings}")
         
+        # Update current_session_alignment with the final system response for context in the next turn
+        if self.current_session_alignment and isinstance(self.current_session_alignment, dict) and final_system_response_for_session_log:
+            self.current_session_alignment['last_system_response'] = final_system_response_for_session_log
+            # 'last_user_query' and 'timestamp' should have been updated when alignment_data was set or reused.
+        
         # Package the final response for main.py
         # Ensure alignment_data_to_use is defined. It would be the result from CurriculumAlignmentAgent or reused previous alignment.
         # For this change, we are ensuring that 'alignment_data' (which holds the active alignment info) is passed.
+        
+        # We pass self.current_session_alignment because it now holds the full context including timestamp and last responses
+        # The recipient (StudentInterfaceAgent -> main.py) will need to know how to unpack this if it needs individual pieces,
+        # or it can just pass the whole self.current_session_alignment as 'previous_alignment_details' in the next turn.
+        # For routing purposes in THIS turn, 'alignment_data' (the 'data' part) was used.
         final_orchestrator_output_payload = {
             "answer": reply_to_user, # This is the specialist's answer, or Orchestrator's direct reply
             "retrieved_rag_context_for_answer": retrieved_rag_context_for_final_reply, # RAG context associated with 'answer'
-            "alignment_data_used_for_routing": alignment_data # The alignment_data used for the main decision/routing
+            "alignment_data_used_for_routing": alignment_data, # The 'data' part of the alignment used for routing THIS turn
+            "updated_orchestrator_session_alignment_for_next_turn": self.current_session_alignment # Full context for NEXT turn
         }
         return True, json.dumps(final_orchestrator_output_payload) + terminate_signal
 
