@@ -15,6 +15,7 @@ from typing import List, Dict, Any, Optional, Tuple, Union # Still needed for ot
 import os
 import time
 import logging
+from datetime import datetime
 import re
 from .utils import ( # Assuming utils.py is in the same directory
     is_short_conversational_follow_up,
@@ -26,7 +27,7 @@ from autogen_core.models import SystemMessage, UserMessage # Added
 # from autogen_ext.models.openai import OpenAIChatCompletionClient # No longer directly instantiating this here
 
 # Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # Conversation constants
@@ -108,47 +109,72 @@ class OrchestratorAgent(autogen.AssistantAgent):
         self.first_token_time = None
         # self._intent_classifier_client is no longer needed as we use self.client
 
-    async def _classify_intent_with_llm(self, current_query: str, last_system_response: Optional[str], last_user_query: Optional[str], full_history: Optional[List[Dict[str, str]]]) -> Dict[str, Any]:
+    async def _classify_intent_with_llm(self, current_query: str, last_system_response: Optional[str], last_user_query: Optional[str], full_history: Optional[List[Dict[str, str]]], alignment_data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
         Uses the agent's configured LLM client to classify the intent of the current user query.
         Returns a dictionary like: {'intent': 'AFFIRMATIVE_FOLLOW_UP|CLARIFICATION|NEW_TOPIC|UNKNOWN', 'confidence': float, 'raw_response': str}
         """
+        print(
+            f"\n*******************\n_classify_intent_with_llm called with: \n*******************\n"
+            f"  current_query: {current_query!r}\n"
+            f"  last_system_response: {last_system_response!r}\n"
+            f"  last_user_query: {last_user_query!r}\n"
+            f"  full_history: {full_history!r}\n"
+            f"  alignment_data: {alignment_data!r}"
+        )
         # Check if the agent's client is available. 
         # self.client is initialized by ConversableAgent based on llm_config.
         if not hasattr(self, 'client') or self.client is None:
             logger.warning("Agent's LLM client (self.client) not available for intent classification.")
             return {"intent": "UNKNOWN", "confidence": 0.0, "raw_response": "Agent client missing"}
 
-        conversation_context = ""
-        if last_user_query:
-            conversation_context += f"Previous User Query: {last_user_query}\n"
-        if last_system_response:
-            conversation_context += f"Previous System Response: {last_system_response}\n"
-        conversation_context += f"Current User Query: {current_query}\n"
-
-        # Simplified history for the prompt
-        if full_history and len(full_history) > 1:
-            recent_history_str = "\nRecent conversation turn(s):\n"
-            # Take last 3 messages before the current one
-            for msg in full_history[-4:-1]: 
+        # Format chat history with timestamps
+        chat_log = []
+        if full_history:
+            for msg in full_history:
                 role = msg.get("role", "user") if msg.get("name") != self.name else "assistant"
                 content = msg.get("content", "")
+                timestamp = msg.get("timestamp", datetime.utcnow().isoformat() + "Z")
+                
                 if isinstance(content, str):
-                    try: 
+                    try:
                         parsed_c = json.loads(content)
                         if isinstance(parsed_c, dict) and "user_query" in parsed_c:
                             content = parsed_c.get("original_user_query", parsed_c.get("user_query"))
                         elif isinstance(parsed_c, dict) and "answer" in parsed_c:
                             content = parsed_c.get("answer")
                     except json.JSONDecodeError:
-                        pass 
-                recent_history_str += f"{role}: {str(content)[:150]}\n" 
-            conversation_context = recent_history_str + "\n---\n" + conversation_context
+                        pass
+                
+                chat_log.append({
+                    "name": "Student" if role == "user" else "System",
+                    "timestamp": timestamp,
+                    "message": str(content)[:150]
+                })
+
+        # Add current query to chat log
+        chat_log.append({
+            "name": "Student",
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "message": current_query
+        })
+
+        # Get page content from alignment data if available
+        page_content = ""
+        if alignment_data: # Check if alignment_data (the direct data dictionary) is available
+            # Directly access raw_metadata_preview from the alignment_data argument
+            raw_metadata = alignment_data.get("raw_metadata_preview", {})
+            page_content = raw_metadata.get("page_content", "")
+
+        conversation_context = {
+            "chat_log": chat_log,
+            "page_content": page_content
+        }
 
         system_prompt_content = (
             "You are an expert in classifying user intent in a tutoring conversation. "
-            "Based on the provided context (previous queries and responses, and current query), "
-            "classify the 'Current User Query' into one of these categories: "
+            "Based on the provided chat log and page content, "
+            "classify the most recent user message into one of these categories: "
             "1. AFFIRMATIVE_FOLLOW_UP: User is saying yes, okay, sure, etc., directly to a question or suggestion from the system. "
             "2. NEGATIVE_FOLLOW_UP: User is saying no, nope, etc., directly to a question or suggestion from the system. "
             "3. CLARIFICATION_ON_TOPIC: User is asking for more details, examples, or explanation about the *immediately preceding* topic. "
@@ -159,10 +185,10 @@ class OrchestratorAgent(autogen.AssistantAgent):
         
         prompt_message_objects = [
             SystemMessage(content=system_prompt_content),
-            UserMessage(content=conversation_context, source="user")
+            UserMessage(content=json.dumps(conversation_context), source="user")
         ]
 
-        logger.debug(f"LLM Intent Classification Prompt Context:\n{conversation_context}")
+        logger.debug(f"LLM Intent Classification Prompt Context:\n{json.dumps(conversation_context, indent=2)}")
 
         # Convert Pydantic message objects to a list of dicts for the API
         formatted_messages_for_api = []
@@ -227,12 +253,11 @@ class OrchestratorAgent(autogen.AssistantAgent):
 
         # Prevent Orchestrator from replying to its own messages
         if sender.name == self.name:
-            logger.debug(f"Orchestrator: Message from self ({sender.name}), content: '{messages[-1].get('content', '')[:100]}...'. Declining to reply to prevent loop.")
+            logger.debug(f"Orchestrator: Message from self ({sender.name}), content: '{messages[-1].get('content', '')[:500]}...'. Declining to reply to prevent loop.")
             return True, None
 
         # Get the full history for potential LLM intent classification
         full_message_history_for_llm_intent = messages 
-
         last_message = messages[-1]
         user_input_raw = last_message.get("content", "")
         input_tokens = estimate_tokens(user_input_raw)
@@ -381,7 +406,8 @@ class OrchestratorAgent(autogen.AssistantAgent):
                     user_query_for_alignment, 
                     previous_system_response_for_heuristic, 
                     previous_user_query_for_heuristic,
-                    full_message_history_for_llm_intent # Pass more history
+                    full_message_history_for_llm_intent, # Pass more history
+                    effective_previous_alignment_data # Pass effective_previous_alignment_data for context
                 ) 
                 
                 classified_intent = intent_result.get('intent')

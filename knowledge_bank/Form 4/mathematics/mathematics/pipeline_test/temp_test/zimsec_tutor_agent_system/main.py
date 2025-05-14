@@ -34,7 +34,7 @@ console = Console()
 FORM_LEVELS = ["Form 1", "Form 2", "Form 3", "Form 4"]
 
 # Helper function to log to file and print to Rich console
-def log_and_print(content, level=logging.INFO, log_prefix=""):
+def log_and_print(content, level=logging.DEBUG, log_prefix=""):
     """Logs the content to the configured logger and prints to Rich console."""
     global console
     

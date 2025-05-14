@@ -9,16 +9,16 @@ SHORT_CONVERSATIONAL_PHRASES: List[str] = [
     "ok", "okay", "alright", "got it", "fine", "sounds good",
     "sure", "please", "please do", "go ahead", "go on", "carry on", "continue",
     "tell me more", "show me", "give examples", "examples", "more examples",
-    "keep going", "elaborate", "expand", "clarify",
+    "keep going", "elaborate", "expand", "clarify","make it more detailed",
     "explain further", "more details", "details", "additional details", "further",
-    "next", "proceed", "move on", "what next", "and then",
+    "next", "proceed", "move on", "what next", "and then", "may you explain it in more detail",
     "why", "how", "what about", "why so", "why is that", "how come", "how is that",
     "can you elaborate", "could you clarify", "i see", "understood", "makes sense",
     "anything else", "what else", "is that all", "any more", "go deeper", "dive deeper",
     "another example", "one more example", "what do you mean", "meaning", "define", "definition",
     "i don't understand", "confused", "lost", "repeat", "say again", "once more", "again please",
     "interesting", "good", "great", "awesome", "perfect", "excellent", "nice", "cool",
-    "that's clear", "clear", "gotcha"
+    "that's clear", "clear", "gotcha", "may you explain further"
 ]
 # Remove duplicates by converting to set and back to list
 SHORT_CONVERSATIONAL_PHRASES = sorted(list(set(phrase.lower() for phrase in SHORT_CONVERSATIONAL_PHRASES)))
