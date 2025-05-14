@@ -336,6 +336,7 @@ class OrchestratorAgent(autogen.AssistantAgent):
         called_curriculum_alignment_this_turn = False
         should_call_curriculum_alignment = True # Default to calling
         reason_for_reuse_or_new_call = "Default: New query"
+        llm_forced_new_alignment = False # Explicitly set for this path
 
         # --- Layered Follow-up Logic ---
         is_stale = is_conversation_stale(last_interaction_timestamp, self.stale_threshold_seconds)
@@ -401,16 +402,19 @@ class OrchestratorAgent(autogen.AssistantAgent):
                         logger.warning("LLM suggested reuse based on intent, but no effective_previous_alignment_data found. Proceeding to new alignment.")
                         reason_for_reuse_or_new_call += "; No prev_alignment for reuse."
                         should_call_curriculum_alignment = True # Ensure it flips back if no data to reuse
+                        llm_forced_new_alignment = False # Explicitly set for this path
                 elif classified_intent == "NEW_TOPIC_UNRELATED" and intent_confidence > 0.6:
                     logger.info(f"LLM Intent: Classified as NEW_TOPIC_UNRELATED. Proceeding to new alignment.")
                     should_call_curriculum_alignment = True
+                    llm_forced_new_alignment = True # LLM forces new alignment
                 else:
                     logger.info(f"LLM Intent: Classified as '{classified_intent}' or low confidence. Fallback to topic overlap / new alignment.")
                     # should_call_curriculum_alignment remains true or as per previous logic if LLM is unsure.
+                    llm_forced_new_alignment = False # LLM did not force new alignment
             
 
         # Fallback/Existing Logic: Topic Overlap Check (if still needing to decide on new call)
-        if should_call_curriculum_alignment and effective_previous_alignment_data:
+        if should_call_curriculum_alignment and effective_previous_alignment_data and not llm_forced_new_alignment:
             # Topic overlap check: compare new query words against page_content + chat history
             topic_page_content = effective_previous_alignment_data.get("raw_metadata_preview", {}).get("page_content", "")
             # Use user_query_for_specialist for history as it contains the fuller context from payload

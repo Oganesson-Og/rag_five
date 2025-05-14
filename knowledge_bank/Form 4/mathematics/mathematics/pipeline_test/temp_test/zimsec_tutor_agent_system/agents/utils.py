@@ -1,12 +1,34 @@
 import time
 from typing import Optional, List
+from symspellpy import SymSpell, Verbosity
 
+# Comprehensive list based on user attachment
 SHORT_CONVERSATIONAL_PHRASES: List[str] = [
-    "yes", "yep", "y", "no", "nope", "n", "ok", "okay", "sure", "please",
-    "go on", "tell me more", "examples", "more examples", "continue",
-    "explain further", "more details", "next", "proceed", "yup",
-    "why", "how", "what about", "please continue"
+    "yes", "yep", "y", "yeah", "ya", "yup", "correct", "right", "exactly",
+    "no", "nope", "nah", "n", "not really", "incorrect", "wrong",
+    "ok", "okay", "alright", "got it", "fine", "sounds good",
+    "sure", "please", "please do", "go ahead", "go on", "carry on", "continue",
+    "tell me more", "show me", "give examples", "examples", "more examples",
+    "keep going", "elaborate", "expand", "clarify",
+    "explain further", "more details", "details", "additional details", "further",
+    "next", "proceed", "move on", "what next", "and then",
+    "why", "how", "what about", "why so", "why is that", "how come", "how is that",
+    "can you elaborate", "could you clarify", "i see", "understood", "makes sense",
+    "anything else", "what else", "is that all", "any more", "go deeper", "dive deeper",
+    "another example", "one more example", "what do you mean", "meaning", "define", "definition",
+    "i don't understand", "confused", "lost", "repeat", "say again", "once more", "again please",
+    "interesting", "good", "great", "awesome", "perfect", "excellent", "nice", "cool",
+    "that's clear", "clear", "gotcha"
 ]
+# Remove duplicates by converting to set and back to list
+SHORT_CONVERSATIONAL_PHRASES = sorted(list(set(phrase.lower() for phrase in SHORT_CONVERSATIONAL_PHRASES)))
+
+# Initialize SymSpell and load dictionary
+# max_dictionary_edit_distance: Maximum edit distance to create dictionary precalculations.
+# prefix_length: The prefix length of dictionary words to precalculate. Max 10.
+sym_spell = SymSpell(max_dictionary_edit_distance=2, prefix_length=7)
+for phrase in SHORT_CONVERSATIONAL_PHRASES:
+    sym_spell.create_dictionary_entry(phrase, 1) # count = 1, can be any positive number
 
 SYSTEM_INVITATION_KEYWORDS: List[str] = [
     "would you like", "do you want", "shall i", "can i help", "any questions",
@@ -15,8 +37,24 @@ SYSTEM_INVITATION_KEYWORDS: List[str] = [
 ]
 
 def is_short_conversational_follow_up(query_text: str) -> bool:
-    """Checks if the query is a short, common conversational follow-up."""
-    return query_text.lower().strip() in SHORT_CONVERSATIONAL_PHRASES
+    """Checks if the query is a short, common conversational follow-up, with typo correction."""
+    normalized_query = query_text.lower().strip()
+    if not normalized_query: # Handle empty strings
+        return False
+
+    # Lookup: get suggestions with max_edit_distance=2 (same as dictionary precalculation for efficiency)
+    # Verbosity.CLOSEST returns only the closest suggestion
+    suggestions = sym_spell.lookup(normalized_query, Verbosity.CLOSEST, max_edit_distance=2)
+    
+    if suggestions:
+        corrected_query = suggestions[0].term
+        return corrected_query in SHORT_CONVERSATIONAL_PHRASES
+    else:
+        # If no suggestion is found (e.g., query is too different or empty after strip),
+        # fall back to checking the original normalized query.
+        # This might be useful if the phrase is correct but not in the dictionary for some reason,
+        # though with SymSpell loading all phrases, this fallback is less critical for correctness.
+        return normalized_query in SHORT_CONVERSATIONAL_PHRASES
 
 def did_system_invite_follow_up(system_response_text: Optional[str]) -> bool:
     """Checks if the system's last response likely invited a follow-up."""
