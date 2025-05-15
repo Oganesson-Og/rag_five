@@ -1,3 +1,40 @@
+"""
+ZIMSEC Tutoring System - Agent Utilities
+----------------------------------------
+
+This module provides utility functions and constants used by various agents
+within the ZIMSEC Tutoring System, particularly by the `OrchestratorAgent`
+for managing conversation flow and context.
+
+Key Features:
+- Defines `SHORT_CONVERSATIONAL_PHRASES`: A list of common short phrases
+  (e.g., "yes", "tell me more", "why") used to identify simple follow-up queries.
+- Initializes `SymSpell`: A spell-checking library used by
+  `is_short_conversational_follow_up` to handle typos in short user queries.
+- Defines `SYSTEM_INVITATION_KEYWORDS`: Keywords used by `did_system_invite_follow_up`
+  to check if the system's last response prompted the user for further interaction.
+- Provides utility functions:
+    - `is_short_conversational_follow_up`: Checks if a query is a short, common
+      conversational follow-up, with typo correction using SymSpell.
+    - `did_system_invite_follow_up`: Checks if the system's last response likely
+      invited a follow-up question or continuation.
+    - `is_conversation_stale`: Determines if the current conversation context has become
+      stale based on the time elapsed since the last interaction.
+
+These utilities help the `OrchestratorAgent` make more informed decisions about
+whether to reuse existing conversation context (like syllabus alignment) or to
+re-evaluate the user's query from scratch.
+
+Dependencies:
+- time
+- typing
+- symspellpy (for typo correction in short phrases)
+
+Author: Keith Satuku
+Version: 1.0.0
+Created: 2024
+License: MIT
+"""
 import time
 from typing import Optional, List
 from symspellpy import SymSpell, Verbosity
@@ -37,7 +74,19 @@ SYSTEM_INVITATION_KEYWORDS: List[str] = [
 ]
 
 def is_short_conversational_follow_up(query_text: str) -> bool:
-    """Checks if the query is a short, common conversational follow-up, with typo correction."""
+    """Checks if the query is a short, common conversational follow-up, with typo correction.
+
+    Normalizes the input query (lowercase, strip whitespace). It then uses SymSpell
+    to find the closest matching phrase from `SHORT_CONVERSATIONAL_PHRASES`,
+    allowing for a small number of edits (typos).
+
+    Args:
+        query_text (str): The user's query.
+
+    Returns:
+        bool: True if the (potentially corrected) query is in the list of short
+              conversational phrases, False otherwise.
+    """
     normalized_query = query_text.lower().strip()
     if not normalized_query: # Handle empty strings
         return False
@@ -57,14 +106,40 @@ def is_short_conversational_follow_up(query_text: str) -> bool:
         return normalized_query in SHORT_CONVERSATIONAL_PHRASES
 
 def did_system_invite_follow_up(system_response_text: Optional[str]) -> bool:
-    """Checks if the system's last response likely invited a follow-up."""
+    """Checks if the system's last response likely invited a follow-up.
+
+    Scans the system's last response for keywords defined in `SYSTEM_INVITATION_KEYWORDS`
+    (e.g., "would you like", "any questions").
+
+    Args:
+        system_response_text (Optional[str]): The text of the system's last response.
+
+    Returns:
+        bool: True if any of the invitation keywords are found in the response,
+              False otherwise or if the response is None.
+    """
     if not system_response_text:
         return False
     lower_response = system_response_text.lower()
     return any(kw in lower_response for kw in SYSTEM_INVITATION_KEYWORDS)
 
 def is_conversation_stale(interaction_timestamp: Optional[float], stale_threshold_seconds: int) -> bool:
-    """Checks if the conversation is stale based on the last interaction time."""
+    """Checks if the conversation is stale based on the last interaction time.
+
+    Compares the current time with the timestamp of the last interaction.
+    If the difference exceeds `stale_threshold_seconds`, the conversation is
+    considered stale.
+
+    Args:
+        interaction_timestamp (Optional[float]): The timestamp (seconds since epoch)
+                                                 of the last interaction. If None,
+                                                 the conversation is considered stale (as if new).
+        stale_threshold_seconds (int): The duration in seconds after which a conversation
+                                       is deemed stale.
+
+    Returns:
+        bool: True if the conversation is stale, False otherwise.
+    """
     if interaction_timestamp is None:
         return True  # No previous interaction, so it's "stale" for a new context
     return (time.time() - interaction_timestamp) > stale_threshold_seconds

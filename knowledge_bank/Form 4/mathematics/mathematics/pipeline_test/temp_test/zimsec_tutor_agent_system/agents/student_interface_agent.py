@@ -1,3 +1,46 @@
+"""
+ZIMSEC Tutoring System - Student Interface Agent
+------------------------------------------------
+
+This module defines the `StudentInterfaceAgent`, responsible for managing
+all direct interactions with the student (represented by `UserProxy` in Autogen).
+Its main goal is to provide a friendly, supportive, and natural conversational
+experience.
+
+Key Responsibilities:
+- Receives raw user input (query and form level) from the `UserProxy`.
+- Packages this input into a JSON format and forwards it to the `OrchestratorAgent`.
+- Receives a structured JSON response from the `OrchestratorAgent`.
+  This response contains the final answer, any retrieved RAG context, and an optional
+  `suggested_image_path`.
+- The `StudentInterfaceAgent` itself does minimal processing of the Orchestrator's response.
+  Its primary role on the return path is to ensure the response is in the correct format
+  (a dictionary with "answer" and "suggested_image_path" keys) to be passed back
+  to `main.py` for final presentation to the user.
+- (Previously, it had more complex conversationalizing logic, but this has been simplified
+  as the Orchestrator now provides a more direct payload).
+
+Technical Details:
+- Inherits from `autogen.AssistantAgent`.
+- Defines a system message that emphasizes its role in friendly student interaction.
+- Registers a reply function (`_generate_student_reply`) which is the core of its
+  interaction logic.
+- When a message is from `UserProxy` (student), it initiates a chat with the `OrchestratorAgent`.
+- When it receives the reply from the `OrchestratorAgent`, it ensures it's a dictionary
+  (parsing from JSON if necessary) and returns it.
+
+Dependencies:
+- autogen
+- json
+- typing
+- logging
+- OrchestratorAgent (for forwarding requests)
+
+Author: Keith Satuku
+Version: 1.0.0
+Created: 2024
+License: MIT
+"""
 import autogen
 import json
 from typing import List, Dict, Any, Optional, Tuple, Union
@@ -7,6 +50,28 @@ import logging
 logger = logging.getLogger(__name__)
 
 class StudentInterfaceAgent(autogen.AssistantAgent):
+    """
+    The `StudentInterfaceAgent` acts as the primary point of contact with the student user.
+
+    It is responsible for:
+    1.  Receiving the student's raw input (query and selected form level) from the
+        `UserProxy` agent.
+    2.  Packaging this input into a structured JSON message.
+    3.  Forwarding this JSON message to the `OrchestratorAgent` to initiate the main
+        tutoring logic (curriculum alignment, specialist agent routing, etc.).
+    4.  Receiving the final structured response from the `OrchestratorAgent`.
+        This response is expected to be a JSON string which, when parsed, will contain
+        at least an "answer" field and potentially a "suggested_image_path" and
+        other contextual information.
+    5.  Ensuring this received response is converted into a Python dictionary and
+        then returning this dictionary. This dictionary is then picked up by the
+        `main.py` script to be displayed to the actual user.
+
+    The agent aims to maintain a friendly and supportive tone, as guided by its
+    system message, although most of the direct conversational formatting is now
+    expected to be handled by the specialist agents and refined by the Orchestrator
+    before reaching this agent.
+    """
     def __init__(self, name: str, orchestrator_agent, llm_config: Dict, **kwargs):
         system_message = (
             "You are the Student Interface Agent.\n"
@@ -26,6 +91,22 @@ class StudentInterfaceAgent(autogen.AssistantAgent):
 
     @staticmethod
     def conversationalize_remediation(remediation_json: Dict) -> str:
+        """
+        DEPRECATED/UNUSED: Converts a JSON object containing remediation syllabus content
+        into a user-friendly, conversational string with options for the student.
+
+        This function was previously used to make raw syllabus remediation data more
+        palatable for the student. The current architecture expects the Orchestrator or
+        specialist agents to handle more of the conversational formatting.
+
+        Args:
+            remediation_json (Dict): A dictionary, typically from a diagnostic agent,
+                                     containing 'remediation' (a list of syllabus entries)
+                                     and a 'message'.
+
+        Returns:
+            str: A conversational message presenting remediation options.
+        """
         remediation = remediation_json.get('remediation', [])
         message = remediation_json.get('message', '')
         if not remediation:
@@ -49,7 +130,7 @@ class StudentInterfaceAgent(autogen.AssistantAgent):
         return f"{intro}\n{options_text}\n{followup}"
 
     def _conversationalize_diagnostic_remediation(self, data: Dict) -> str:
-        """Transforms diagnostic/remediation JSON into a conversational message."""
+        """DEPRECATED/UNUSED: Transforms diagnostic/remediation JSON into a conversational message."""
         logger.debug(f"Conversationalizing diagnostic/remediation data: {data}")
         
         if "prerequisite_check" in data and data["prerequisite_check"].get("score", 1.0) < 0.7:
@@ -75,12 +156,47 @@ class StudentInterfaceAgent(autogen.AssistantAgent):
             return "I received a response, but I'm not sure how to present it. It might be a bit technical."
 
     def _conversationalize_concept_explanation(self, explanation_text: str) -> str:
-        """Wraps a concept explanation in a conversational tone."""
+        """DEPRECATED/UNUSED: Wraps a concept explanation in a conversational tone."""
         logger.debug(f"Conversationalizing concept explanation snippet: {explanation_text[:100]}...")
         # Basic conversational wrapper. Could be more dynamic.
         return f"Okay, let me explain that for you:\n\n{explanation_text}\n\nDoes that make sense, or would you like me to explain a part of it differently?"
 
     async def _generate_student_reply(self, messages: Optional[List[Dict]] = None, sender: Optional[autogen.Agent] = None, config: Optional[Any] = None) -> Tuple[bool, Union[str, Dict, None]]:
+        """
+        Handles messages for the StudentInterfaceAgent.
+
+        This asynchronous method is the main interaction point for this agent.
+        Its behavior depends on the sender of the message:
+
+        1.  If the message is from `UserProxy` (i.e., the student via the main CLI):
+            a.  Parses the incoming content (expected to be a JSON string with
+                `user_query` and `form_level`).
+            b.  Constructs an input JSON string for the `OrchestratorAgent`.
+            c.  Initiates a chat with the `OrchestratorAgent`, sending this input.
+            d.  Receives the reply from the `OrchestratorAgent` (which should be a
+                JSON string representing a dictionary with "answer", "suggested_image_path", etc.).
+            e.  Parses this orchestrator reply into a Python dictionary.
+            f.  Returns this dictionary. This dictionary is then used by `main.py`
+                to display the answer and image path to the student.
+
+        2.  If the message is from another agent (e.g., directly from Orchestrator or a
+            specialist, though this path is less common in the primary student interaction loop):
+            a.  It attempts to parse the content as JSON if it's a string.
+            b.  Returns the parsed content (if successful) or a wrapped version if parsing fails,
+                maintaining a consistent dictionary structure with "answer" and
+                "suggested_image_path".
+
+        Args:
+            messages (Optional[List[Dict]]): A list of messages. The last message is the one to process.
+            sender (Optional[autogen.Agent]): The agent that sent the message.
+            config (Optional[Any]): Optional configuration data (not actively used).
+
+        Returns:
+            Tuple[bool, Union[str, Dict, None]]: A tuple where the first element is True
+                                                 (indicating the agent can reply), and the
+                                                 second is the processed reply (typically a
+                                                 dictionary for `main.py` or None).
+        """
         last_message = messages[-1]
         content = last_message.get("content", "")
         logger.debug(f"Received message from {sender.name if sender else 'Unknown Sender'}")
@@ -106,15 +222,26 @@ class StudentInterfaceAgent(autogen.AssistantAgent):
             orchestrator_reply = orchestrator_results.summary if orchestrator_results else "Sorry, I couldn't get a response."
             # Try to parse as JSON
             try:
-                parsed = json.loads(orchestrator_reply)
-                if parsed.get("status") == "remediation_syllabus_content":
-                    reply = self.conversationalize_remediation(parsed)
-                else:
-                    # Fallback: just show the message or a generic explanation
-                    reply = parsed.get("message") or str(parsed)
-            except Exception:
-                reply = orchestrator_reply
+                parsed_orchestrator_reply = json.loads(orchestrator_reply)
+                # If orchestrator_reply was valid JSON, pass the parsed dict as the reply.
+                # main.py will then extract 'answer', 'suggested_image_path', etc.
+                reply = parsed_orchestrator_reply
+            except json.JSONDecodeError:
+                # If orchestrator_reply was not JSON, pass the raw string.
+                # Create a simple dict structure for consistency in main.py if needed.
+                reply = {"answer": orchestrator_reply, "suggested_image_path": None}
+            except Exception as e: # Catch other potential errors during parsing or access
+                logger.error(f"Error processing orchestrator reply: {e}. Raw reply: {orchestrator_reply}")
+                reply = {"answer": "Sorry, I had trouble processing the response.", "suggested_image_path": None}
             return True, reply
         else:
-            # If this is a specialist/orchestrator reply, just pass it through (shouldn't happen in normal flow)
-            return True, content 
+            # If this is a specialist/orchestrator reply directly to StudentInterfaceAgent (not via UserProxy flow),
+            # this case should ideally not be hit in the main loop for student interaction.
+            # For safety, pass content through, perhaps wrapped for consistency.
+            if isinstance(content, str):
+                try:
+                    parsed_content = json.loads(content)
+                    return True, parsed_content # Assuming it's already the final format
+                except json.JSONDecodeError:
+                    return True, {"answer": content, "suggested_image_path": None}
+            return True, content # Pass as is if already a dict or other type 

@@ -115,6 +115,10 @@ class KnowledgeBaseRetriever:
                                 if isinstance(section, dict):
                                     page_content_parts.append(f"Section {sec_idx+1}: Heading: {section.get('heading', 'N/A')}")
                                     page_content_parts.append(f"Content: {section.get('content', 'N/A')}")
+                                    if section.get("image_path"):
+                                        page_content_parts.append(f"Image Path: {section.get('image_path')}")
+                                    if section.get("image_description"):
+                                        page_content_parts.append(f"Image Description: {section.get('image_description')}")
                         
                         if "worked_examples" in item and isinstance(item["worked_examples"], list):
                             page_content_parts.append("\n--- WORKED EXAMPLES ---")

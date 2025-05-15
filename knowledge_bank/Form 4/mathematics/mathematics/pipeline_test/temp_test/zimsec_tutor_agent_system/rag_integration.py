@@ -1,4 +1,36 @@
 # rag_integration.py
+"""
+ZIMSEC Tutoring System - RAG Integration Module
+-----------------------------------------------
+
+This module facilitates the integration of the Retrieval Augmented Generation (RAG)
+pipeline (`rag_oo_pipeline`) with the ZIMSEC Tutoring Agent System.
+It initializes and provides access to RAG components like syllabus alignment
+and knowledge base retrieval for use by the agents.
+
+Key Features:
+- Initializes RAG components (EmbeddingModel, QdrantService, SyllabusProcessor, KnowledgeBaseRetriever).
+- Provides functions for agents to get syllabus alignment information for a query.
+- Provides functions for agents to retrieve knowledge content based on topic, subtopic, and form.
+- Handles path adjustments for RAG components assuming a specific directory structure.
+
+Technical Details:
+- Leverages the `rag_oo_pipeline` for core RAG functionalities.
+- Components are initialized once upon module import.
+- Functions are designed to return structured data or error messages for agent consumption.
+
+Dependencies:
+- json
+- typing (List, Dict, Optional, Any)
+- langchain.docstore.document (Document)
+- os
+- rag_oo_pipeline (EmbeddingModelFactory, QdrantService, KnowledgeBaseRetriever, SyllabusProcessor, config)
+
+Author: Keith Satuku
+Version: 1.0.0
+Created: 2024
+License: MIT
+"""
 
 import json
 from typing import List, Dict, Optional, Any
@@ -38,6 +70,24 @@ syllabus_processor_instance: Optional[SyllabusProcessor] = None
 kb_retriever_instance: Optional[KnowledgeBaseRetriever] = None
 
 def _initialize_rag_components():
+    """
+    Initializes the core RAG components from the `rag_oo_pipeline`.
+
+    This function is called once when the module is imported. It sets up:
+    1.  Path adjustments: Modifies `rag_config.QDRANT_PATH` and determines the
+        absolute path for `KNOWLEDGE_BANK_PATH` based on the expected directory
+        structure relative to this file.
+    2.  Embedding Model: Fetches the embedding model using `EmbeddingModelFactory`.
+    3.  Qdrant Service: Initializes `QdrantService` with the embedding model.
+        It relies on `QdrantService` to pick up configurations like path and API key
+        from `rag_oo_pipeline.config`.
+    4.  Syllabus Processor: Initializes `SyllabusProcessor` with the Qdrant service.
+    5.  Knowledge Base Retriever: Initializes `KnowledgeBaseRetriever` with the
+        absolute path to the knowledge bank.
+
+    If initialization fails, global component instances remain `None`, and subsequent
+    RAG calls will return error messages.
+    """
     global _initialized, syllabus_processor_instance, kb_retriever_instance
     if _initialized:
         return
@@ -114,12 +164,27 @@ _initialize_rag_components() # Initialize on first import
 
 def get_syllabus_alignment_from_rag(query: str, subject_hint: str, form_level: str) -> Dict[str, Any]:
     """
-    Uses the SyllabusProcessor from rag_oo_pipeline to classify the query
-    and returns a structured dictionary for the CurriculumAlignmentAgent.
+    Uses the SyllabusProcessor from `rag_oo_pipeline` to classify the user's query
+    against the syllabus and returns a structured dictionary of alignment details.
+
+    This function is intended to be called by the `CurriculumAlignmentAgent` or
+    `OrchestratorAgent` to understand how a student's query maps to the curriculum.
+
     Args:
-        query: The user's query string.
-        subject_hint: The current subject context (e.g., "Mathematics").
-        form_level: The specific form level (e.g., "Form 4") to filter syllabus by.
+        query (str): The student's query string.
+        subject_hint (str): The current subject context (e.g., "Mathematics").
+                            This is used to populate `identified_subject` in the response.
+        form_level (str): The specific form level (e.g., "Form 4") to filter syllabus
+                          entries by during classification.
+
+    Returns:
+        Dict[str, Any]: A dictionary containing syllabus alignment information.
+                        Keys include `is_in_syllabus` (bool), `alignment_score` (float),
+                        `matched_outcomes` (List[str]), `mandatory_terms` (List[str]),
+                        `syllabus_references` (List[Dict]), `identified_subject` (str),
+                        `identified_topic` (str), `identified_subtopic` (str),
+                        `identified_form` (str), `gaps` (List), and
+                        `notes_for_orchestrator` (str). Includes `error` key on failure.
     """
     if not syllabus_processor_instance:
         return {
@@ -220,9 +285,22 @@ def get_syllabus_alignment_from_rag(query: str, subject_hint: str, form_level: s
 
 def get_knowledge_content_from_rag(topic: str, subtopic: str, form: str) -> str:
     """
-    Uses the KnowledgeBaseRetriever from rag_oo_pipeline to fetch content
-    for a given topic, subtopic, and form.
-    Returns a string of knowledge content.
+    Uses the KnowledgeBaseRetriever from `rag_oo_pipeline` to fetch relevant
+    knowledge content for a given topic, subtopic, and form level.
+
+    This function is typically called by a specialist agent (e.g., `ConceptTutorAgent`)
+    after the `OrchestratorAgent` has determined the precise syllabus context.
+    The retrieved content is expected to be a formatted string ready for inclusion
+    in an LLM prompt.
+
+    Args:
+        topic (str): The specific topic identified from the syllabus.
+        subtopic (str): The specific subtopic identified from the syllabus.
+        form (str): The specific form level.
+
+    Returns:
+        str: A string containing the formatted knowledge content. If no content is
+             found or an error occurs, an error message string is returned.
     """
     if not kb_retriever_instance:
         return "Error: KnowledgeBaseRetriever not initialized. Cannot fetch content."

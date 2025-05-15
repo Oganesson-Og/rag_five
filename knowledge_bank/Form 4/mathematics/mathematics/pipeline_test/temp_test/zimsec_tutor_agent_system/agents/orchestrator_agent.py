@@ -1,4 +1,58 @@
 # orchestrator_agent.py
+"""
+ZIMSEC Tutoring System - Orchestrator Agent
+-------------------------------------------
+
+This module defines the `OrchestratorAgent`, the central coordinating agent in
+the ZIMSEC Tutoring System. It manages the conversation flow, determines user
+intent, interacts with the `CurriculumAlignmentAgent`, and routes tasks to
+specialist agents (e.g., `ConceptTutorAgent`, `AssessmentRevisionAgent`).
+
+Key Responsibilities:
+- Receives user queries from the `StudentInterfaceAgent` (via `UserProxy`).
+- Manages conversation context, including recent alignment data and interaction history.
+- Determines if a query is a follow-up or a new topic using an LLM-based intent classifier
+  and utility functions (`is_short_conversational_follow_up`, `did_system_invite_follow_up`, `is_conversation_stale`).
+- If necessary, consults the `CurriculumAlignmentAgent` to get syllabus alignment for the query.
+- Based on alignment and intent, routes the query to the appropriate specialist agent:
+    - `ConceptTutorAgent` for explanations and conceptual help.
+    - `DiagnosticRemediationAgent` for checking answers and diagnosing misconceptions.
+    - `AssessmentRevisionAgent` for practice questions and revision tasks.
+    - `ProjectsMentorAgent` for CALA project assistance.
+    - `ContentGenerationAgent` for generating learning materials.
+    - `AnalyticsProgressAgent` for progress tracking and analytics queries.
+- Handles cases where queries are out of syllabus scope or require subject clarification.
+- Forwards the specialist agent's response (or its own direct response) back to the `StudentInterfaceAgent`.
+- Manages state for multi-turn interactions, such as subject clarification dialogues.
+
+Technical Details:
+- Inherits from `autogen.AssistantAgent`.
+- Defines a comprehensive system message detailing its roles, communication protocols with other agents, and decision-making logic.
+- Registers a primary reply function (`_generate_orchestrator_reply`) to handle incoming messages.
+- Uses an internal LLM (`_classify_intent_with_llm`) for nuanced intent classification.
+- Interacts with other agents by initiating chats and processing their JSON responses.
+- Maintains `current_session_alignment` to store the latest syllabus alignment data.
+- Includes logic for handling simulated user input for context-switching clarifications (due to limitations in async human input with UserProxyAgent in some Autogen setups).
+
+Dependencies:
+- autogen
+- json
+- asyncio
+- typing
+- os
+- time
+- logging
+- datetime
+- re
+- .utils (helper functions for conversation context analysis)
+- autogen_core.models (SystemMessage, UserMessage)
+- Other agents in the system (CurriculumAlignmentAgent, ConceptTutorAgent, etc.)
+
+Author: Keith Satuku
+Version: 1.0.0
+Created: 2024
+License: MIT
+"""
 # NOTE: Due to issues with handling async human input via UserProxyAgent
 # in the current setup (causing TypeError: object str can't be used in 'await' expression),
 # the logic to handle the user's reply to context-switch clarifications is currently
@@ -41,13 +95,44 @@ STALE_THRESHOLD_SECONDS = 3600 # 1 hour
 
 # Helper function to estimate tokens (rough approximation)
 def estimate_tokens(text: str) -> int:
-    """Rough estimate of tokens based on characters and words."""
+    """Rough estimate of tokens based on characters and words.
+
+    Provides a basic heuristic to approximate the number of tokens in a given text.
+    This is a simplified estimation and may not accurately reflect the token count
+    of specific LLM tokenizers.
+
+    Args:
+        text (str): The input string.
+
+    Returns:
+        int: An estimated token count.
+    """
     # Average of 4 chars per token and 1.3 tokens per word
     char_estimate = len(text) / 4
     word_estimate = len(text.split()) * 1.3
     return int((char_estimate + word_estimate) / 2)
 
 class OrchestratorAgent(autogen.AssistantAgent):
+    """
+    The OrchestratorAgent acts as the central coordinator in the multi-agent tutoring system.
+
+    It receives user queries, determines their context and intent, aligns them with the
+    curriculum by consulting the `CurriculumAlignmentAgent`, and then routes them to
+    the most appropriate specialist agent for handling. It manages the overall flow
+    of conversation and ensures that responses are relevant and syllabus-aligned.
+
+    Attributes:
+        curriculum_alignment_agent (CurriculumAlignmentAgent): Agent for syllabus alignment.
+        concept_tutor_agent (ConceptTutorAgent): Agent for conceptual explanations.
+        diagnostic_agent (DiagnosticRemediationAgent): Agent for diagnosing issues.
+        assessment_agent (AssessmentRevisionAgent): Agent for assessments.
+        projects_mentor_agent (ProjectsMentorAgent): Agent for project mentorship.
+        content_generation_agent (ContentGenerationAgent): Agent for content creation.
+        analytics_progress_agent (AnalyticsProgressAgent): Agent for tracking progress.
+        current_session_alignment (Optional[Dict]): Stores the latest syllabus alignment data for the session.
+        _active_sub_chat_partner_name (Optional[str]): Name of the agent currently in a sub-chat with the orchestrator.
+        stale_threshold_seconds (int): Time in seconds after which conversation context is considered stale.
+    """
     def __init__(self, name, llm_config, curriculum_alignment_agent, concept_tutor_agent, diagnostic_agent, assessment_agent, projects_mentor_agent, content_generation_agent, analytics_progress_agent, **kwargs):
         system_message = (
     "You are the Orchestrator Agent in a multi-agent AI tutoring system for ZIMSEC O-Level students.\n"
@@ -112,16 +197,26 @@ class OrchestratorAgent(autogen.AssistantAgent):
     async def _classify_intent_with_llm(self, current_query: str, last_system_response: Optional[str], last_user_query: Optional[str], full_history: Optional[List[Dict[str, str]]], alignment_data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
         Uses the agent's configured LLM client to classify the intent of the current user query.
-        Returns a dictionary like: {'intent': 'AFFIRMATIVE_FOLLOW_UP|CLARIFICATION|NEW_TOPIC|UNKNOWN', 'confidence': float, 'raw_response': str}
+
+        This method constructs a detailed prompt for the LLM, including chat history
+        and current syllabus context (if available from alignment_data), to determine
+        if the user's latest query is an affirmative/negative follow-up, a request for
+        clarification on the current topic, a new unrelated topic, or ambiguous but contextual.
+
+        Args:
+            current_query (str): The user's most recent query.
+            last_system_response (Optional[str]): The last response sent by the system.
+            last_user_query (Optional[str]): The user's query preceding the current one.
+            full_history (Optional[List[Dict[str, str]]]): The entire conversation history.
+            alignment_data (Optional[Dict[str, Any]]): Current syllabus alignment data, which may
+                                                      contain `raw_metadata_preview` with `page_content`
+                                                      for syllabus context.
+
+        Returns:
+            Dict[str, Any]: A dictionary containing the classified intent, a confidence score,
+                            and the raw response from the LLM. Example:
+                            {'intent': 'AFFIRMATIVE_FOLLOW_UP', 'confidence': 0.8, 'raw_response': 'AFFIRMATIVE_FOLLOW_UP'}
         """
-        print(
-            f"\n*******************\n_classify_intent_with_llm called with: \n*******************\n"
-            f"  current_query: {current_query!r}\n"
-            f"  last_system_response: {last_system_response!r}\n"
-            f"  last_user_query: {last_user_query!r}\n"
-            f"  full_history: {full_history!r}\n"
-            f"  alignment_data: {alignment_data!r}"
-        )
         # Check if the agent's client is available. 
         # self.client is initialized by ConversableAgent based on llm_config.
         if not hasattr(self, 'client') or self.client is None:
@@ -159,26 +254,26 @@ class OrchestratorAgent(autogen.AssistantAgent):
             "message": current_query
         })
 
-        # Get page content from alignment data if available
-        page_content = ""
+        # Get syllabus_conetxt from alignment data if available
+        syllabus_context = ""
         if alignment_data: # Check if alignment_data (the direct data dictionary) is available
             # Directly access raw_metadata_preview from the alignment_data argument
             raw_metadata = alignment_data.get("raw_metadata_preview", {})
-            page_content = raw_metadata.get("page_content", "")
+            syllabus_context = raw_metadata.get("page_content", "")
 
         conversation_context = {
             "chat_log": chat_log,
-            "page_content": page_content
+            "syllabus_context": syllabus_context
         }
 
         system_prompt_content = (
             "You are an expert in classifying user intent in a tutoring conversation. "
-            "Based on the provided chat log and page content, "
+            "Based on the provided chat log and syllabus_context, "
             "classify the most recent user message into one of these categories: "
             "1. AFFIRMATIVE_FOLLOW_UP: User is saying yes, okay, sure, etc., directly to a question or suggestion from the system. "
             "2. NEGATIVE_FOLLOW_UP: User is saying no, nope, etc., directly to a question or suggestion from the system. "
-            "3. CLARIFICATION_ON_TOPIC: User is asking for more details, examples, or explanation about the *immediately preceding* topic. "
-            "4. NEW_TOPIC_UNRELATED: User is asking a question that seems unrelated to the immediate prior discussion. "
+            "3. CLARIFICATION_ON_TOPIC: User is asking for more details, examples, or explanation about the *immediately preceding* topic, which might be informed by the provided chat_log or syllabus_context. "
+            "4. NEW_TOPIC_UNRELATED: User is asking a question that seems unrelated to the immediate prior discussion AND is not covered by the provided syllabus_context. This indicates a potential need to fetch new information. "
             "5. AMBIGUOUS_CONTEXTUAL: User query is short (e.g. 'why', 'how') and context is needed to understand if it relates to prior topic or is new. Assume CLARIFICATION if contextually relevant. "
             "Respond with ONLY the classification label and nothing else. If unsure, use UNKNOWN."
         )
@@ -238,8 +333,71 @@ class OrchestratorAgent(autogen.AssistantAgent):
 
     async def _generate_orchestrator_reply(self, messages, sender, config):
         """
-        This function is called when the OrchestratorAgent receives a message.
-        It processes the user query, consults curriculum alignment, and decides next steps.
+        Core reply generation logic for the OrchestratorAgent.
+
+        This asynchronous method is triggered when the OrchestratorAgent receives a message.
+        It orchestrates the entire response generation process:
+
+        1.  **Initial Checks & Context Management**:
+            - Ignores messages from active sub-chat partners to allow sub-chats to complete.
+            - Prevents self-reply loops.
+            - Parses the incoming message (expected JSON from `StudentInterfaceAgent`)
+              to extract `original_user_query`, `form_level`, `context_was_reset`,
+              and `previous_alignment_details`.
+            - If `context_was_reset` is true or no `previous_alignment_details` are provided,
+              clears `self.current_session_alignment`.
+
+        2.  **Intent Classification & Context Reuse Decision**:
+            - Retrieves `last_system_response` and `last_user_query` from `self.current_session_alignment`.
+            - Calls `_classify_intent_with_llm` to determine the user's intent based on the
+              current query, recent interactions, and full chat history.
+            - Checks for simple conversational follow-ups (e.g., "yes", "thanks") using `is_short_conversational_follow_up`.
+            - Checks if the system explicitly invited a follow-up using `did_system_invite_follow_up`.
+            - Checks if the current session alignment is stale using `is_conversation_stale`.
+            - Decides whether to reuse `self.current_session_alignment` based on intent, staleness,
+              and whether the system invited a follow-up. Non-clarification intents or stale context
+              typically lead to not reusing alignment.
+
+        3.  **Syllabus Alignment (if needed)**:
+            - If alignment is not being reused, initiates a chat with `CurriculumAlignmentAgent`,
+              sending a JSON payload with `user_query` and `learner_context` (including `form_level`).
+            - Parses the JSON response from `CurriculumAlignmentAgent`.
+            - Updates `self.current_session_alignment` with the new alignment data, timestamp,
+              current user query, and a placeholder for the system response.
+            - Handles errors from the alignment agent (e.g., out of scope, JSON errors).
+
+        4.  **Routing to Specialist Agent or Direct Reply**:
+            - If the alignment indicates the query is out of scope, prepares a polite message for the user.
+            - If the alignment suggests a different subject than the current context, it prepares
+              a clarification question for the user (simulating the user's reply for now).
+            - If the query is aligned and within scope:
+                - Determines the most appropriate specialist agent based on keywords in the
+                  user query (e.g., "explain" -> ConceptTutor, "practice" -> AssessmentRevision,
+                  "project" -> ProjectsMentor, "diagram" -> ContentGeneration, etc.).
+                - If no specific intent is matched, defaults to `ConceptTutorAgent`.
+                - Initiates a chat with the chosen specialist agent, sending a payload containing
+                  `original_user_query` and the `alignment_data`.
+                - Parses the JSON response from the specialist agent, extracting the `answer`,
+                  `retrieved_rag_context`, and `suggested_image_path`.
+
+        5.  **Response Finalization & Payload Construction**:
+            - Constructs the `final_orchestrator_output_payload` containing:
+                - `answer`: The textual response for the user.
+                - `retrieved_rag_context_for_answer`: RAG context used by the specialist.
+                - `suggested_image_path`: Path to a suggested image, if any.
+                - `alignment_data_used_for_routing`: The alignment data that informed the routing.
+                - `orchestrator_dialogue_acts`: A log of decisions made by the orchestrator.
+            - Updates `self.current_session_alignment['last_system_response']` with the final answer.
+            - Logs timing and token count information.
+            - Returns the JSON string of `final_orchestrator_output_payload`.
+
+        Args:
+            messages (List[Dict]): The list of messages. The last message is from `StudentInterfaceAgent`.
+            sender (autogen.Agent): The agent that sent the message.
+            config (Any): Optional configuration data.
+
+        Returns:
+            Tuple[bool, Union[str, None]]: (True, JSON string of the final payload) or (True, None) if no reply.
         """
         start_time = time.time()
         self.stage_timings = {}
@@ -654,6 +812,9 @@ class OrchestratorAgent(autogen.AssistantAgent):
                 })
                 logger.debug(f"Defaulting to ConceptTutorAgent. Routing to {next_agent.name}.")
             
+            # Initialize variable to hold potential image path from specialist
+            suggested_image_path_from_specialist = None
+
             if next_agent:
                 logger.debug(f"Orchestrator: Initiating chat with {next_agent.name} with message: {message_for_next_agent[:200]}...")
                 self._active_sub_chat_partner_name = next_agent.name # Set active partner
@@ -686,6 +847,7 @@ class OrchestratorAgent(autogen.AssistantAgent):
                         if isinstance(parsed_specialist_response, dict):
                             reply_to_user = parsed_specialist_response.get("answer", specialist_response_summary)
                             retrieved_rag_context_for_final_reply = parsed_specialist_response.get("retrieved_rag_context")
+                            suggested_image_path_from_specialist = parsed_specialist_response.get("suggested_image_path") # Extract image path
                             final_system_response_for_session_log = reply_to_user # Store for next turn's context
                             logger.debug("Successfully parsed structured response from specialist.")
                         else:
@@ -740,6 +902,7 @@ class OrchestratorAgent(autogen.AssistantAgent):
         final_orchestrator_output_payload = {
             "answer": reply_to_user, # This is the specialist's answer, or Orchestrator's direct reply
             "retrieved_rag_context_for_answer": retrieved_rag_context_for_final_reply, # RAG context associated with 'answer'
+            "suggested_image_path": suggested_image_path_from_specialist, # Add the image path here
             "alignment_data_used_for_routing": alignment_data, # The 'data' part of the alignment used for routing THIS turn
             "updated_orchestrator_session_alignment_for_next_turn": self.current_session_alignment # Full context for NEXT turn
         }

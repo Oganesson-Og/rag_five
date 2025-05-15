@@ -1,3 +1,40 @@
+"""
+ZIMSEC Tutoring System - Diagnostic and Remediation Agent
+---------------------------------------------------------
+
+This module defines the `DiagnosticRemediationAgent`, an AI agent designed to
+evaluate learner answers, pinpoint misconceptions, and recommend targeted
+remediation steps or review of prerequisite topics within the ZIMSEC Tutoring System.
+
+Key Features:
+- Analyzes learner responses against marking rubrics (simulated).
+- Identifies potential misconceptions (conceptual, procedural, careless).
+- Suggests remediation actions based on the type of misconception.
+- Can check for prerequisite mastery and suggest remediation if needed.
+- Retrieves remediation content from syllabus data for previous form levels.
+- Outputs diagnostic results and remediation suggestions in a structured JSON format.
+
+Technical Details:
+- Inherits from `autogen.AssistantAgent`.
+- Defines a system message outlining its mission, workflow, constraints, and tool usage.
+- Registers a custom reply function (`_generate_diagnostic_reply`) to handle diagnostic tasks.
+- Includes mock implementations for core tools (`analyse_response`, `suggest_remediation`).
+- Loads syllabus data (`mathematics_syllabus_chunked.json`) to find prerequisite content.
+
+Dependencies:
+- autogen
+- json
+- random
+- os
+- typing
+- logging
+- ../../mathematics_syllabus_chunked.json (Syllabus Data)
+
+Author: Keith Satuku
+Version: 1.0.0
+Created: 2024
+License: MIT
+"""
 import autogen
 import json
 import random
@@ -22,6 +59,23 @@ except json.JSONDecodeError:
     SYLLABUS_DATA = [] # Default to empty list if JSON is malformed
 
 def get_remediation_path_from_alignment(syllabus_json, topic, subtopic, current_form):
+    """
+    Filters syllabus data to find entries for a given topic and subtopic
+    from form levels lower than the student's current form.
+
+    This helps identify prerequisite content that a student might need to review
+    if they are struggling with a concept in their current form level.
+
+    Args:
+        syllabus_json (List[Dict]): The loaded syllabus data (list of entries).
+        topic (str): The topic to search for.
+        subtopic (str): The subtopic to search for.
+        current_form (str): The student's current form level (e.g., "Form 4").
+
+    Returns:
+        List[Dict]: A list of matching syllabus entries from earlier forms,
+                    sorted by form level.
+    """
     form_order = {f"Form {i}": i for i in range(1, 5)}
     current_form_num = form_order.get(current_form, 0)
     matches = [
@@ -35,7 +89,23 @@ def get_remediation_path_from_alignment(syllabus_json, topic, subtopic, current_
 
 # Mock tool implementations (replace with actual logic later)
 def analyse_response(question: str, learner_answer: str, marking_rubric: Dict) -> Dict:
-    """Mock: Analyzes learner answer against a rubric."""
+    """Mock: Analyzes learner answer against a rubric.
+
+    Simulates the process of scoring a learner's answer and identifying
+    potential misconceptions based on a provided marking rubric.
+    In a real system, this would involve more complex NLP and rule-based logic.
+
+    Args:
+        question (str): The question asked to the learner.
+        learner_answer (str): The learner's submitted answer.
+        marking_rubric (Dict): The rubric against which to grade the answer.
+                               (Currently not used in mock logic, but present for API).
+
+    Returns:
+        Dict[str, Any]: A dictionary containing the simulated score (float)
+                        and misconception_type (str: "conceptual", "procedural",
+                        "careless", or "none").
+    """
     logger.debug(f"[Tool Mock - analyse_response] Analyzing: Q='{question}', A='{learner_answer}', Rubric={marking_rubric}")
     # Simulate scoring and misconception analysis
     score = random.uniform(0.5, 1.0) # Random score for now
@@ -47,7 +117,21 @@ def analyse_response(question: str, learner_answer: str, marking_rubric: Dict) -
     return {"score": score, "misconception_type": misconception_type}
 
 def suggest_remediation(misconception_type: str) -> List[Dict[str, str]]:
-    """Mock: Suggests remediation steps based on misconception type."""
+    """Mock: Suggests remediation steps based on misconception type.
+
+    Provides a predefined set of remediation suggestions tailored to different
+    types of misconceptions (conceptual, procedural, careless).
+    Each suggestion includes a Bloom's Taxonomy level and an action description.
+
+    Args:
+        misconception_type (str): The type of misconception identified (e.g.,
+                                  "conceptual", "procedural", "careless").
+
+    Returns:
+        List[Dict[str, str]]: A list of dictionaries, where each dictionary
+                              represents a remediation step with "level" and "action" keys.
+                              Returns an empty list if misconception_type is "none" or unknown.
+    """
     logger.debug(f"[Tool Mock - suggest_remediation] For misconception: {misconception_type}")
     remediations = {
         "conceptual": [
@@ -69,6 +153,27 @@ def suggest_remediation(misconception_type: str) -> List[Dict[str, str]]:
     return result
 
 class DiagnosticRemediationAgent(autogen.AssistantAgent):
+    """
+    An AI agent that diagnoses learner misconceptions and suggests remediation.
+
+    This agent is designed to evaluate a learner's answer to a question,
+    identify potential areas of misunderstanding (misconceptions), and then
+    recommend targeted actions or content for the learner to review. It can also
+    check for mastery of prerequisite topics before tackling more advanced concepts.
+
+    The agent expects input in a JSON format specifying the question, the learner's
+    answer, and a marking rubric. It uses (mocked) tools to analyze the response
+    and suggest remediation steps. The output is also a JSON object containing the
+    score, type of misconception, and a list of recommended remediation actions,
+    or prerequisite remediation if applicable.
+
+    Key System Message Mandates:
+    - Evaluate answers, pinpoint misconceptions, recommend remediation.
+    - Use `analyse_response()` and `suggest_remediation()` tools.
+    - Output JSON with score, misconception type, and remediation steps.
+    - Tag remediation items with Bloom's Taxonomy levels.
+    - Avoid leaking rubric details and maintain data integrity.
+    """
     def __init__(self, name: str, llm_config: Dict, **kwargs):
         system_message = (
             "Mission\n"
@@ -98,7 +203,47 @@ class DiagnosticRemediationAgent(autogen.AssistantAgent):
         )
 
     async def _generate_diagnostic_reply(self, messages: Optional[List[Dict]] = None, sender: Optional[autogen.Agent] = None, config: Optional[Any] = None) -> Tuple[bool, Union[str, Dict, None]]:
-        """Generates a diagnostic reply based on learner's answer."""
+        """
+        Generates a diagnostic report and remediation suggestions based on a learner's answer.
+
+        This asynchronous method is the core logic handler for the `DiagnosticRemediationAgent`.
+        It processes an incoming message, which is expected to be a JSON string containing
+        details about the learner's attempt at a question.
+
+        Workflow:
+        1.  Parses the input JSON to extract: `question`, `learner_answer`, `marking_rubric`,
+            optional `diagnostic_check` (for prerequisites), and `alignment_data` (for context).
+        2.  If a `diagnostic_check` for a prerequisite topic is present:
+            a.  Analyzes the learner's answer to the prerequisite question using `analyse_response`.
+            b.  If the prerequisite score is below a threshold (e.g., 0.7), it suggests
+                remediation for the prerequisite topic using `suggest_remediation` and returns
+                a JSON response indicating that prerequisite remediation is needed.
+            c.  If prerequisite mastery is sufficient, it proceeds to the main question.
+        3.  If the main question context (topic, subtopic, form) is available from `alignment_data`,
+            it attempts to find relevant remediation content from previous form levels in the
+            `SYLLABUS_DATA` using `get_remediation_path_from_alignment`. If found, it returns
+            this syllabus content as a remediation suggestion.
+        4.  If no prerequisite issue or direct syllabus remediation is triggered, it analyzes the
+            learner's answer to the main `question` using `analyse_response`.
+        5.  Based on the analysis score:
+            a.  If the score is high (e.g., >= 0.7), it returns a JSON indicating "mastered".
+            b.  If the score is low, it identifies the `misconception_type` and uses
+                `suggest_remediation` to get tailored remediation steps. These are packaged
+                into the JSON response.
+        6.  The final JSON response (diagnostic report or error message) is returned.
+
+        Args:
+            messages (Optional[List[Dict]]): A list of messages. The last message contains
+                                            the JSON payload with the diagnostic request.
+            sender (Optional[autogen.Agent]): The agent that sent the message.
+            config (Optional[Any]): Optional configuration data (not actively used).
+
+        Returns:
+            Tuple[bool, Union[str, Dict, None]]: A tuple where the first element is True (indicating
+                                                 success in this mock setup), and the second is
+                                                 either a JSON string with the diagnostic output
+                                                 or an error message if input parsing failed.
+        """
         last_message = messages[-1]
         content = last_message.get("content", "{}")
         

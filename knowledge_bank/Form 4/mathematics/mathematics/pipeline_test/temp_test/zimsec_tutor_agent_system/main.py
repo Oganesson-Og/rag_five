@@ -1,3 +1,45 @@
+"""
+ZIMSEC Tutoring System - Main Interaction CLI
+---------------------------------------------
+
+This module serves as the main entry point for the ZIMSEC Tutoring System,
+providing an interactive command-line interface (CLI) for students to
+interact with the various AI agents. It handles agent initialization,
+user input, session management, and orchestrates the overall conversation flow.
+
+Key Features:
+- Interactive CLI for student queries.
+- Initialization and management of all AI agents.
+- Conversation history and context management using `ConversationMemory`.
+- RAG context retrieval and augmentation for agent prompts.
+- Form level selection for tailored content.
+- Debug mode for detailed operational insights.
+- Rich console output for an enhanced user experience.
+
+Technical Details:
+- Uses Typer for CLI argument parsing and command definition.
+- Uses Rich for enhanced console output (panels, markdown).
+- Integrates with Autogen for multi-agent conversations.
+- Asynchronous operations for non-blocking interactions.
+- Logging to a session file (`session.log`).
+
+Dependencies:
+- asyncio
+- autogen
+- json
+- sys
+- os
+- typer
+- rich
+- logging
+- ../memory_manager.py (ConversationMemory)
+- ./agents/* (Various agent classes)
+
+Author: Keith Satuku
+Version: 1.0.0
+Created: 2024
+License: MIT
+"""
 import asyncio
 import autogen
 import json
@@ -35,7 +77,20 @@ FORM_LEVELS = ["Form 1", "Form 2", "Form 3", "Form 4"]
 
 # Helper function to log to file and print to Rich console
 def log_and_print(content, level=logging.DEBUG, log_prefix=""):
-    """Logs the content to the configured logger and prints to Rich console."""
+    """
+    Logs the content to the configured logger and prints to Rich console.
+
+    This function handles various types of content (strings, Rich Panels, Markdown)
+    and ensures they are logged appropriately as strings and printed to the
+    Rich console for a better user experience. It also strips ANSI escape codes
+    from log messages for cleaner log files.
+
+    Args:
+        content: The content to log and print. Can be a string, Rich Panel,
+                 Markdown, or other Rich renderable.
+        level: The logging level (e.g., logging.INFO, logging.DEBUG).
+        log_prefix: A string prefix to add to the log message.
+    """
     global console
     
     log_message = ""
@@ -109,7 +164,18 @@ PROJECT_CHECKLIST_TOOL_SCHEMA = {
 }
 
 def initialize_agents():
-    """Initialize all agents with their configurations"""
+    """
+    Initializes all the AI agents required for the tutoring system.
+
+    This function sets up each agent with its name, LLM configuration (including
+    API keys and model details), and any specific tools or configurations
+    it requires (e.g., code execution, specialized tools for ProjectsMentorAgent).
+    It then wires them together, particularly by providing specialist agents
+    to the OrchestratorAgent.
+
+    Returns:
+        StudentInterfaceAgent: The primary agent the user proxy will interact with.
+    """
     # 1. Initialize CurriculumAlignmentAgent
     curriculum_agent = CurriculumAlignmentAgent(
         name="CurriculumAlignmentAgent",
@@ -175,7 +241,28 @@ def initialize_agents():
     return student_interface_agent
 
 async def interactive_session(debug: bool = False):
-    """Run an interactive session with the tutoring system"""
+    """
+    Runs the main interactive command-line session for the ZIMSEC Tutoring System.
+
+    This asynchronous function manages the entire student interaction lifecycle:
+    1. Initializes agents and the UserProxyAgent.
+    2. Initializes `ConversationMemory` for session history.
+    3. Welcomes the student and prompts for their form level.
+    4. Enters a loop to continuously:
+        a. Get the student's question.
+        b. Handle session termination commands ("exit", "quit").
+        c. Determine if conversation context should be reset or continued.
+        d. Augment the current question with relevant conversation history if continuing.
+        e. Prepare a payload for the `StudentInterfaceAgent`.
+        f. Initiate a chat turn with the `StudentInterfaceAgent` via the `UserProxy`.
+        g. Parse the structured JSON response from the agent system.
+        h. Display the textual answer and any suggested image paths to the student.
+        i. Store the interaction (question, RAG context, answer) in `ConversationMemory`.
+
+    Args:
+        debug (bool): If True, enables detailed debug logging and output,
+                      including raw agent responses.
+    """
     # Initialize agents
     student_interface_agent = initialize_agents()
     
@@ -335,58 +422,86 @@ async def interactive_session(debug: bool = False):
                     parsed_content = json.loads(last_message_content)
                     if isinstance(parsed_content, dict):
                         final_agent_response_text = parsed_content.get("answer", str(parsed_content))
-                        actual_rag_context_used_this_turn = parsed_content.get("retrieved_rag_context")
-                        last_orchestrator_response_payload = parsed_content # Update for NEXT turn
-                    else:
+                        actual_rag_context_used_this_turn = parsed_content.get("retrieved_rag_context_for_answer") # Key from Orchestrator
+                        last_orchestrator_response_payload = parsed_content # Store the full payload for next turn's context
+                        
+                        # Display the main textual answer first
+                        log_and_print("[bold cyan]Tutor is typing...[/bold cyan]", level=logging.DEBUG)
+                        time.sleep(0.7)
+                        log_and_print(Markdown(final_agent_response_text))
+
+                        # Then, check for and display image path if available
+                        suggested_image_path = parsed_content.get("suggested_image_path")
+                        if suggested_image_path and isinstance(suggested_image_path, str) and suggested_image_path.strip():
+                            # Path from knowledge bank is like "math_diagrams/image.png"
+                            # main.py is in "zimsec_tutor_agent_system/"
+                            # Diagrams are in "../math_diagrams/"
+                            # So, prepend "../" to the suggested_image_path
+                            display_image_path = os.path.join("..", suggested_image_path.strip())
+                            # Make sure path uses OS-specific separators
+                            display_image_path = os.path.normpath(display_image_path)
+                            image_message = f"\n---\n**Diagram:** A helpful diagram is available for this topic. You can view it at: `{display_image_path}`\n---"
+                            log_and_print(Markdown(image_message))
+                        
+                        # Set to None if we already printed, to avoid double printing later
+                        # final_agent_response_text_for_general_display = None 
+
+                    else: # parsed_content is not a dict (e.g. simple string JSON)
                         final_agent_response_text = last_message_content
-                        last_orchestrator_response_payload = None # Reset if not a dict
-                except json.JSONDecodeError:
+                        last_orchestrator_response_payload = None 
+                        log_and_print("[bold cyan]Tutor is typing...[/bold cyan]", level=logging.DEBUG)
+                        time.sleep(0.7)
+                        log_and_print(Markdown(final_agent_response_text))
+
+                except json.JSONDecodeError: # last_message_content was not JSON
                     final_agent_response_text = last_message_content
-                    last_orchestrator_response_payload = None # Reset if not JSON
+                    last_orchestrator_response_payload = None 
+                    log_and_print("[bold cyan]Tutor is typing...[/bold cyan]", level=logging.DEBUG)
+                    time.sleep(0.7)
+                    log_and_print(Markdown(final_agent_response_text))
+
             elif isinstance(last_message_content, dict): # e.g. tool_calls, not our structured response
-                final_agent_response_text = json.dumps(last_message_content) # Or handle more gracefully
-                last_orchestrator_response_payload = None # Reset as it's not the expected payload
+                final_agent_response_text = json.dumps(last_message_content) 
+                last_orchestrator_response_payload = None 
+                log_and_print("[bold cyan]Tutor is typing...[/bold cyan]", level=logging.DEBUG)
+                time.sleep(0.7)
+                log_and_print(Markdown(final_agent_response_text))
+
             elif result and result.summary: # Fallback to summary if no suitable chat history message
                  final_agent_response_text = result.summary
-                 last_orchestrator_response_payload = None # Reset
+                 last_orchestrator_response_payload = None 
+                 log_and_print("[bold cyan]Tutor is typing...[/bold cyan]", level=logging.DEBUG)
+                 time.sleep(0.7)
+                 log_and_print(Markdown(final_agent_response_text))
+
             elif not last_message_content: # If no suitable message found in history
                 final_agent_response_text = "No specific response content found in chat history."
-                last_orchestrator_response_payload = None # Reset
+                last_orchestrator_response_payload = None 
+                # No separate print here, will be caught by the general print/error handling below
 
-            if not final_agent_response_text and result: # Broader fallback
-                 final_agent_response_text = str(result) if result else "I didn't receive a response. Please try again."
-                 last_orchestrator_response_payload = None # Reset
+            # This block for general printing is now mostly handled above within the if/try blocks
+            # but can serve as a final fallback if final_agent_response_text was set by an edge case
+            # and not yet printed.
+            if final_agent_response_text == "Default response": # if it was never updated from default
+                if not last_message_content and not (result and result.summary): # and not printed by above blocks
+                    log_and_print("[bold cyan]Tutor is typing...[/bold cyan]", level=logging.DEBUG)
+                    time.sleep(0.7)
+                    log_and_print(Markdown("I didn't receive a clear response. Please try again."))
+                # else it was already printed or handled by the 'No specific response' case
+            
+            # The actual display of final_agent_response_text is now handled within the try-except block
+            # that parses parsed_content. We only need to ensure it *always* prints something
+            # if not handled by the JSON parsing path.
 
-            # Clean up the response
-            if isinstance(final_agent_response_text, str):
-                for term in ["exit", "quit", "TERMINATE"]:
-                    final_agent_response_text = final_agent_response_text.replace(term, "").strip()
-            else: # if it's not a string (e.g. dict from tool call that wasn't parsed into answer/context)
-                final_agent_response_text = str(final_agent_response_text)
-
-            # Typing indicator for realism
-            log_and_print("[bold cyan]Tutor is typing...[/bold cyan]", level=logging.DEBUG)
-            time.sleep(0.7)
-
-            # Try to parse as JSON for structured responses
-            try:
-                parsed = json.loads(final_agent_response_text)
-                if isinstance(parsed, dict):
-                    # If it's a remediation response, format it nicely
-                    if parsed.get("status") == "remediation_syllabus_content":
-                        log_and_print(Markdown(parsed.get("message", "No remediation content available")))
-                    else:
-                        # For other structured responses, show the message
-                        log_and_print(Markdown(parsed.get("message", str(parsed))))
-                else:
-                    log_and_print(Markdown(final_agent_response_text))
-            except json.JSONDecodeError:
-                # If not JSON, display as markdown
-                log_and_print(Markdown(final_agent_response_text))
         except Exception as e:
-            final_agent_response_text = f"Error processing agent response: {e}"
+            # final_agent_response_text = f"Error processing agent response: {e}" # This was already set
             if debug:
                 log_and_print(f"[bold red]Error in response extraction: {e}[/bold red]", level=logging.ERROR)
+            # Ensure some user-facing message if not already printed by try-block for successful parsing
+            if 'final_agent_response_text' not in locals() or final_agent_response_text == "Default response":
+                 log_and_print(Markdown("Sorry, an error occurred while processing the response."))
+            elif not last_orchestrator_response_payload: # If parsing failed, print the raw text
+                 log_and_print(Markdown(str(final_agent_response_text)))
 
         # Store Interaction
         conversation_memory.add_interaction(
@@ -399,9 +514,20 @@ async def interactive_session(debug: bool = False):
 
 @app.command()
 def start(
-    debug: bool = typer.Option(False, "--debug", "-d", help="Enable debug mode to see detailed information about the system\'s operation")
+    debug: bool = typer.Option(False, "--debug", "-d", help="Enable debug mode to see detailed information about the system's operation")
 ):
-    """Start an interactive session with the ZIMSEC Tutoring System"""
+    """
+    Start an interactive session with the ZIMSEC Tutoring System.
+
+    This is the main command registered with Typer. It performs initial setup:
+    1. Configures logging (file and console handlers, log levels).
+    2. Checks for the presence of the OPENAI_API_KEY environment variable.
+    3. Calls the `interactive_session` coroutine to begin the chat.
+
+    Args:
+        debug (bool): Flag to enable debug mode. Passed to `interactive_session`.
+                      Controlled via CLI option `--debug` or `-d`.
+    """
     log_file_path = "session.log"
     log_level = logging.DEBUG if debug else logging.INFO
 

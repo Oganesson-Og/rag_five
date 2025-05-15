@@ -1,3 +1,47 @@
+"""
+ZIMSEC Tutoring System - Curriculum Alignment Agent
+---------------------------------------------------
+
+This module defines the `CurriculumAlignmentAgent`, an AI agent responsible for
+ensuring that all interactions and content within the ZIMSEC Tutoring System
+are strictly aligned with the official ZIMSEC syllabus for O-Level Mathematics
+and Combined Science.
+
+Key Features:
+- Receives user queries and context (subject, form level) from the Orchestrator.
+- Utilizes the RAG (Retrieval Augmented Generation) pipeline to check the query
+  against the syllabus data stored in a vector database.
+- Returns a structured JSON response to the Orchestrator, detailing:
+    - Whether the query is in the syllabus.
+    - Alignment score.
+    - Matched learning outcomes.
+    - Mandatory terminology.
+    - Identified subject, topic, subtopic, and form.
+    - Any identified gaps or notes for the Orchestrator.
+
+Technical Details:
+- Inherits from `autogen.ConversableAgent`.
+- Defines a system message that outlines its responsibilities, communication
+  guidelines, tool usage (RAG via `get_syllabus_alignment_from_rag`), and integrity rules.
+- Registers a custom reply function (`_generate_alignment_reply`) to handle incoming
+  requests and interact with the RAG system.
+- Loads syllabus data (for reference or fallback, though primary alignment is via RAG).
+
+Dependencies:
+- autogen
+- json
+- asyncio
+- os
+- typing
+- logging
+- ../rag_integration.py (get_syllabus_alignment_from_rag)
+- ../../mathematics_syllabus_chunked.json (for reference/fallback)
+
+Author: Keith Satuku
+Version: 1.0.0
+Created: 2024
+License: MIT
+"""
 import autogen
 import json
 import asyncio
@@ -18,6 +62,27 @@ with open(SYLLABUS_PATH, 'r') as f:
     SYLLABUS_DATA = json.load(f)
 
 class CurriculumAlignmentAgent(autogen.ConversableAgent):
+    """
+    The CurriculumAlignmentAgent is responsible for aligning student queries
+    with the official ZIMSEC syllabus using a RAG-based approach.
+
+    It receives a student's query along with context (like subject and form level hints)
+    from the OrchestratorAgent. Its primary task is to determine how this query maps
+    to the syllabus. This involves:
+    1.  Passing the query and context to the `get_syllabus_alignment_from_rag` function
+        from the `rag_integration` module. This function interacts with a RAG pipeline
+        (which typically includes a vector store of syllabus documents and an embedding model)
+        to find the most relevant syllabus entries.
+    2.  Receiving a structured dictionary from the RAG function containing detailed
+        alignment information (e.g., matched outcomes, topic, subtopic, score).
+    3.  Formatting this dictionary into a JSON string.
+    4.  Returning this JSON string as its reply to the OrchestratorAgent.
+
+    The agent's system prompt guides its behavior, emphasizing strict adherence to
+    syllabus outcomes, proper JSON output format, and read-only access to the RAG tools.
+    It is designed to be a specialized component focused solely on curriculum alignment,
+    providing crucial data for downstream agents to tailor their responses accurately.
+    """
     def __init__(self, name, llm_config, **kwargs):
         # System prompt for the Curriculum Alignment Agent
         system_message = (
@@ -49,6 +114,42 @@ class CurriculumAlignmentAgent(autogen.ConversableAgent):
         )
 
     async def _generate_alignment_reply(self, *args, **kwargs):
+        """
+        Processes an incoming query from the Orchestrator to perform syllabus alignment.
+
+        This asynchronous method is triggered when the agent receives a message.
+        It expects the message content to be a JSON string containing:
+        -   `user_query`: The student's question.
+        -   `learner_context`: A dictionary that can include:
+            -   `current_subject_hint`: The subject the query is likely related to (e.g., "Mathematics").
+            -   `current_form_level_hint`: The student's current form level (e.g., "Form 4").
+
+        The method performs the following steps:
+        1.  Parses the incoming JSON to extract `user_query`, `subject_hint`, and `form_level_hint`.
+        2.  Calls the `get_syllabus_alignment_from_rag` function, passing these extracted values.
+            This function interacts with the RAG pipeline to get syllabus alignment details.
+        3.  The result from `get_syllabus_alignment_from_rag` (a dictionary) is converted
+            into a JSON string.
+        4.  This JSON string is then returned as the content of the agent's reply.
+
+        Error handling is included for JSON decoding errors or other exceptions during processing,
+        returning an error JSON in such cases.
+
+        Args:
+            *args: Variable length argument list (potentially including the agent instance).
+            **kwargs: Arbitrary keyword arguments. Expected to contain:
+                - `messages` (List[Dict]): A list of messages. The last message's content
+                  is parsed for the query and context.
+                - `sender` (autogen.Agent, optional): The agent that sent the message.
+                - `config` (Any, optional): Configuration data (not actively used).
+
+        Returns:
+            Tuple[bool, Dict[str, str]]: A tuple where the first element is True (indicating
+                                       the agent can reply), and the second element is a
+                                       dictionary representing the assistant's message,
+                                       with the 'content' key holding the JSON string of
+                                       the alignment results or an error.
+        """
         # ARGS will contain the agent instance itself if Autogen passes it positionally.
         # KWARGS will contain messages, sender, config.
         messages = kwargs.get('messages')
