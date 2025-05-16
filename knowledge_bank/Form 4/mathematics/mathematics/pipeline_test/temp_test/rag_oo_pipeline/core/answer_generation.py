@@ -1,16 +1,36 @@
 """
-Handles the final step of generating a response using the LLM.
+RAG Pipeline - Answer Generation
+-----------------------------------
 
-This module defines the `AnswerGenerator` class. Its primary responsibility
-is to take the user's query, the retrieved syllabus and content documents
-(which might be from a direct JSON match or Qdrant search), and the request type
-(EXPLAIN, SOLVE, PRACTICE) to construct a context-aware prompt.
+This module defines the `AnswerGenerator` class, responsible for generating
+LLM-based responses using retrieved syllabus and content documents.
 
-It selects the appropriate prompt template based on the request type and the
-nature of the retrieved content (e.g., prioritizing structured notes/examples/questions
-from a direct JSON match). It then invokes the provided LLM instance with the
-final prompt to generate the textual answer for the user.
-Includes basic safeguards like prompt length truncation.
+Key Features:
+- Constructs context-aware prompts for the LLM based on user query, retrieved
+  documents (syllabus and content), and request type (EXPLAIN, SOLVE, PRACTICE).
+- Selects appropriate prompt templates based on request type and content source
+  (direct JSON match vs. Qdrant search results).
+- Prioritizes structured content from direct JSON matches if available.
+- Invokes an LLM instance to generate the final textual answer.
+- Includes basic prompt length truncation to prevent exceeding token limits.
+
+Technical Details:
+- Takes an initialized LLM instance (`OllamaLLM`) during construction.
+- The `generate_llm_answer` method orchestrates prompt construction and LLM invocation.
+- Different prompt templates are used for EXPLAIN, SOLVE, and PRACTICE scenarios.
+- Handles cases where content is from a direct JSON match or Qdrant search.
+
+Dependencies:
+- typing (List)
+- langchain.docstore.document (Document)
+- langchain_ollama (OllamaLLM)
+- rich.console (Console)
+- ..config (MAX_PROMPT_CHARS)
+
+Author: Keith Satuku
+Version: 1.0.0
+Created: 2025
+License: MIT
 """
 from typing import List
 from langchain.docstore.document import Document

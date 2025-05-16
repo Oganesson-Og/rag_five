@@ -1,14 +1,38 @@
 """
-Manages interactions with the Qdrant vector database.
+RAG Pipeline - Qdrant Vector Store Service
+---------------------------------------------
 
-This module defines the `QdrantService` class, which encapsulates all operations
-related to the Qdrant vector store. Responsibilities include:
-- Initializing the Qdrant client (connecting to the local database defined in `config.py`).
-- Providing a `search` method to query the vector store collections (syllabus, content)
-  using a text query and optional metadata filters (form, topic, subtopic).
-- Handling the embedding of the query text using the provided embedding model.
-- Processing search results and converting them into Langchain `Document` objects.
-It relies on an `EmbeddingModelFactory` instance to perform query embeddings.
+This module defines the `QdrantService` class, which manages interactions
+with the Qdrant vector database.
+
+Key Features:
+- Initializes and manages a singleton Qdrant client instance.
+- Provides a `search` method to query Qdrant collections (syllabus, content).
+- Handles query embedding using an `EmbeddingModelFactory` instance.
+- Supports metadata filtering (form, topic, subtopic) during search.
+- Converts Qdrant search results into Langchain `Document` objects.
+- Ensures Qdrant path and collections are correctly configured via `config.py`.
+
+Technical Details:
+- Uses `qdrant_client` for communication with the Qdrant database.
+- Implements a static `_get_qdrant_client` method for singleton client access.
+- The `search` method constructs Qdrant filters and performs similarity search.
+- Handles potential errors during Qdrant client initialization and search operations.
+
+Dependencies:
+- os
+- sys
+- typing (List, Optional)
+- langchain.docstore.document (Document)
+- qdrant_client (QdrantClient, Filter, FieldCondition, MatchValue)
+- rich.console (Console)
+- ..config (dynamic_rag_config)
+- .embeddings (EmbeddingModelFactory)
+
+Author: Keith Satuku
+Version: 1.0.0
+Created: 2025
+License: MIT
 """
 import os
 import sys

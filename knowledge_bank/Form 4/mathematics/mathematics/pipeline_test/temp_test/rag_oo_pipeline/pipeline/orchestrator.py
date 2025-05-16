@@ -1,20 +1,38 @@
 """
-Orchestrates the different components of the RAG pipeline for query processing.
+RAG Pipeline - Orchestrator
+------------------------------
 
-This module defines the `RAGOrchestrator` class, which acts as the central controller
-for handling user queries. It initializes and holds instances of various core services
-(like LLM service, Qdrant service, knowledge base retriever) and pipeline components
-(like syllabus processor, query analyzer, answer generator).
+This module defines the `RAGOrchestrator` class, which serves as the central
+controller for the RAG (Retrieval Augmented Generation) pipeline.
 
-The `process_query` method implements the main logic:
-1. Loads the LLM for the current query.
-2. Performs syllabus classification using `SyllabusProcessor`.
-3. Analyzes the query using `QueryAnalyzer` (LLM-based).
-4. Retrieves content, attempting a direct match using `KnowledgeBaseRetriever` first,
-   then falling back to `QdrantService` semantic search.
-5. Generates the final answer using `AnswerGenerator`.
-6. Manages the display of intermediate and final results using `display_utils`.
-7. Includes timing for each major phase to aid performance analysis.
+Key Features:
+- Initializes and manages instances of core services (LLM, Qdrant, KnowledgeBase).
+- Initializes and manages pipeline components (SyllabusProcessor, QueryAnalyzer, AnswerGenerator).
+- Orchestrates the query processing flow: syllabus classification, query analysis,
+  content retrieval (direct JSON match then Qdrant search), and answer generation.
+- Handles display of intermediate and final results using `display_utils`.
+- Logs timing for different phases of the pipeline for performance monitoring.
+
+Technical Details:
+- The `process_query` method is the main entry point for handling a user's question.
+- It dynamically loads the LLM for each query to manage resources (though this can be adapted).
+- Content retrieval prioritizes direct matches from the JSON knowledge base before
+  falling back to semantic search in the Qdrant vector store.
+- It integrates various components to form a cohesive RAG workflow.
+
+Dependencies:
+- time, typing
+- langchain.docstore.document
+- rich.console, rich.panel
+- ..config (FORM_LEVELS, DEFAULT_SYLLABUS_K, etc.)
+- ..core (EmbeddingModelFactory, LanguageModelService, QdrantService, etc.)
+- .syllabus_processor (SyllabusProcessor)
+- ..ui.display_utils
+
+Author: Keith Satuku
+Version: 1.0.0
+Created: 2025
+License: MIT
 """
 import time
 from typing import Optional, Tuple, List

@@ -1,12 +1,35 @@
 """
-Provides services related to the Language Model (LLM).
+RAG Pipeline - Language Model Services
+-----------------------------------------
 
-This module includes:
-- `LanguageModelService`: Loads and provides access to the main LLM instance
-  (using a singleton pattern to avoid repeated loading) based on `config.py`.
-- `QueryAnalyzer`: Utilizes an LLM instance to analyze user queries, extracting
-  key information like topic, subtopic, form level, request type, and a
-  rephrased query suitable for content retrieval.
+This module provides services related to Language Model (LLM) interactions,
+including loading LLM instances and analyzing user queries.
+
+Key Features:
+- `LanguageModelService`: Loads and provides a singleton LLM instance (`OllamaLLM`)
+  based on `config.LLM_MODEL`.
+- `QueryAnalyzer`: Uses an LLM to extract structured information from user queries,
+  such as topic, subtopic, form level, request type, and a rephrased query.
+- Handles potential errors during LLM loading and query analysis.
+
+Technical Details:
+- `LanguageModelService.get_llm` uses a singleton pattern for the LLM instance.
+- `QueryAnalyzer.analyze_query` constructs a prompt for the LLM and parses its
+  JSON response to extract query details.
+- Error handling for LLM initialization and JSON parsing is included.
+
+Dependencies:
+- langchain_ollama (OllamaLLM)
+- rich.console (Console)
+- json
+- sys
+- typing (Tuple)
+- ..config (LLM_MODEL)
+
+Author: Keith Satuku
+Version: 1.0.0
+Created: 2025
+License: MIT
 """
 from langchain_ollama import OllamaLLM
 from rich.console import Console

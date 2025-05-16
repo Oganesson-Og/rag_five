@@ -1,11 +1,29 @@
 """
-Centralized configuration settings for the RAG OO Pipeline application.
+RAG Pipeline - Configuration
+---------------------------------
 
-This module consolidates all configuration variables, such as model names,
-paths to data stores (Qdrant, JSON knowledge base), collection names,
-embedding settings, and other application parameters. Centralizing configuration
-makes it easier to manage and modify the application's behavior without
-searching through multiple files.
+This module centralizes configuration settings for the RAG Pipeline application.
+It includes paths, model names, collection names, and other parameters crucial
+for the pipeline's operation.
+
+Key Features:
+- Centralized configuration for easy management.
+- Environment variable overrides for paths (e.g., `QDRANT_PATH`).
+- Settings for Qdrant, embedding models (Ollama/HuggingFace), LLM, and data paths.
+- Default values for retrieval parameters (e.g., K values for search).
+
+Technical Details:
+- Uses `os.getenv` for path configurations, allowing environment overrides.
+- Defines constants for model names, collection names, and embedding dimensions.
+- Specifies paths for Qdrant database and JSON knowledge bank.
+
+Dependencies:
+- os
+
+Author: Keith Satuku
+Version: 1.0.0
+Created: 2025
+License: MIT
 """
 import os
 

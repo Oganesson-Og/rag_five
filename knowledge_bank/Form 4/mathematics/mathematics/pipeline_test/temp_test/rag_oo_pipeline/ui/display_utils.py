@@ -1,14 +1,36 @@
 """
-Utility functions for formatting and displaying pipeline output using the Rich library.
+RAG Pipeline - UI Display Utilities
+--------------------------------------
 
-This module provides helper functions to present information to the user in a 
-readable and visually appealing format in the terminal. Functions include:
-- `display_documents_summary_rich`: Shows a summary table of retrieved documents.
-- `display_full_document_rich`: Displays the detailed content of a single document
-  within a panel, adapting the format based on the document source (direct JSON or Qdrant).
-- `display_generated_answer_rich`: Formats and displays the final LLM-generated answer
+This module provides utility functions for formatting and displaying pipeline
+output in the terminal using the Rich library.
+
+Key Features:
+- `display_documents_summary_rich`: Displays a summary table of retrieved documents.
+- `display_full_document_rich`: Shows detailed content of a single document within a
+  Rich Panel, adapting format based on document source (direct JSON or Qdrant).
+- `display_generated_answer_rich`: Formats and displays the LLM-generated answer
   using Rich Markdown and Panel components.
-These functions help separate the presentation logic from the core pipeline processing.
+- Enhances readability and visual appeal of terminal output.
+
+Technical Details:
+- Uses `rich.console.Console` for output.
+- Employs `rich.panel.Panel`, `rich.table.Table`, and `rich.markdown.Markdown` for styling.
+- Functions are designed to handle Langchain `Document` objects.
+- Adapts display based on metadata attributes like `source` and `document_type`.
+
+Dependencies:
+- typing (List)
+- langchain.docstore.document (Document)
+- rich.console (Console)
+- rich.panel (Panel)
+- rich.table (Table)
+- rich.markdown (Markdown)
+
+Author: Keith Satuku
+Version: 1.0.0
+Created: 2025
+License: MIT
 """
 from typing import List
 from langchain.docstore.document import Document

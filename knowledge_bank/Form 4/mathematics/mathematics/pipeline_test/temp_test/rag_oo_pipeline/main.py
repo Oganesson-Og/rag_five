@@ -1,17 +1,40 @@
 """
-Main command-line interface (CLI) entry point for the RAG OO Pipeline application.
+RAG Pipeline - Main CLI
+--------------------------
 
-This script uses the Typer library to define CLI commands (`query`, `classify`, `interactive`)
-that allow users to interact with the RAG pipeline.
+This module serves as the main command-line interface (CLI) entry point for the
+RAG Pipeline application. It provides commands to interact with the RAG
+pipeline for querying, classification, and interactive sessions.
 
-It initializes the `RAGOrchestrator` which contains the core application logic.
-The CLI commands parse user arguments (like the question, form level, display options)
-and then call the appropriate methods on the `RAGOrchestrator` instance to process
-the request.
+Key Features:
+- CLI commands: `query`, `classify`, `interactive`.
+- Initializes and uses `RAGOrchestrator` for core logic.
+- Parses user inputs (question, form level, display options).
+- Integrates with Typer for CLI argument parsing.
+- Uses Rich for console output.
+
+Technical Details:
+- Uses Typer for CLI command definitions.
+- Leverages `RAGOrchestrator` from `pipeline.orchestrator`.
+- Utilizes `display_utils` for Rich console output formatting.
+- Form level validation against `config.FORM_LEVELS`.
+
+Dependencies:
+- typer
+- rich
+- sys
+- rag_oo_pipeline.pipeline.orchestrator (RAGOrchestrator)
+- rag_oo_pipeline.config (FORM_LEVELS)
+- rag_oo_pipeline.ui.display_utils (display_full_document_rich)
 
 To run this application, execute it as a module from the parent directory:
 `python -m rag_oo_pipeline.main <command> [OPTIONS]`
 Example: `python -m rag_oo_pipeline.main interactive`
+
+Author: Keith Satuku
+Version: 1.0.0
+Created: 2025
+License: MIT
 """
 import typer
 from rich.console import Console

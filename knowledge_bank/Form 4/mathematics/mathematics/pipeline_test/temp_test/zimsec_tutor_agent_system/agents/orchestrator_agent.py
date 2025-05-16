@@ -50,7 +50,7 @@ Dependencies:
 
 Author: Keith Satuku
 Version: 1.0.0
-Created: 2024
+Created: 2025
 License: MIT
 """
 # NOTE: Due to issues with handling async human input via UserProxyAgent

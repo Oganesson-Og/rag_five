@@ -1,15 +1,34 @@
 """
-Handles direct retrieval from the structured JSON knowledge base file.
+RAG Pipeline - Knowledge Base Retriever
+------------------------------------------
 
-This module provides the `KnowledgeBaseRetriever` class, which is responsible for:
-- Loading the `math_knowledge_bank.json` file specified in `config.py` upon initialization.
-- Parsing the titles within the JSON data to extract structured information (form, topic, subtopic)
-  using the `_parse_knowledge_bank_title` helper function.
-- Offering a `retrieve_direct_match` method that attempts to find an exact entry
-  in the loaded JSON data based on the classified form, topic, and subtopic.
-- If a match is found, it constructs a comprehensive Langchain `Document` containing
-  the notes, worked examples, and practice questions from that specific JSON entry.
-This allows for precise content retrieval when the syllabus classification is highly confident.
+This module defines the `KnowledgeBaseRetriever` class, responsible for direct
+retrieval from a structured JSON knowledge base file.
+
+Key Features:
+- Loads knowledge base from a JSON file (specified in `config.KNOWLEDGE_BANK_PATH`).
+- Parses titles within the JSON to extract form, topic, and subtopic.
+- Provides `retrieve_direct_match` method to find exact entries based on classification.
+- Constructs Langchain `Document` objects from matched JSON entries, including notes,
+  worked examples, and practice questions.
+
+Technical Details:
+- Uses a helper function `_parse_knowledge_bank_title` for robust title parsing.
+- `_load_knowledge_bank` handles file loading and error checking.
+- `retrieve_direct_match` performs case-insensitive matching against parsed titles.
+- Returns a list of `langchain.docstore.document.Document` objects.
+
+Dependencies:
+- json
+- typing (List, Optional, Tuple)
+- langchain.docstore.document (Document)
+- rich.console (Console)
+- ..config (KNOWLEDGE_BANK_PATH)
+
+Author: Keith Satuku
+Version: 1.0.0
+Created: 2025
+License: MIT
 """
 import json
 from typing import List, Optional, Tuple

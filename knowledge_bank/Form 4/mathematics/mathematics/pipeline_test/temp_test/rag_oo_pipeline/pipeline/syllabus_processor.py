@@ -1,13 +1,33 @@
 """
-Handles the processing and classification of user questions against the syllabus.
+RAG Pipeline - Syllabus Processor
+------------------------------------
 
-This module defines the `SyllabusProcessor` class, which uses vector search
-(via the `QdrantService`) to find the most relevant syllabus entries for a given
-user question and form level. Its `classify_question` method takes the question text
-and an optional form filter, queries the syllabus collection in Qdrant, and returns
-a ranked list of matching syllabus `Document` objects. This initial classification
-helps determine the likely topic and subtopic context for the user's query according
-to the curriculum structure.
+This module defines the `SyllabusProcessor` class, responsible for classifying
+user questions against the mathematics syllabus using vector search.
+
+Key Features:
+- Uses an injected `QdrantService` instance to query the syllabus vector collection.
+- The `classify_question` method takes a user question and optional form level filter.
+- Retrieves relevant syllabus entries (topic, subtopic, objectives) from Qdrant.
+- Returns a ranked list of Langchain `Document` objects representing matched syllabus sections.
+- Aims to provide an initial, curriculum-aligned context for the user's query.
+
+Technical Details:
+- Relies on the `QdrantService` for actual vector search and embedding.
+- Syllabus data is assumed to be pre-loaded into a Qdrant collection (e.g., "math_syllabus").
+- Configuration for collection names and default retrieval K value is sourced from `config.py`.
+
+Dependencies:
+- typing (List, Optional)
+- langchain.docstore.document (Document)
+- rich.console (Console)
+- ..core.vector_store (QdrantService)
+- ..config (COLLECTIONS, DEFAULT_SYLLABUS_K)
+
+Author: Keith Satuku
+Version: 1.0.0
+Created: 2025
+License: MIT
 """
 from typing import List, Optional
 from langchain.docstore.document import Document

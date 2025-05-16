@@ -1,11 +1,31 @@
 """
-Manages the loading and provision of text embedding models.
+RAG Pipeline - Embedding Model Factory
+-----------------------------------------
 
-This module defines the `EmbeddingModelFactory` which is responsible for
-instantiating the correct embedding model (e.g., from HuggingFace or Ollama)
-based on the settings in `config.py`. It uses a singleton pattern to ensure
-that the potentially large embedding model is loaded only once during the
-application's lifecycle, improving performance and reducing memory usage.
+This module provides the `EmbeddingModelFactory`, responsible for loading and
+providing text embedding model instances (HuggingFace or Ollama).
+
+Key Features:
+- Selects embedding model based on `config.USE_OLLAMA_EMBEDDINGS`.
+- Supports `OllamaEmbeddings` and `HuggingFaceEmbeddings` from Langchain.
+- Implements a singleton pattern (`_embedding_model_instance`) to ensure the model
+  is loaded only once, optimizing performance and memory usage.
+
+Technical Details:
+- The `get_embedding_model` static method is the entry point for obtaining the model.
+- Model names are sourced from `config.OLLAMA_EMBEDDING_MODEL` or `config.EMBEDDING_MODEL`.
+- Uses Rich console for logging initialization messages.
+
+Dependencies:
+- langchain_community.embeddings (HuggingFaceEmbeddings)
+- langchain_ollama (OllamaEmbeddings)
+- rich.console (Console)
+- ..config (USE_OLLAMA_EMBEDDINGS, OLLAMA_EMBEDDING_MODEL, EMBEDDING_MODEL)
+
+Author: Keith Satuku
+Version: 1.0.0
+Created: 2025
+License: MIT
 """
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_ollama import OllamaEmbeddings
